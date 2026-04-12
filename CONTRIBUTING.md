@@ -4,11 +4,17 @@ Thanks for helping improve CDK.
 
 ## Contribution Workflow
 
-1. Fork and create a topic branch from `master`.
+1. Fork and create a topic branch from `main`.
 2. If the change is non-trivial, open an issue first and align on approach.
 3. Implement the change with focused commits that follow the commit standard.
 4. Run local validation before opening a PR.
 5. Open a PR with a clear problem statement, change summary, and test notes.
+
+## Branch and PR Policy
+
+- Direct pushes to `main` are blocked by the local `pre-push` hook.
+- Always push a non-main branch and open a Pull Request into `main`.
+- Recommended branch naming: `feat/*`, `fix/*`, `docs/*`, `chore/*`.
 
 ## Local Validation Checklist
 

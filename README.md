@@ -151,7 +151,23 @@ Run once after cloning:
 ./tools/install_git_hooks.sh
 ```
 
-The hook installs `.githooks/commit-msg`, which runs `tools/validate_commit_msg.sh`.
+The installer sets both hooks:
+
+- `.githooks/commit-msg` -> enforces commit message standard
+- `.githooks/pre-push` -> blocks direct pushes to `main` and requires branch + PR workflow
+
+### Branch Protection Workflow
+
+- Do not push directly to `main`
+- Create a topic branch for every change
+- Push that branch and open a Pull Request into `main`
+
+Example:
+
+```bash
+git switch -c feat/my-change
+git push -u origin HEAD
+```
 
 ## License
 
