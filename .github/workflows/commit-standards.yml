@@ -1,0 +1,36 @@
+name: Commit Standards
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+jobs:
+  validate-commits:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate commit messages
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          base_sha="${{ github.event.pull_request.base.sha }}"
+          head_sha="${{ github.event.pull_request.head.sha }}"
+
+          commits="$(git rev-list --no-merges "${base_sha}..${head_sha}")"
+          if [[ -z "${commits}" ]]; then
+            echo "No commits to validate."
+            exit 0
+          fi
+
+          for commit in ${commits}; do
+            msg_file="$(mktemp)"
+            git log --format=%B -n 1 "${commit}" > "${msg_file}"
+            echo "Validating commit ${commit}"
+            tools/validate_commit_msg.sh "${msg_file}"
+            rm -f "${msg_file}"
+          done

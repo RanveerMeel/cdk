@@ -1,0 +1,64 @@
+[package]
+name = "cdk"
+version = "0.1.0"
+edition = "2021"
+description = "Cognitive Distributed Kernel — a bare-metal capability-based OS"
+
+[package.metadata.bootimage]
+test-args = [
+    "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-serial", "stdio",
+    "-display", "none",
+]
+test-success-exit-code = 33 # (0x10 << 1) | 1
+
+[features]
+default = []
+std = []
+
+[[bin]]
+name = "cdk"
+path = "src/main.rs"
+required-features = []
+
+
+[build-dependencies]
+bootimage = "0.10"
+
+[dependencies]
+# Bare-metal dependencies  
+# bootloader_api 0.10 doesn't exist, only 0.11.x is available
+bootloader_api = "0.11"
+# x86_64 crate disabled - using inline assembly instead to avoid nightly features
+# x86_64 = { version = "0.15", default-features = false, features = [] }
+
+# no_std compatible collections
+heapless = "0.8"
+
+# UUID with no_std support (disabled for now - using simple counter)
+# uuid = { version = "1.6", features = ["v4", "v1", "serde"], default-features = false }
+
+# Serialization (disabled for bare-metal - can enable later if needed)
+# serde = { version = "1.0", features = ["derive"], default-features = false }
+
+# Panic handler
+panic-halt = "0.2"
+
+# Spin locks for no_std
+spin = "0.9"
+
+# Volatile memory access
+volatile = "0.4"
+
+# Cryptographic signing for capabilities (disabled for now - needs RNG)
+# ed25519-dalek = { version = "2.0", default-features = false }
+# sha2 = { version = "0.10", default-features = false }
+# Note: rand/getrandom don't work on bare-metal without custom RNG implementation
+
+# Network support for distributed kernel
+# smoltcp = { version = "0.10", default-features = false, features = ["alloc"] }
+
+# Host-only (serde, tempfile, …): not built for `x86_64-unknown-none`. Use
+# `tools/create_disk_image` instead of `cargo bootimage` with bootloader 0.11.
+[target.'cfg(not(target_os = "none"))'.dependencies]
+bootloader = "0.11"

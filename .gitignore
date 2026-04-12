@@ -1,0 +1,6 @@
+/target/
+/tools/create_disk_image/target/
+*.log
+*.tmp
+*.swp
+.DS_Store
