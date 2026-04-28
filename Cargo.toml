@@ -35,9 +35,12 @@ spin = "0.9"
 # Volatile memory access
 volatile = "0.4"
 
-# Bare-metal only: bootloader entry point + CPU structures + panic handler.
-# Excluded from host `cargo test` runs (test cfg implies a host target).
-[target.'cfg(not(test))'.dependencies]
+# Bare-metal only: bootloader entry point, CPU structures, panic handler.
+# These are compiled for the kernel binary (x86_64-unknown-none).
+# When running `cargo test` pass the host target explicitly, e.g.:
+#   cargo test --target x86_64-apple-darwin   (macOS)
+#   cargo test --target x86_64-unknown-linux-gnu  (Linux)
+[target.'cfg(target_os = "none")'.dependencies]
 bootloader_api = "0.11"
 x86_64 = { version = "0.15", default-features = false, features = [] }
 panic-halt = "0.2"

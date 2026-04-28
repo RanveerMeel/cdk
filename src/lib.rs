@@ -1,10 +1,10 @@
-#![cfg_attr(not(test), no_std)]
+#![cfg_attr(target_os = "none", no_std)]
 
 pub mod serial;
 pub mod vga_buffer;
-#[cfg(not(test))]
+#[cfg(target_os = "none")]
 pub mod gdt;
-#[cfg(not(test))]
+#[cfg(target_os = "none")]
 pub mod interrupts;
 pub mod console;
 pub mod kernel;

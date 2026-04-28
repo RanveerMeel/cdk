@@ -3,3 +3,11 @@ target = "x86_64-unknown-none"
 
 [target.x86_64-unknown-none]
 runner = "qemu-system-x86_64 -drive format=raw,file=target/x86_64-unknown-none/debug/bootimage-cdk.bin"
+
+[alias]
+# Run host-side unit tests (bypasses the bare-metal default target).
+# Usage:  cargo test-host
+# On macOS:
+test-host = "test --target x86_64-apple-darwin --lib"
+# On Linux uncomment the line below and comment the macOS one:
+# test-host = "test --target x86_64-unknown-linux-gnu --lib"
