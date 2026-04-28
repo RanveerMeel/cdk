@@ -26,6 +26,7 @@ static GDT: Once<(GlobalDescriptorTable, Selectors)> = Once::new();
 
 pub struct Selectors {
     pub code_selector: SegmentSelector,
+    pub data_selector: SegmentSelector,
     pub tss_selector: SegmentSelector,
 }
 
@@ -37,7 +38,7 @@ pub fn init() {
         let mut tss = TaskStateSegment::new();
         // Point IST slot 0 at the top of our dedicated stack (stacks grow down).
         tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = {
-            let stack_start = VirtAddr::from_ptr(unsafe { &DOUBLE_FAULT_STACK });
+            let stack_start = VirtAddr::from_ptr(unsafe { &raw const DOUBLE_FAULT_STACK } as *const u8);
             stack_start + DOUBLE_FAULT_STACK_SIZE as u64
         };
         tss
@@ -46,17 +47,24 @@ pub fn init() {
     let (gdt, selectors) = GDT.call_once(|| {
         let mut gdt = GlobalDescriptorTable::new();
         let code_selector = gdt.append(Descriptor::kernel_code_segment());
+        let data_selector = gdt.append(Descriptor::kernel_data_segment());
         let tss_selector = gdt.append(Descriptor::tss_segment(tss));
-        (gdt, Selectors { code_selector, tss_selector })
+        (gdt, Selectors { code_selector, data_selector, tss_selector })
     });
 
     // Safety: loading a correctly-formed GDT / TSS.
     unsafe {
-        use x86_64::instructions::segmentation::{Segment, CS};
+        use x86_64::instructions::segmentation::{Segment, CS, DS, ES, FS, GS, SS};
         use x86_64::instructions::tables::load_tss;
 
         gdt.load();
         CS::set_reg(selectors.code_selector);
+        // Set all data segment registers to the kernel data segment.
+        DS::set_reg(selectors.data_selector);
+        ES::set_reg(selectors.data_selector);
+        FS::set_reg(selectors.data_selector);
+        GS::set_reg(selectors.data_selector);
+        SS::set_reg(selectors.data_selector);
         load_tss(selectors.tss_selector);
     }
 }

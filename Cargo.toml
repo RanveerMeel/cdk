@@ -42,7 +42,7 @@ volatile = "0.4"
 #   cargo test --target x86_64-unknown-linux-gnu  (Linux)
 [target.'cfg(target_os = "none")'.dependencies]
 bootloader_api = "0.11"
-x86_64 = { version = "0.15", default-features = false, features = [] }
+x86_64 = { version = "0.15", default-features = false, features = ["instructions", "abi_x86_interrupt"] }
 panic-halt = "0.2"
 
 # Cryptographic signing for capabilities (disabled for now - needs RNG)

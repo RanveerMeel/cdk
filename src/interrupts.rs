@@ -70,9 +70,9 @@ pub fn init() {
                 .set_stack_index(crate::gdt::DOUBLE_FAULT_IST_INDEX);
         }
 
-        // Hardware interrupts
-        idt[usize::from(TIMER_INTERRUPT_ID)].set_handler_fn(timer_handler);
-        idt[usize::from(KEYBOARD_INTERRUPT_ID)].set_handler_fn(keyboard_handler);
+        // Hardware interrupts — IDT indexed by u8 in x86_64 0.15
+        idt[TIMER_INTERRUPT_ID].set_handler_fn(timer_handler);
+        idt[KEYBOARD_INTERRUPT_ID].set_handler_fn(keyboard_handler);
 
         idt
     });
