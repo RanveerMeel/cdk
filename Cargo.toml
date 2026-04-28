@@ -29,8 +29,7 @@ bootimage = "0.10"
 # Bare-metal dependencies  
 # bootloader_api 0.10 doesn't exist, only 0.11.x is available
 bootloader_api = "0.11"
-# x86_64 crate disabled - using inline assembly instead to avoid nightly features
-# x86_64 = { version = "0.15", default-features = false, features = [] }
+x86_64 = { version = "0.15", default-features = false, features = [] }
 
 # no_std compatible collections
 heapless = "0.8"

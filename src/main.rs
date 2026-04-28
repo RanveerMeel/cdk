@@ -23,6 +23,7 @@ entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
 fn kernel_main(_boot_info: &'static mut BootInfo) -> ! {
     cdk::serial::init();
+    cdk::interrupts::init();
 
     cdk::println!("CDK - Cognitive Distributed Kernel");
     cdk::println!("Booting on bare metal...");
