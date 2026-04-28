@@ -1,6 +1,7 @@
 //! Interactive serial console — reads lines from COM1 and dispatches commands.
 
 use crate::serial;
+use crate::allocator::FrameAllocator;
 use crate::kernel::Kernel;
 use crate::memory_graph::MemoryGraph;
 use crate::node::KernelNode;
@@ -15,6 +16,7 @@ pub fn run_static(
     kernel: &'static Mutex<Kernel>,
     mem_graph: &'static Mutex<MemoryGraph>,
     node: &'static Mutex<KernelNode>,
+    frame_alloc: &'static Mutex<FrameAllocator>,
 ) -> ! {
     crate::println!("\n--- CDK Serial Console ---");
     crate::println!("Type 'help' for available commands.\n");
@@ -29,7 +31,7 @@ pub fn run_static(
         if line.is_empty() {
             continue;
         }
-        dispatch(line, &mut kernel.lock(), &mut mem_graph.lock(), &mut node.lock());
+        dispatch(line, &mut kernel.lock(), &mut mem_graph.lock(), &mut node.lock(), &mut frame_alloc.lock());
     }
 }
 
@@ -83,6 +85,7 @@ fn dispatch(
     kernel: &mut Kernel,
     mem_graph: &mut MemoryGraph,
     node: &mut KernelNode,
+    frame_alloc: &mut FrameAllocator,
 ) {
     let mut parts = line.splitn(3, ' ');
     let cmd = parts.next().unwrap_or("");
@@ -106,6 +109,9 @@ fn dispatch(
         "ticks" => crate::println!("Timer ticks: {}", crate::interrupts::ticks()),
         #[cfg(not(target_os = "none"))]
         "ticks" => crate::println!("Timer ticks: (unavailable outside bare-metal)"),
+        "frames" => cmd_frames(frame_alloc),
+        "palloc" => cmd_palloc(frame_alloc),
+        "pfree"  => cmd_pfree(arg1, frame_alloc),
         "echo" => crate::println!("{} {}", arg1, arg2),
         "panic" => panic!("user-triggered panic"),
         _ => crate::println!("Unknown command: '{}'. Type 'help'.", cmd),
@@ -130,6 +136,9 @@ fn cmd_help() {
     crate::println!("  discover <id> <latency_ms>");
     crate::println!("                    Simulate discovering a remote node");
     crate::println!("  ticks             Show PIT timer tick count since boot");
+    crate::println!("  frames            Physical frame allocator summary");
+    crate::println!("  palloc            Allocate one physical frame, print address");
+    crate::println!("  pfree <addr>      Free a physical frame by base address (hex)");
     crate::println!("  echo <text>       Echo text back");
     crate::println!("  panic             Trigger a kernel panic (test)");
 }
@@ -260,6 +269,56 @@ fn cmd_discover(id: &str, latency_str: &str, node: &mut KernelNode) {
     let latency: u32 = parse_u32(latency_str).unwrap_or(100);
     node.discover_node(id, crate::node::NodeType::Edge, "simulated", latency);
     crate::println!("Discovered node '{}' (latency={}ms)", id, latency);
+}
+
+fn cmd_frames(fa: &FrameAllocator) {
+    crate::println!("=== Physical Frame Allocator ===");
+    crate::println!("  Total frames : {}", fa.total_frames());
+    crate::println!("  Free  frames : {}", fa.free_frames());
+    crate::println!("  Used  frames : {}", fa.used_frames());
+    crate::println!("  Reserved     : {}", fa.reserved_frames());
+    crate::println!("  Usable       : {} KiB", fa.usable_bytes() / 1024);
+    crate::println!("  Free         : {} KiB", fa.free_bytes() / 1024);
+}
+
+fn cmd_palloc(fa: &mut FrameAllocator) {
+    match fa.alloc() {
+        Ok(frame) => crate::println!("Allocated frame at {:#x}", frame.base_addr()),
+        Err(_) => crate::println!("Error: out of physical memory"),
+    }
+}
+
+fn cmd_pfree(addr_str: &str, fa: &mut FrameAllocator) {
+    if addr_str.is_empty() {
+        crate::println!("Usage: pfree <hex-address>");
+        return;
+    }
+    let addr = parse_hex(addr_str);
+    match addr {
+        Some(a) => match fa.free(crate::allocator::PhysFrame(a)) {
+            Ok(()) => crate::println!("Freed frame at {:#x}", a),
+            Err(e) => crate::println!("Error: {:?}", e),
+        },
+        None => crate::println!("Error: invalid hex address '{}'", addr_str),
+    }
+}
+
+fn parse_hex(s: &str) -> Option<u64> {
+    let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    if s.is_empty() {
+        return None;
+    }
+    let mut n: u64 = 0;
+    for b in s.bytes() {
+        let digit = match b {
+            b'0'..=b'9' => (b - b'0') as u64,
+            b'a'..=b'f' => (b - b'a') as u64 + 10,
+            b'A'..=b'F' => (b - b'A') as u64 + 10,
+            _ => return None,
+        };
+        n = n.checked_mul(16)?.checked_add(digit)?;
+    }
+    Some(n)
 }
 
 fn parse_u32(s: &str) -> Option<u32> {

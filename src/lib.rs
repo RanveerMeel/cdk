@@ -7,6 +7,7 @@ pub mod vga_buffer;
 pub mod gdt;
 #[cfg(target_os = "none")]
 pub mod interrupts;
+pub mod allocator;
 pub mod console;
 pub mod kernel;
 pub mod object;
