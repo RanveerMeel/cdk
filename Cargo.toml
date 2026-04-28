@@ -53,7 +53,5 @@ panic-halt = "0.2"
 # Network support for distributed kernel
 # smoltcp = { version = "0.10", default-features = false, features = ["alloc"] }
 
-# Host-only (serde, tempfile, …): not built for `x86_64-unknown-none`. Use
-# `tools/create_disk_image` instead of `cargo bootimage` with bootloader 0.11.
-[target.'cfg(not(target_os = "none"))'.dependencies]
-bootloader = "0.11"
+# The `bootloader` crate (disk image builder) lives in tools/create_disk_image/
+# and is NOT a dependency of the kernel crate itself.

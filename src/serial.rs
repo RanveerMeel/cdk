@@ -4,6 +4,7 @@ use core::fmt;
 
 const COM1: u16 = 0x3F8;
 
+#[cfg(target_arch = "x86_64")]
 #[inline]
 unsafe fn outb(port: u16, v: u8) {
     core::arch::asm!(
@@ -14,6 +15,11 @@ unsafe fn outb(port: u16, v: u8) {
     );
 }
 
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+unsafe fn outb(_port: u16, _v: u8) {}
+
+#[cfg(target_arch = "x86_64")]
 #[inline]
 unsafe fn inb(port: u16) -> u8 {
     let v: u8;
@@ -25,6 +31,10 @@ unsafe fn inb(port: u16) -> u8 {
     );
     v
 }
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+unsafe fn inb(_port: u16) -> u8 { 0 }
 
 /// Minimal 8N1 @ 38400 — sufficient for QEMU and matches common bootloader expectations.
 pub fn init() {

@@ -7,7 +7,7 @@ const MAX_NODES: usize = 8;
 const MAX_ID_LEN: usize = 64;
 const MAX_ADDR_LEN: usize = 128;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NodeType {
     Local,
     Edge,
