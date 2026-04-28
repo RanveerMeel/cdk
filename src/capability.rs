@@ -145,3 +145,64 @@ pub enum CapabilityError {
     InvalidSignature,
     PermissionSetFull,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::object::KernelObject;
+
+    fn dummy_obj(name: &str) -> KernelObject {
+        KernelObject::new_compute(name, "normal")
+    }
+
+    #[test]
+    fn new_capability_has_default_permissions() {
+        let cap = Capability::new(&dummy_obj("worker"));
+        assert!(cap.has_permission(&Permission::Read));
+        assert!(cap.has_permission(&Permission::Execute));
+        assert!(cap.has_permission(&Permission::SendMessage));
+        assert!(cap.has_permission(&Permission::ReceiveMessage));
+        // Delete is NOT in the default set.
+        assert!(!cap.has_permission(&Permission::Delete));
+    }
+
+    #[test]
+    fn add_permission_grants_access() {
+        let mut cap = Capability::new(&dummy_obj("obj"));
+        assert!(!cap.has_permission(&Permission::Write));
+        cap.add_permission(Permission::Write).unwrap();
+        assert!(cap.has_permission(&Permission::Write));
+    }
+
+    #[test]
+    fn remove_permission_revokes_access() {
+        let mut cap = Capability::new(&dummy_obj("obj"));
+        assert!(cap.has_permission(&Permission::Execute));
+        cap.remove_permission(&Permission::Execute);
+        assert!(!cap.has_permission(&Permission::Execute));
+    }
+
+    #[test]
+    fn with_permissions_respects_supplied_set() {
+        let obj = dummy_obj("restricted");
+        let cap = Capability::with_permissions(&obj, &[Permission::Read]);
+        assert!(cap.has_permission(&Permission::Read));
+        assert!(!cap.has_permission(&Permission::Execute));
+        assert!(!cap.has_permission(&Permission::SendMessage));
+    }
+
+    #[test]
+    fn verify_returns_false_without_signature() {
+        let cap = Capability::new(&dummy_obj("x"));
+        // No signature set → verify returns Ok(false).
+        assert_eq!(cap.verify().unwrap(), false);
+    }
+
+    #[test]
+    fn capability_object_id_matches_object() {
+        let obj = dummy_obj("myobj");
+        let id = obj.id.clone();
+        let cap = Capability::new(&obj);
+        assert_eq!(cap.object_id, id);
+    }
+}

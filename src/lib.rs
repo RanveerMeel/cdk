@@ -1,8 +1,10 @@
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
 pub mod serial;
 pub mod vga_buffer;
+#[cfg(not(test))]
 pub mod gdt;
+#[cfg(not(test))]
 pub mod interrupts;
 pub mod console;
 pub mod kernel;

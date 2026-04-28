@@ -102,7 +102,10 @@ fn dispatch(
         "mem" => cmd_mem(mem_graph),
         "node" => cmd_node(node),
         "discover" => cmd_discover(arg1, arg2, node),
+        #[cfg(not(test))]
         "ticks" => crate::println!("Timer ticks: {}", crate::interrupts::ticks()),
+        #[cfg(test)]
+        "ticks" => crate::println!("Timer ticks: (unavailable in test mode)"),
         "echo" => crate::println!("{} {}", arg1, arg2),
         "panic" => panic!("user-triggered panic"),
         _ => crate::println!("Unknown command: '{}'. Type 'help'.", cmd),

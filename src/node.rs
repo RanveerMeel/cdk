@@ -112,6 +112,86 @@ impl KernelNode {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_node_starts_with_no_known_nodes() {
+        let node = KernelNode::new();
+        assert_eq!(node.known_nodes_count(), 0);
+    }
+
+    #[test]
+    fn new_node_type_is_local() {
+        let node = KernelNode::new();
+        assert_eq!(node.node_type(), NodeType::Local);
+    }
+
+    #[test]
+    fn discover_node_adds_to_known_nodes() {
+        let mut node = KernelNode::new();
+        node.discover_node("remote-1", NodeType::Edge, "10.0.0.1", 20);
+        assert_eq!(node.known_nodes_count(), 1);
+    }
+
+    #[test]
+    fn get_node_returns_correct_entry() {
+        let mut node = KernelNode::new();
+        node.discover_node("edge-42", NodeType::Edge, "192.168.1.1", 15);
+        let found = node.get_node("edge-42").unwrap();
+        assert_eq!(found.node_id.as_str(), "edge-42");
+        assert_eq!(found.latency_ms, 15);
+        assert_eq!(found.node_type, NodeType::Edge);
+    }
+
+    #[test]
+    fn get_node_missing_returns_none() {
+        let node = KernelNode::new();
+        assert!(node.get_node("ghost").is_none());
+    }
+
+    #[test]
+    fn discover_node_overwrites_existing_entry() {
+        let mut node = KernelNode::new();
+        node.discover_node("n1", NodeType::Edge, "addr-a", 50);
+        node.discover_node("n1", NodeType::Cloud, "addr-b", 5);
+        assert_eq!(node.known_nodes_count(), 1);
+        let n = node.get_node("n1").unwrap();
+        assert_eq!(n.latency_ms, 5);
+        assert_eq!(n.node_type, NodeType::Cloud);
+    }
+
+    #[test]
+    fn find_best_node_picks_lowest_latency_of_preferred_type() {
+        let mut node = KernelNode::new();
+        node.discover_node("edge-fast", NodeType::Edge, "a", 10);
+        node.discover_node("edge-slow", NodeType::Edge, "b", 100);
+        node.discover_node("cloud-1",   NodeType::Cloud, "c", 5);
+
+        let best_edge = node.find_best_node(NodeType::Edge).unwrap();
+        assert_eq!(best_edge.node_id.as_str(), "edge-fast");
+
+        let best_cloud = node.find_best_node(NodeType::Cloud).unwrap();
+        assert_eq!(best_cloud.node_id.as_str(), "cloud-1");
+    }
+
+    #[test]
+    fn find_best_node_returns_none_when_type_absent() {
+        let mut node = KernelNode::new();
+        node.discover_node("only-edge", NodeType::Edge, "x", 1);
+        assert!(node.find_best_node(NodeType::Cloud).is_none());
+    }
+
+    #[test]
+    fn set_node_type_changes_type() {
+        let mut node = KernelNode::new();
+        assert_eq!(node.node_type(), NodeType::Local);
+        node.set_node_type(NodeType::Edge);
+        assert_eq!(node.node_type(), NodeType::Edge);
+    }
+}
+
 fn write_number(s: &mut String<MAX_ID_LEN>, n: u64) -> Result<(), ()> {
     if n == 0 {
         return s.push_str("0");
