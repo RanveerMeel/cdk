@@ -55,3 +55,62 @@ impl Message {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_message_round_trip() {
+        let msg = Message::text("sender", "receiver", "hello").unwrap();
+        assert_eq!(msg.from.as_str(), "sender");
+        assert_eq!(msg.to.as_str(), "receiver");
+        match &msg.payload {
+            MessagePayload::Text(t) => assert_eq!(t.as_str(), "hello"),
+            _ => panic!("expected Text payload"),
+        }
+    }
+
+    #[test]
+    fn command_message_round_trip() {
+        let msg = Message::command("kernel", "obj-1", "shutdown").unwrap();
+        assert_eq!(msg.from.as_str(), "kernel");
+        assert_eq!(msg.to.as_str(), "obj-1");
+        match &msg.payload {
+            MessagePayload::Command(c) => assert_eq!(c.as_str(), "shutdown"),
+            _ => panic!("expected Command payload"),
+        }
+    }
+
+    #[test]
+    fn data_message_round_trip() {
+        let mut data = heapless::Vec::<u8, 64>::new();
+        data.extend_from_slice(&[1u8, 2, 3, 4]).unwrap();
+        let msg = Message::new("a", "b", MessagePayload::Data(data)).unwrap();
+        match &msg.payload {
+            MessagePayload::Data(d) => assert_eq!(&d[..], &[1, 2, 3, 4]),
+            _ => panic!("expected Data payload"),
+        }
+    }
+
+    #[test]
+    fn message_too_long_returns_error() {
+        // MAX_TEXT_LEN is 64; a 65-char string should fail.
+        let long = "x".repeat(65);
+        assert!(Message::text("a", "b", &long).is_err());
+    }
+
+    #[test]
+    fn response_payload() {
+        let msg = Message::new(
+            "srv",
+            "cli",
+            MessagePayload::Response { result: String::from_str("ok").unwrap() },
+        )
+        .unwrap();
+        match &msg.payload {
+            MessagePayload::Response { result } => assert_eq!(result.as_str(), "ok"),
+            _ => panic!("expected Response payload"),
+        }
+    }
+}

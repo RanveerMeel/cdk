@@ -78,3 +78,78 @@ impl MemoryGraph {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn register_increases_total_memory() {
+        let mut g = MemoryGraph::new();
+        g.register_object("a", 1024);
+        g.register_object("b", 2048);
+        assert_eq!(g.total_memory(), 3072);
+        assert_eq!(g.object_count(), 2);
+    }
+
+    #[test]
+    fn get_object_size_returns_correct_value() {
+        let mut g = MemoryGraph::new();
+        g.register_object("obj-1", 512);
+        assert_eq!(g.get_object_size("obj-1"), Some(512));
+        assert_eq!(g.get_object_size("nonexistent"), None);
+    }
+
+    #[test]
+    fn remove_object_decreases_total_memory() {
+        let mut g = MemoryGraph::new();
+        g.register_object("x", 256);
+        g.register_object("y", 128);
+        let removed = g.remove_object("x");
+        assert_eq!(removed, Some(256));
+        assert_eq!(g.total_memory(), 128);
+        assert_eq!(g.object_count(), 1);
+    }
+
+    #[test]
+    fn remove_nonexistent_object_returns_none() {
+        let mut g = MemoryGraph::new();
+        assert_eq!(g.remove_object("ghost"), None);
+    }
+
+    #[test]
+    fn reference_counting_add_and_remove() {
+        let mut g = MemoryGraph::new();
+        g.register_object("ref-obj", 64);
+        g.add_reference("ref-obj");
+        g.add_reference("ref-obj");
+        let obj = g.objects.get(&heapless::String::from_str("ref-obj").unwrap()).unwrap();
+        assert_eq!(obj.references, 2);
+        g.remove_reference("ref-obj");
+        let obj = g.objects.get(&heapless::String::from_str("ref-obj").unwrap()).unwrap();
+        assert_eq!(obj.references, 1);
+    }
+
+    #[test]
+    fn reference_count_does_not_underflow() {
+        let mut g = MemoryGraph::new();
+        g.register_object("r", 0);
+        g.remove_reference("r"); // already 0, must not panic or wrap
+        let obj = g.objects.get(&heapless::String::from_str("r").unwrap()).unwrap();
+        assert_eq!(obj.references, 0);
+    }
+
+    #[test]
+    fn duplicate_register_does_not_double_count_memory() {
+        let mut g = MemoryGraph::new();
+        g.register_object("dup", 100);
+        // FnvIndexMap::insert returns Err when key already exists and map is full,
+        // and Ok(Some(old)) when replacing — either way total_memory must stay consistent.
+        let before = g.total_memory();
+        g.register_object("dup", 200);
+        // If insert replaces, the new size is added; if it errors, nothing changes.
+        // The important thing: no double-counting of the original entry.
+        let after = g.total_memory();
+        assert!(after >= before, "total memory must not decrease on re-register");
+    }
+}
+

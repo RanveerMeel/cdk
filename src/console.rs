@@ -102,6 +102,10 @@ fn dispatch(
         "mem" => cmd_mem(mem_graph),
         "node" => cmd_node(node),
         "discover" => cmd_discover(arg1, arg2, node),
+        #[cfg(target_os = "none")]
+        "ticks" => crate::println!("Timer ticks: {}", crate::interrupts::ticks()),
+        #[cfg(not(target_os = "none"))]
+        "ticks" => crate::println!("Timer ticks: (unavailable outside bare-metal)"),
         "echo" => crate::println!("{} {}", arg1, arg2),
         "panic" => panic!("user-triggered panic"),
         _ => crate::println!("Unknown command: '{}'. Type 'help'.", cmd),
@@ -125,6 +129,7 @@ fn cmd_help() {
     crate::println!("  node              Show this node's info");
     crate::println!("  discover <id> <latency_ms>");
     crate::println!("                    Simulate discovering a remote node");
+    crate::println!("  ticks             Show PIT timer tick count since boot");
     crate::println!("  echo <text>       Echo text back");
     crate::println!("  panic             Trigger a kernel panic (test)");
 }

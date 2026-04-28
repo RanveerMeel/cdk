@@ -26,29 +26,24 @@ required-features = []
 bootimage = "0.10"
 
 [dependencies]
-# Bare-metal dependencies  
-# bootloader_api 0.10 doesn't exist, only 0.11.x is available
-bootloader_api = "0.11"
-# x86_64 crate disabled - using inline assembly instead to avoid nightly features
-# x86_64 = { version = "0.15", default-features = false, features = [] }
-
 # no_std compatible collections
 heapless = "0.8"
-
-# UUID with no_std support (disabled for now - using simple counter)
-# uuid = { version = "1.6", features = ["v4", "v1", "serde"], default-features = false }
-
-# Serialization (disabled for bare-metal - can enable later if needed)
-# serde = { version = "1.0", features = ["derive"], default-features = false }
-
-# Panic handler
-panic-halt = "0.2"
 
 # Spin locks for no_std
 spin = "0.9"
 
 # Volatile memory access
 volatile = "0.4"
+
+# Bare-metal only: bootloader entry point, CPU structures, panic handler.
+# These are compiled for the kernel binary (x86_64-unknown-none).
+# When running `cargo test` pass the host target explicitly, e.g.:
+#   cargo test --target x86_64-apple-darwin   (macOS)
+#   cargo test --target x86_64-unknown-linux-gnu  (Linux)
+[target.'cfg(target_os = "none")'.dependencies]
+bootloader_api = "0.11"
+x86_64 = { version = "0.15", default-features = false, features = ["instructions", "abi_x86_interrupt"] }
+panic-halt = "0.2"
 
 # Cryptographic signing for capabilities (disabled for now - needs RNG)
 # ed25519-dalek = { version = "2.0", default-features = false }
@@ -58,7 +53,5 @@ volatile = "0.4"
 # Network support for distributed kernel
 # smoltcp = { version = "0.10", default-features = false, features = ["alloc"] }
 
-# Host-only (serde, tempfile, …): not built for `x86_64-unknown-none`. Use
-# `tools/create_disk_image` instead of `cargo bootimage` with bootloader 0.11.
-[target.'cfg(not(target_os = "none"))'.dependencies]
-bootloader = "0.11"
+# The `bootloader` crate (disk image builder) lives in tools/create_disk_image/
+# and is NOT a dependency of the kernel crate itself.

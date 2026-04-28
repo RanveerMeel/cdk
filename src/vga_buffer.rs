@@ -176,11 +176,23 @@ macro_rules! println {
 
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
-    use core::fmt::Write;
-    // Bootloader 0.11 uses a graphical framebuffer; the legacy VGA text buffer at 0xB8000
-    // is NOT mapped in its page tables. Writing there page-faults → triple-fault (no IDT).
-    // Use serial (COM1) exclusively until we implement framebuffer text rendering.
-    let mut serial = crate::serial::SerialPort;
-    let _ = serial.write_fmt(args);
+    #[cfg(test)]
+    {
+        // During host-side tests route output through std's print so tests
+        // can capture it normally without touching serial/VGA I/O ports.
+        use std::io::Write as _;
+        let _ = std::io::stdout().lock().write_fmt(args);
+        let _ = std::io::stdout().lock().flush();
+    }
+    #[cfg(not(test))]
+    {
+        use core::fmt::Write;
+        // Bootloader 0.11 uses a graphical framebuffer; the legacy VGA text buffer at
+        // 0xB8000 is NOT mapped in its page tables. Writing there page-faults →
+        // triple-fault (no IDT yet). Use serial (COM1) exclusively until we add
+        // framebuffer text rendering.
+        let mut serial = crate::serial::SerialPort;
+        let _ = serial.write_fmt(args);
+    }
 }
 
