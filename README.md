@@ -59,8 +59,9 @@ CDK_QEMU_GUI=1 ./run_qemu.sh
   allocator.rs     Bitmap physical frame allocator
   heap.rs          Kernel heap (#[global_allocator], linked-list, 2 MiB)
   rng.rs           RDRAND RNG (bare-metal) / OsRng (host tests)
+  framebuffer.rs   Pixel framebuffer renderer (8×16 font, scroll, RGB/BGR)
   serial.rs        COM1 UART driver (init, read, write)
-  vga_buffer.rs    Serial-backed print!/println! macros
+  vga_buffer.rs    print!/println! macros → serial + framebuffer
   console.rs       Interactive serial console and command dispatch
  tools/
   create_disk_image/   Host-side tool to wrap the kernel ELF in a BIOS boot image
@@ -94,6 +95,7 @@ CDK_QEMU_GUI=1 ./run_qemu.sh
 | `capsign <id>` | Sign a fresh capability for object `<id>` and verify the signature |
 | `capverify <id>` | Check whether a capability for `<id>` is signed |
 | `heapinfo` | Kernel heap usage (total / used / free) |
+| `fbinfo` | Pixel framebuffer resolution and text grid size |
 | `frames` | Physical frame allocator summary |
 | `palloc` | Allocate one physical frame, print address |
 | `pfree <addr>` | Free a physical frame by hex base address |
@@ -120,7 +122,7 @@ CDK_QEMU_GUI=1 ./run_qemu.sh
 - [x] 4-level x86_64 page-table manager (map / unmap / translate, lazy interior allocation)
 - [x] Kernel heap allocator (`#[global_allocator]`, linked-list, 2 MiB reserved at boot)
 - [x] Ed25519 capability signing (RDRAND on bare-metal, OsRng on host; SHA-256 message digest)
-- [ ] Framebuffer text rendering (replace serial-only output)
+- [x] Framebuffer text rendering (8×16 bitmap font, RGB/BGR/U8 pixel formats, auto-scroll)
 - [ ] Network stack integration
 - [ ] Multi-core support
 

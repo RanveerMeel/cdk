@@ -3,6 +3,7 @@
 use crate::serial;
 use crate::allocator::FrameAllocator;
 use crate::capability::Capability;
+use crate::framebuffer::FRAMEBUFFER;
 use crate::heap::KERNEL_HEAP;
 use crate::kernel::Kernel;
 use crate::memory_graph::MemoryGraph;
@@ -128,6 +129,7 @@ fn dispatch(
         "heapinfo"   => cmd_heapinfo(),
         "palloc"     => cmd_palloc(frame_alloc),
         "pfree"      => cmd_pfree(arg1, frame_alloc),
+        "fbinfo"     => cmd_fbinfo(),
         "capsign"    => cmd_capsign(arg1, kernel),
         "capverify"  => cmd_capverify(arg1, kernel),
         "vmmap"      => cmd_vmmap(arg1, arg2, arg3, page_table, frame_alloc),
@@ -160,6 +162,7 @@ fn cmd_help() {
     crate::println!("                    Simulate discovering a remote node");
     crate::println!("  ticks             Show PIT timer tick count since boot");
     crate::println!("  timeslice         Show the preemptive time-slice length (ticks)");
+    crate::println!("  fbinfo            Pixel framebuffer info (resolution, format)");
     crate::println!("  capsign <id>      Sign a fresh capability for object <id> and verify it");
     crate::println!("  capverify <id>    Create + sign + verify a capability for object <id>");
     crate::println!("  heapinfo          Kernel heap usage (total / used / free)");
@@ -203,6 +206,11 @@ fn cmd_status(kernel: &mut Kernel, mem_graph: &MemoryGraph, node: &KernelNode, p
     } else {
         crate::println!("  Heap:         (not initialised)");
     }
+    match FRAMEBUFFER.lock().as_ref() {
+        Some(fb) => crate::println!("  Framebuffer:  {}x{} px ({}x{} chars)",
+            fb.width(), fb.height(), fb.cols(), fb.rows()),
+        None     => crate::println!("  Framebuffer:  (not initialised)"),
+    }
 }
 
 fn cmd_timeslice() {
@@ -215,6 +223,18 @@ fn cmd_running(kernel: &Kernel) {
     match kernel.running_task_id() {
         Some(id) => crate::println!("Running: {}", id),
         None      => crate::println!("(idle — no task currently running)"),
+    }
+}
+
+fn cmd_fbinfo() {
+    match FRAMEBUFFER.lock().as_ref() {
+        Some(fb) => {
+            crate::println!("=== Pixel Framebuffer ===");
+            crate::println!("  Resolution : {}x{} px", fb.width(), fb.height());
+            crate::println!("  Text grid  : {}x{} chars ({}x{} px/char)",
+                fb.cols(), fb.rows(), crate::framebuffer::CHAR_W, crate::framebuffer::CHAR_H);
+        }
+        None => crate::println!("Framebuffer: not initialised"),
     }
 }
 

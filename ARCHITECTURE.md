@@ -114,7 +114,23 @@ A `linked_list_allocator::Heap` wrapped in a `spin::Mutex`, registered as `#[glo
 
 Once the heap is live, `alloc` types (`Box`, `Vec`, `String`, `Arc`) become available throughout the kernel. Current consumers: none yet — the heap is the foundation for the next features (capability signing, smoltcp network stack).
 
-Boot sequence: frame allocator → **heap init** → page-table setup → console.
+Boot sequence: serial init → framebuffer init → interrupts → frame allocator → **heap init** → page-table setup → console.
+
+### Framebuffer (`src/framebuffer.rs`)
+
+Pixel-level text renderer that displays kernel output directly on the QEMU graphical window.
+
+| Concept | Detail |
+|---|---|
+| Font | Built-in 8×16 monospaced bitmap covering printable ASCII (0x20–0x7E) |
+| Pixel formats | `Rgb`, `Bgr`, `U8` (greyscale); format detected at runtime from bootloader `FrameBuffer::info()` |
+| Scroll | Entire buffer shifted up one character row (`core::ptr::copy`); last row cleared |
+| Cursor | Software (col, row) — no hardware cursor, no blink |
+| Init | `framebuffer::init(fb: &'static mut BootInfo::framebuffer)` — called once during boot before first `println!` |
+| Multiplexing | `vga_buffer::_print` writes to both COM1 serial and the framebuffer so output is always visible |
+| Thread safety | Global `FRAMEBUFFER: spin::Mutex<Option<Framebuffer>>`; `try_lock` used in the print path to avoid deadlocks |
+
+Boot sequence: serial init → **framebuffer init** → interrupts → frame allocator → heap → page tables → console.
 
 ### Serial Console (`src/console.rs`)
 
@@ -143,5 +159,6 @@ All dependencies are `no_std` compatible:
 - `ed25519-dalek` — Ed25519 signing and verification
 - `sha2` — SHA-256 message digest
 - `rand_core` — `CryptoRng` / `RngCore` traits
+- (no extra crate needed for framebuffer — the bootloader provides the pixel buffer and format info directly via `bootloader_api`)
 - `panic-halt` — halts on panic
 - `volatile` — volatile memory operations
