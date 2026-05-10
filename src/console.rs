@@ -109,6 +109,8 @@ fn dispatch(
         "ticks" => crate::println!("Timer ticks: {}", crate::interrupts::ticks()),
         #[cfg(not(target_os = "none"))]
         "ticks" => crate::println!("Timer ticks: (unavailable outside bare-metal)"),
+        "timeslice" => cmd_timeslice(),
+        "running"   => cmd_running(kernel),
         "frames" => cmd_frames(frame_alloc),
         "palloc" => cmd_palloc(frame_alloc),
         "pfree"  => cmd_pfree(arg1, frame_alloc),
@@ -121,13 +123,14 @@ fn dispatch(
 fn cmd_help() {
     crate::println!("Commands:");
     crate::println!("  help              Show this message");
-    crate::println!("  status            Kernel overview");
+    crate::println!("  status            Kernel overview (includes preemption info)");
     crate::println!("  create <name> <intent>");
     crate::println!("                    Create a compute object (intents: low_latency,");
     crate::println!("                    interactive, normal, batch, energy_saving)");
     crate::println!("  list              List registered objects");
-    crate::println!("  schedule <id>     Schedule an object for execution");
-    crate::println!("  run               Execute next task from the scheduler queue");
+    crate::println!("  schedule <id>     Queue an object for execution");
+    crate::println!("  run               Manually dispatch next task (ignores preemption)");
+    crate::println!("  running           Show the currently running task");
     crate::println!("  send <id> <text>  Send a text message to an object");
     crate::println!("  recv <id>         Receive next message from an object");
     crate::println!("  delete <id>       Delete an object");
@@ -136,6 +139,7 @@ fn cmd_help() {
     crate::println!("  discover <id> <latency_ms>");
     crate::println!("                    Simulate discovering a remote node");
     crate::println!("  ticks             Show PIT timer tick count since boot");
+    crate::println!("  timeslice         Show the preemptive time-slice length (ticks)");
     crate::println!("  frames            Physical frame allocator summary");
     crate::println!("  palloc            Allocate one physical frame, print address");
     crate::println!("  pfree <addr>      Free a physical frame by base address (hex)");
@@ -145,12 +149,32 @@ fn cmd_help() {
 
 fn cmd_status(kernel: &mut Kernel, mem_graph: &MemoryGraph, node: &KernelNode) {
     crate::println!("=== CDK Kernel Status ===");
-    crate::println!("  Node:       {}", node.node_id());
-    crate::println!("  Objects:    {}", kernel.object_count());
-    crate::println!("  Sched queue: {}", kernel.scheduler_queue_size());
-    crate::println!("  Memory:     {} bytes tracked", mem_graph.total_memory());
-    crate::println!("  Mem objects: {}", mem_graph.object_count());
-    crate::println!("  Known nodes: {}", node.known_nodes_count());
+    crate::println!("  Node:         {}", node.node_id());
+    crate::println!("  Objects:      {}", kernel.object_count());
+    crate::println!("  Sched queue:  {}", kernel.scheduler_queue_size());
+    match kernel.running_task_id() {
+        Some(id) => crate::println!("  Running task: {}", id),
+        None      => crate::println!("  Running task: (idle)"),
+    }
+    crate::println!("  Time slice:   {} ticks (~{}ms at 1kHz)",
+        crate::scheduler::TICKS_PER_SLICE,
+        crate::scheduler::TICKS_PER_SLICE);
+    crate::println!("  Memory:       {} bytes tracked", mem_graph.total_memory());
+    crate::println!("  Mem objects:  {}", mem_graph.object_count());
+    crate::println!("  Known nodes:  {}", node.known_nodes_count());
+}
+
+fn cmd_timeslice() {
+    crate::println!("Time slice: {} ticks (~{}ms at default PIT ~1kHz)",
+        crate::scheduler::TICKS_PER_SLICE,
+        crate::scheduler::TICKS_PER_SLICE);
+}
+
+fn cmd_running(kernel: &Kernel) {
+    match kernel.running_task_id() {
+        Some(id) => crate::println!("Running: {}", id),
+        None      => crate::println!("(idle — no task currently running)"),
+    }
 }
 
 fn cmd_create(name: &str, intent: &str, kernel: &mut Kernel, mem_graph: &mut MemoryGraph) {

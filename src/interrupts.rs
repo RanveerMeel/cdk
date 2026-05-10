@@ -7,9 +7,17 @@
 //!
 //! The 8259 PIC is remapped so its IRQ vectors start at 0x20, keeping them
 //! clear of the CPU exception vectors 0x00–0x1F.
+//!
+//! ## Preemptive scheduling hook
+//!
+//! `main.rs` calls [`set_preempt_hook`] once at boot to register a function
+//! that the timer ISR invokes on every tick.  The hook receives the current
+//! tick count so it can decide whether the running task's time slice has
+//! expired without the ISR needing to know about `KERNEL` directly.
 
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 use spin::{Mutex, Once};
+use core::sync::atomic::{AtomicPtr, Ordering as AtomicOrdering};
 
 // ---------------------------------------------------------------------------
 // PIC constants
@@ -40,6 +48,41 @@ static TICKS: Mutex<u64> = Mutex::new(0);
 /// Returns the number of timer ticks since the IDT was loaded.
 pub fn ticks() -> u64 {
     *TICKS.lock()
+}
+
+// ---------------------------------------------------------------------------
+// Preemption hook
+// ---------------------------------------------------------------------------
+
+/// Signature for the preemption callback installed by `main.rs`.
+///
+/// The argument is the current tick count.  The function should attempt a
+/// non-blocking lock on `KERNEL` and call `Kernel::preempt_tick`; if the
+/// lock is busy (console command in progress) the tick is silently skipped —
+/// the scheduler will catch up on the next tick.
+pub type PreemptFn = fn(u64);
+
+/// Null sentinel: no hook installed yet.
+fn noop_preempt(_tick: u64) {}
+
+/// Atomic pointer holding the current preemption callback.
+///
+/// We store a raw function pointer cast to `*mut u8` so we can use
+/// `AtomicPtr` (the only atomic pointer type stable in `no_std`).
+static PREEMPT_HOOK: AtomicPtr<u8> = AtomicPtr::new(noop_preempt as *mut u8);
+
+/// Register the preemption callback.  Call once from `kernel_main` before
+/// enabling interrupts (or immediately after — the hook is set atomically).
+pub fn set_preempt_hook(f: PreemptFn) {
+    PREEMPT_HOOK.store(f as *mut u8, AtomicOrdering::Release);
+}
+
+#[inline]
+fn call_preempt_hook(tick: u64) {
+    let raw = PREEMPT_HOOK.load(AtomicOrdering::Acquire);
+    // SAFETY: we only ever store valid `PreemptFn` function pointers here.
+    let f: PreemptFn = unsafe { core::mem::transmute(raw) };
+    f(tick);
 }
 
 // ---------------------------------------------------------------------------
@@ -199,12 +242,18 @@ extern "x86-interrupt" fn double_fault_handler(
 // ---------------------------------------------------------------------------
 
 extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
-    let mut t = TICKS.lock();
-    *t = t.wrapping_add(1);
-    // EOI must be sent while NOT holding a lock that a non-interrupt path
-    // might also hold, to avoid deadlock.
-    drop(t);
+    let tick = {
+        let mut t = TICKS.lock();
+        *t = t.wrapping_add(1);
+        *t
+        // Lock released here before we call the preemption hook, which may
+        // itself attempt to lock KERNEL.  Keeping TICKS lock-free at that
+        // point prevents priority-inversion deadlocks.
+    };
+    // EOI first so the PIC can accept the next interrupt while we run the hook.
     unsafe { send_eoi(0) };
+    // Invoke the preemption hook registered by main.rs (non-blocking).
+    call_preempt_hook(tick);
 }
 
 extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {

@@ -31,10 +31,25 @@ Priority queue (`heapless::Vec` sorted by priority). Intent labels map to numeri
 | Intent | Priority |
 |---|---|
 | `low_latency` | 10 (highest) |
-| `interactive` | 8 |
+| `interactive` | 7 |
 | `normal` | 5 |
 | `batch` | 3 |
-| `energy_saving` | 1 (lowest) |
+| `energy_saving` | 2 (lowest) |
+
+#### Preemptive time-slicing
+
+`Scheduler` tracks a `running: Option<RunningTask>` slot alongside the ready queue.
+Each dispatched task records the tick at which it started (`started_at_tick`).
+
+On every PIT timer interrupt the ISR calls `Kernel::preempt_tick(current_tick)` via
+a statically-registered function pointer hook (`interrupts::set_preempt_hook`).
+If the running task has consumed `TICKS_PER_SLICE` (50) ticks it is evicted, re-queued
+at its original priority (round-robin within a priority band), and the next queued task
+is dispatched immediately.
+
+The hook uses `Mutex::try_lock` so the ISR never spins — if the lock is held by the
+console or boot path the tick is silently skipped and scheduling catches up on the next
+IRQ.
 
 ### Messages (`src/message.rs`)
 

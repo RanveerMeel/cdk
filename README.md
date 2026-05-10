@@ -79,7 +79,9 @@ CDK_QEMU_GUI=1 ./run_qemu.sh
 | `create <name> <intent>` | Create a compute object |
 | `list` | List all registered objects |
 | `schedule <id>` | Queue an object for execution |
-| `run` | Execute next task from the scheduler |
+| `run` | Manually dispatch next task from the scheduler queue |
+| `running` | Show the currently running (preempted) task |
+| `timeslice` | Show the preemptive time-slice length in ticks |
 | `send <id> <text>` | Send a text message to an object |
 | `recv <id>` | Pop next message from an object |
 | `delete <id>` | Remove an object |
@@ -104,8 +106,8 @@ CDK_QEMU_GUI=1 ./run_qemu.sh
 
 - [x] Wire up `BootInfo` and a physical frame allocator
 - [x] Set up IDT with double-fault, timer, and keyboard handlers
-- [ ] Timer-driven preemptive scheduling
-- [ ] Restore Ed25519 capability signing (needs bare-metal RNG)
+- [x] Timer-driven preemptive scheduling (50 ms time slice, round-robin re-queue)
+- [ ] Restore Ed25519 capability signing (needs bare-metal RNG / RDRAND)
 - [ ] Framebuffer text rendering (replace serial-only output)
 - [ ] Network stack integration
 - [ ] Multi-core support
