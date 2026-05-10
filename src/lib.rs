@@ -11,6 +11,7 @@ pub mod allocator;
 pub mod heap;
 pub mod rng;
 pub mod paging;
+pub mod framebuffer;
 pub mod console;
 pub mod kernel;
 pub mod object;

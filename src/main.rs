@@ -39,6 +39,13 @@ fn on_timer_tick(tick: u64) {
 
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     cdk::serial::init();
+
+    // Init the pixel framebuffer early so boot messages appear on screen.
+    if let Some(fb) = boot_info.framebuffer.as_mut() {
+        cdk::framebuffer::init(fb);
+        cdk::println!("Framebuffer: {}x{} pixels", fb.info().width, fb.info().height);
+    }
+
     // Register the preemption hook *before* enabling interrupts so the very
     // first timer IRQ already has a valid callback.
     cdk::interrupts::set_preempt_hook(on_timer_tick);
