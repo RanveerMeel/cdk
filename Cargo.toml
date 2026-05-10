@@ -28,6 +28,7 @@ bootimage = "0.10"
 [dependencies]
 # no_std compatible collections
 heapless = "0.8"
+linked_list_allocator = { version = "0.10.6", default-features = false }
 
 # Spin locks for no_std
 spin = "0.9"

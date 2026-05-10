@@ -56,6 +56,8 @@ CDK_QEMU_GUI=1 ./run_qemu.sh
   message.rs       Typed IPC messages and payloads
   memory_graph.rs  Per-object memory tracking
   node.rs          Distributed node types and discovery
+  allocator.rs     Bitmap physical frame allocator
+  heap.rs          Kernel heap (#[global_allocator], linked-list, 2 MiB)
   serial.rs        COM1 UART driver (init, read, write)
   vga_buffer.rs    Serial-backed print!/println! macros
   console.rs       Interactive serial console and command dispatch
@@ -88,6 +90,7 @@ CDK_QEMU_GUI=1 ./run_qemu.sh
 | `mem` | Memory graph summary |
 | `node` | Show local node info |
 | `discover <id> <ms>` | Simulate discovering a remote node |
+| `heapinfo` | Kernel heap usage (total / used / free) |
 | `frames` | Physical frame allocator summary |
 | `palloc` | Allocate one physical frame, print address |
 | `pfree <addr>` | Free a physical frame by hex base address |
@@ -112,7 +115,7 @@ CDK_QEMU_GUI=1 ./run_qemu.sh
 - [x] Set up IDT with double-fault, timer, and keyboard handlers
 - [x] Timer-driven preemptive scheduling (50 ms time slice, round-robin re-queue)
 - [x] 4-level x86_64 page-table manager (map / unmap / translate, lazy interior allocation)
-- [ ] Kernel heap allocator (`#[global_allocator]` backed by frame allocator)
+- [x] Kernel heap allocator (`#[global_allocator]`, linked-list, 2 MiB reserved at boot)
 - [ ] Restore Ed25519 capability signing (needs bare-metal RNG / RDRAND)
 - [ ] Framebuffer text rendering (replace serial-only output)
 - [ ] Network stack integration

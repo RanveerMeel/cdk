@@ -4,7 +4,7 @@
 
 The Cognitive Distributed Kernel (CDK) is a bare-metal kernel targeting x86_64 with:
 
-- `#![no_std]` — no OS, no allocator, no standard library
+- `#![no_std]` + `extern crate alloc` — no OS, no standard library; a custom heap provides `alloc` types
 - Capability-based security for all object access
 - Message-passing IPC between kernel objects
 - Intent-driven scheduling (not thread-based)
@@ -77,6 +77,21 @@ Manages a single 4-level x86_64 page-table hierarchy (PML4 → PDPT → PD → P
 
 The `FrameSource` trait decouples the walker from the concrete allocator, enabling lightweight mock allocators in host unit tests.
 
+### Kernel Heap (`src/heap.rs`)
+
+A `linked_list_allocator::Heap` wrapped in a `spin::Mutex`, registered as `#[global_allocator]` on bare-metal.
+
+| Concept | Detail |
+|---|---|
+| Backing memory | 512 physical frames (2 MiB) allocated from `FrameAllocator` at boot |
+| Address model | Identity-mapped — frame physical addresses == virtual addresses |
+| Thread safety | All access goes through `spin::Mutex`; safe for single-core use |
+| Host tests | `#[global_allocator]` is `#[cfg(target_os = "none")]`-gated; tests call `init_from_slice` with a stack-allocated buffer |
+
+Once the heap is live, `alloc` types (`Box`, `Vec`, `String`, `Arc`) become available throughout the kernel. Current consumers: none yet — the heap is the foundation for the next features (capability signing, smoltcp network stack).
+
+Boot sequence: frame allocator → **heap init** → page-table setup → console.
+
 ### Serial Console (`src/console.rs`)
 
 Interactive command loop over COM1. Locks the global `Kernel`, `MemoryGraph`, and `KernelNode` mutexes per command, then releases them.
@@ -84,6 +99,8 @@ Interactive command loop over COM1. Locks the global `Kernel`, `MemoryGraph`, an
 ## Memory Layout
 
 Large data structures (`Kernel`, `MemoryGraph`, `KernelNode`) are `static` globals in BSS behind `spin::Mutex`, keeping the kernel stack small (~8 KB). The bootloader allocates a 100 KiB stack.
+
+The kernel heap occupies a contiguous 2 MiB region within the physical address space that the bootloader marks as `Usable`.
 
 ## Build Pipeline
 
@@ -98,5 +115,6 @@ All dependencies are `no_std` compatible:
 - `bootloader_api` — entry point macro and `BootInfo`
 - `heapless` — `FnvIndexMap`, `Vec`, `Deque`, `String` with fixed capacities
 - `spin` — spinlock `Mutex` (no OS primitives needed)
+- `linked_list_allocator` — `no_std`-compatible heap for `#[global_allocator]`
 - `panic-halt` — halts on panic
 - `volatile` — volatile memory operations

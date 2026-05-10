@@ -5,6 +5,7 @@ use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
 use spin::Mutex;
 
 use cdk::allocator::FrameAllocator;
+use cdk::heap::KERNEL_HEAP;
 use cdk::kernel::Kernel;
 use cdk::memory_graph::MemoryGraph;
 use cdk::node::KernelNode;
@@ -50,6 +51,22 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         cdk::println!("Frame allocator: {} KiB usable, {} KiB free",
             fa.usable_bytes() / 1024,
             fa.free_bytes() / 1024);
+    }
+
+    // Initialise the kernel heap: 512 frames = 2 MiB.
+    //
+    // Done before any alloc type is used and before the page-table setup
+    // which may eventually use Box for interior tables.
+    {
+        let mut fa = FRAME_ALLOCATOR.lock();
+        match KERNEL_HEAP.init(&mut fa, 512) {
+            Ok(()) => cdk::println!(
+                "Heap: {} KiB initialised ({} KiB free)",
+                KERNEL_HEAP.total_bytes() / 1024,
+                KERNEL_HEAP.free_bytes() / 1024,
+            ),
+            Err(e) => cdk::println!("Heap: WARNING — init failed: {:?}", e),
+        }
     }
 
     // Build the initial kernel page-table hierarchy.

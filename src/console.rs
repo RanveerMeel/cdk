@@ -2,6 +2,7 @@
 
 use crate::serial;
 use crate::allocator::FrameAllocator;
+use crate::heap::KERNEL_HEAP;
 use crate::kernel::Kernel;
 use crate::memory_graph::MemoryGraph;
 use crate::node::KernelNode;
@@ -123,6 +124,7 @@ fn dispatch(
         "timeslice" => cmd_timeslice(),
         "running"   => cmd_running(kernel),
         "frames"     => cmd_frames(frame_alloc),
+        "heapinfo"   => cmd_heapinfo(),
         "palloc"     => cmd_palloc(frame_alloc),
         "pfree"      => cmd_pfree(arg1, frame_alloc),
         "vmmap"      => cmd_vmmap(arg1, arg2, arg3, page_table, frame_alloc),
@@ -155,6 +157,7 @@ fn cmd_help() {
     crate::println!("                    Simulate discovering a remote node");
     crate::println!("  ticks             Show PIT timer tick count since boot");
     crate::println!("  timeslice         Show the preemptive time-slice length (ticks)");
+    crate::println!("  heapinfo          Kernel heap usage (total / used / free)");
     crate::println!("  frames            Physical frame allocator summary");
     crate::println!("  palloc            Allocate one physical frame, print address");
     crate::println!("  pfree <addr>      Free a physical frame by base address (hex)");
@@ -187,6 +190,13 @@ fn cmd_status(kernel: &mut Kernel, mem_graph: &MemoryGraph, node: &KernelNode, p
         Some(pt) => crate::println!("  VM pages:     {} mapped (PML4 @ {:#x})",
             pt.mapped_pages(), pt.pml4_phys()),
         None => crate::println!("  VM pages:     (page table not initialised)"),
+    }
+    if KERNEL_HEAP.is_initialised() {
+        crate::println!("  Heap:         {} KiB used / {} KiB total",
+            KERNEL_HEAP.used_bytes() / 1024,
+            KERNEL_HEAP.total_bytes() / 1024);
+    } else {
+        crate::println!("  Heap:         (not initialised)");
     }
 }
 
@@ -322,6 +332,20 @@ fn cmd_discover(id: &str, latency_str: &str, node: &mut KernelNode) {
     let latency: u32 = parse_u32(latency_str).unwrap_or(100);
     node.discover_node(id, crate::node::NodeType::Edge, "simulated", latency);
     crate::println!("Discovered node '{}' (latency={}ms)", id, latency);
+}
+
+fn cmd_heapinfo() {
+    if !KERNEL_HEAP.is_initialised() {
+        crate::println!("Heap: not initialised");
+        return;
+    }
+    let total = KERNEL_HEAP.total_bytes();
+    let used  = KERNEL_HEAP.used_bytes();
+    let free  = KERNEL_HEAP.free_bytes();
+    crate::println!("=== Kernel Heap ===");
+    crate::println!("  Total : {} KiB", total / 1024);
+    crate::println!("  Used  : {} KiB ({} bytes)", used / 1024, used);
+    crate::println!("  Free  : {} KiB ({} bytes)", free / 1024, free);
 }
 
 fn cmd_frames(fa: &FrameAllocator) {

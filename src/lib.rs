@@ -8,6 +8,7 @@ pub mod gdt;
 #[cfg(target_os = "none")]
 pub mod interrupts;
 pub mod allocator;
+pub mod heap;
 pub mod paging;
 pub mod console;
 pub mod kernel;
