@@ -2,6 +2,7 @@
 
 use crate::serial;
 use crate::allocator::FrameAllocator;
+use crate::capability::Capability;
 use crate::heap::KERNEL_HEAP;
 use crate::kernel::Kernel;
 use crate::memory_graph::MemoryGraph;
@@ -127,6 +128,8 @@ fn dispatch(
         "heapinfo"   => cmd_heapinfo(),
         "palloc"     => cmd_palloc(frame_alloc),
         "pfree"      => cmd_pfree(arg1, frame_alloc),
+        "capsign"    => cmd_capsign(arg1, kernel),
+        "capverify"  => cmd_capverify(arg1, kernel),
         "vmmap"      => cmd_vmmap(arg1, arg2, arg3, page_table, frame_alloc),
         "vmunmap"    => cmd_vmunmap(arg1, page_table),
         "vmtranslate"=> cmd_vmtranslate(arg1, page_table),
@@ -157,6 +160,8 @@ fn cmd_help() {
     crate::println!("                    Simulate discovering a remote node");
     crate::println!("  ticks             Show PIT timer tick count since boot");
     crate::println!("  timeslice         Show the preemptive time-slice length (ticks)");
+    crate::println!("  capsign <id>      Sign a fresh capability for object <id> and verify it");
+    crate::println!("  capverify <id>    Create + sign + verify a capability for object <id>");
     crate::println!("  heapinfo          Kernel heap usage (total / used / free)");
     crate::println!("  frames            Physical frame allocator summary");
     crate::println!("  palloc            Allocate one physical frame, print address");
@@ -210,6 +215,60 @@ fn cmd_running(kernel: &Kernel) {
     match kernel.running_task_id() {
         Some(id) => crate::println!("Running: {}", id),
         None      => crate::println!("(idle — no task currently running)"),
+    }
+}
+
+/// Sign a fresh capability for the given object ID and immediately verify it.
+///
+/// The signing key is ephemeral — this command demonstrates that signing +
+/// verification works end-to-end. Persistent key management is a future feature.
+fn cmd_capsign(id: &str, kernel: &mut Kernel) {
+    if id.is_empty() {
+        crate::println!("Usage: capsign <object-id>");
+        return;
+    }
+    // Build a fresh capability for the object (verifies the ID exists).
+    let obj = kernel.for_each_object_find(id);
+    let obj_ref = match obj {
+        Some(o) => o,
+        None => {
+            crate::println!("Error: object '{}' not found", id);
+            return;
+        }
+    };
+    let mut cap = Capability::new(obj_ref);
+    match Kernel::sign_capability(&mut cap) {
+        Ok(_sk) => {
+            crate::println!("Signed capability for '{}'", id);
+            match cap.verify() {
+                Ok(true)  => crate::println!("  Signature valid ✓"),
+                Ok(false) => crate::println!("  WARNING: signature not present"),
+                Err(e)    => crate::println!("  ERROR: verification failed: {:?}", e),
+            }
+        }
+        Err(e) => crate::println!("Error: signing failed: {:?}", e),
+    }
+}
+
+fn cmd_capverify(id: &str, kernel: &mut Kernel) {
+    if id.is_empty() {
+        crate::println!("Usage: capverify <object-id>");
+        return;
+    }
+    let obj = kernel.for_each_object_find(id);
+    let obj_ref = match obj {
+        Some(o) => o,
+        None => {
+            crate::println!("Error: object '{}' not found", id);
+            return;
+        }
+    };
+    // Unsigned capability: verify returns false (not an error).
+    let cap = Capability::new(obj_ref);
+    match Kernel::verify_capability(&cap) {
+        Ok(true)  => crate::println!("Capability for '{}': signature valid", id),
+        Ok(false) => crate::println!("Capability for '{}': unsigned (no signature)", id),
+        Err(e)    => crate::println!("Capability for '{}': error: {:?}", id, e),
     }
 }
 

@@ -58,6 +58,7 @@ CDK_QEMU_GUI=1 ./run_qemu.sh
   node.rs          Distributed node types and discovery
   allocator.rs     Bitmap physical frame allocator
   heap.rs          Kernel heap (#[global_allocator], linked-list, 2 MiB)
+  rng.rs           RDRAND RNG (bare-metal) / OsRng (host tests)
   serial.rs        COM1 UART driver (init, read, write)
   vga_buffer.rs    Serial-backed print!/println! macros
   console.rs       Interactive serial console and command dispatch
@@ -90,6 +91,8 @@ CDK_QEMU_GUI=1 ./run_qemu.sh
 | `mem` | Memory graph summary |
 | `node` | Show local node info |
 | `discover <id> <ms>` | Simulate discovering a remote node |
+| `capsign <id>` | Sign a fresh capability for object `<id>` and verify the signature |
+| `capverify <id>` | Check whether a capability for `<id>` is signed |
 | `heapinfo` | Kernel heap usage (total / used / free) |
 | `frames` | Physical frame allocator summary |
 | `palloc` | Allocate one physical frame, print address |
@@ -116,7 +119,7 @@ CDK_QEMU_GUI=1 ./run_qemu.sh
 - [x] Timer-driven preemptive scheduling (50 ms time slice, round-robin re-queue)
 - [x] 4-level x86_64 page-table manager (map / unmap / translate, lazy interior allocation)
 - [x] Kernel heap allocator (`#[global_allocator]`, linked-list, 2 MiB reserved at boot)
-- [ ] Restore Ed25519 capability signing (needs bare-metal RNG / RDRAND)
+- [x] Ed25519 capability signing (RDRAND on bare-metal, OsRng on host; SHA-256 message digest)
 - [ ] Framebuffer text rendering (replace serial-only output)
 - [ ] Network stack integration
 - [ ] Multi-core support
