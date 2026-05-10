@@ -86,6 +86,9 @@ CDK_QEMU_GUI=1 ./run_qemu.sh
 | `mem` | Memory graph summary |
 | `node` | Show local node info |
 | `discover <id> <ms>` | Simulate discovering a remote node |
+| `frames` | Physical frame allocator summary |
+| `palloc` | Allocate one physical frame, print address |
+| `pfree <addr>` | Free a physical frame by hex base address |
 
 ## Dependencies
 
@@ -99,8 +102,8 @@ CDK_QEMU_GUI=1 ./run_qemu.sh
 
 ## Roadmap
 
-- [ ] Wire up `BootInfo` and a physical frame allocator
-- [ ] Set up IDT with double-fault, timer, and keyboard handlers
+- [x] Wire up `BootInfo` and a physical frame allocator
+- [x] Set up IDT with double-fault, timer, and keyboard handlers
 - [ ] Timer-driven preemptive scheduling
 - [ ] Restore Ed25519 capability signing (needs bare-metal RNG)
 - [ ] Framebuffer text rendering (replace serial-only output)

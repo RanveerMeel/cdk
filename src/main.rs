@@ -4,6 +4,7 @@
 use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
 use spin::Mutex;
 
+use cdk::allocator::FrameAllocator;
 use cdk::kernel::Kernel;
 use cdk::memory_graph::MemoryGraph;
 use cdk::node::KernelNode;
@@ -18,12 +19,22 @@ static BOOTLOADER_CONFIG: BootloaderConfig = {
 static KERNEL: Mutex<Kernel> = Mutex::new(Kernel::new());
 static MEM_GRAPH: Mutex<MemoryGraph> = Mutex::new(MemoryGraph::new());
 static NODE: Mutex<KernelNode> = Mutex::new(KernelNode::new_const());
+static FRAME_ALLOCATOR: Mutex<FrameAllocator> = Mutex::new(FrameAllocator::new());
 
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
-fn kernel_main(_boot_info: &'static mut BootInfo) -> ! {
+fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     cdk::serial::init();
     cdk::interrupts::init();
+
+    // Initialise the physical frame allocator from the bootloader memory map.
+    {
+        let mut fa = FRAME_ALLOCATOR.lock();
+        cdk::allocator::boot::init(&mut fa, &boot_info.memory_regions);
+        cdk::println!("Frame allocator: {} KiB usable, {} KiB free",
+            fa.usable_bytes() / 1024,
+            fa.free_bytes() / 1024);
+    }
 
     cdk::println!("CDK - Cognitive Distributed Kernel");
     cdk::println!("Booting on bare metal...");
@@ -62,7 +73,7 @@ fn kernel_main(_boot_info: &'static mut BootInfo) -> ! {
         cdk::println!("Node ID: {}", node.node_id());
     }
 
-    cdk::console::run_static(&KERNEL, &MEM_GRAPH, &NODE);
+    cdk::console::run_static(&KERNEL, &MEM_GRAPH, &NODE, &FRAME_ALLOCATOR);
 }
 
 #[panic_handler]
