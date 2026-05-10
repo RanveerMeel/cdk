@@ -1,5 +1,5 @@
 use crate::{
-    capability::{Capability, Permission},
+    capability::{Capability, CapabilityError, Permission},
     message::Message,
     object::KernelObject,
     scheduler::Scheduler,
@@ -42,12 +42,27 @@ impl Kernel {
         cap
     }
 
+    /// Sign a capability with a freshly-generated Ed25519 key.
+    ///
+    /// Returns the 32-byte signing key (secret — caller must store it) and
+    /// updates the capability in place with the signature + verifying key.
+    pub fn sign_capability(cap: &mut Capability) -> Result<[u8; 32], CapabilityError> {
+        let (sk, _vk) = Capability::generate_key();
+        cap.sign(&sk)?;
+        Ok(sk)
+    }
+
+    /// Verify a capability's Ed25519 signature.
+    ///
+    /// Returns `Ok(true)` when valid, `Ok(false)` when unsigned,
+    /// `Err` when the stored key or signature bytes are malformed.
+    pub fn verify_capability(cap: &Capability) -> Result<bool, CapabilityError> {
+        cap.verify()
+    }
+
     pub fn execute(&mut self, cap: &Capability) -> KernelResult<()> {
-        // Verify capability signature if present (simplified for bare-metal)
-        if cap.signature.is_some() {
-            let _ = cap.verify(); // Simplified verification
-        }
-        
+        Self::check_signature(cap)?;
+
         if !cap.has_permission(&Permission::Execute) {
             return Err(KernelError::PermissionDenied);
         }
@@ -67,11 +82,8 @@ impl Kernel {
         to_object_id: &str,
         msg: Message,
     ) -> KernelResult<()> {
-        // Verify capability signature if present (simplified for bare-metal)
-        if from_cap.signature.is_some() {
-            let _ = from_cap.verify();
-        }
-        
+        Self::check_signature(from_cap)?;
+
         if !from_cap.has_permission(&Permission::SendMessage) {
             return Err(KernelError::PermissionDenied);
         }
@@ -95,11 +107,8 @@ impl Kernel {
         &mut self,
         cap: &Capability,
     ) -> KernelResult<Option<Message>> {
-        // Verify capability signature if present (simplified for bare-metal)
-        if cap.signature.is_some() {
-            let _ = cap.verify();
-        }
-        
+        Self::check_signature(cap)?;
+
         if !cap.has_permission(&Permission::ReceiveMessage) {
             return Err(KernelError::PermissionDenied);
         }
@@ -131,11 +140,8 @@ impl Kernel {
     }
 
     pub fn get_object(&self, cap: &Capability) -> KernelResult<&KernelObject> {
-        // Verify capability signature if present (simplified for bare-metal)
-        if cap.signature.is_some() {
-            let _ = cap.verify();
-        }
-        
+        Self::check_signature(cap)?;
+
         if !cap.has_permission(&Permission::Read) {
             return Err(KernelError::PermissionDenied);
         }
@@ -146,11 +152,8 @@ impl Kernel {
     }
 
     pub fn delete_object(&mut self, cap: &Capability) -> KernelResult<()> {
-        // Verify capability signature if present (simplified for bare-metal)
-        if cap.signature.is_some() {
-            let _ = cap.verify();
-        }
-        
+        Self::check_signature(cap)?;
+
         if !cap.has_permission(&Permission::Delete) {
             return Err(KernelError::PermissionDenied);
         }
@@ -166,11 +169,8 @@ impl Kernel {
     }
 
     pub fn validate_capability(&self, cap: &Capability) -> KernelResult<()> {
-        // Verify signature if present (simplified for bare-metal)
-        if cap.signature.is_some() {
-            let _ = cap.verify();
-        }
-        
+        Self::check_signature(cap)?;
+
         if !self.objects.contains_key(&cap.object_id) {
             return Err(KernelError::InvalidCapability);
         }
@@ -187,6 +187,12 @@ impl Kernel {
         for obj in self.objects.values() {
             f(obj);
         }
+    }
+
+    /// Find an object by its string ID, returning a shared reference.
+    pub fn for_each_object_find(&self, id: &str) -> Option<&KernelObject> {
+        let key: String<MAX_ID_LEN> = String::from_str(id).unwrap_or_default();
+        self.objects.get(&key)
     }
 
     pub fn schedule_by_id(&mut self, id: &str) -> KernelResult<()> {
@@ -209,6 +215,22 @@ impl Kernel {
         let key: String<MAX_ID_LEN> = String::from_str(id).unwrap_or_default();
         let obj = self.objects.get_mut(&key).ok_or(KernelError::ObjectNotFound)?;
         Ok(obj.pop_message())
+    }
+
+    /// If the capability carries a signature, verify it.
+    ///
+    /// Returns `Err(InvalidSignature)` when the signature is present but
+    /// invalid; returns `Ok(())` when unsigned or when the signature checks
+    /// out.
+    fn check_signature(cap: &Capability) -> KernelResult<()> {
+        if cap.signature.is_none() {
+            return Ok(());
+        }
+        match cap.verify() {
+            Ok(true)  => Ok(()),
+            Ok(false) => Err(KernelError::InvalidSignature),
+            Err(_)    => Err(KernelError::InvalidSignature),
+        }
     }
 
     pub fn delete_by_id(&mut self, id: &str) -> KernelResult<()> {

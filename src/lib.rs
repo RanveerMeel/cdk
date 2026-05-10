@@ -9,6 +9,7 @@ pub mod gdt;
 pub mod interrupts;
 pub mod allocator;
 pub mod heap;
+pub mod rng;
 pub mod paging;
 pub mod console;
 pub mod kernel;

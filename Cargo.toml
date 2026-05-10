@@ -21,7 +21,6 @@ name = "cdk"
 path = "src/main.rs"
 required-features = []
 
-
 [build-dependencies]
 bootimage = "0.10"
 
@@ -36,20 +35,25 @@ spin = "0.9"
 # Volatile memory access
 volatile = "0.4"
 
+# Cryptographic signing for capabilities.
+# ed25519-dalek: no_std; rand_core feature enables SigningKey::generate().
+# sha2: no_std digest used to build the signable message.
+ed25519-dalek = { version = "2.0", default-features = false, features = ["rand_core"] }
+sha2 = { version = "0.10", default-features = false }
+
+# rand_core on host includes getrandom (OsRng); bare-metal uses traits only.
+[target.'cfg(not(target_os = "none"))'.dependencies]
+rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
+
 # Bare-metal only: bootloader entry point, CPU structures, panic handler.
-# These are compiled for the kernel binary (x86_64-unknown-none).
 # When running `cargo test` pass the host target explicitly, e.g.:
-#   cargo test --target x86_64-apple-darwin   (macOS)
+#   cargo test --target aarch64-apple-darwin  (Apple Silicon macOS)
 #   cargo test --target x86_64-unknown-linux-gnu  (Linux)
 [target.'cfg(target_os = "none")'.dependencies]
 bootloader_api = "0.11"
 x86_64 = { version = "0.15", default-features = false, features = ["instructions", "abi_x86_interrupt"] }
 panic-halt = "0.2"
-
-# Cryptographic signing for capabilities (disabled for now - needs RNG)
-# ed25519-dalek = { version = "2.0", default-features = false }
-# sha2 = { version = "0.10", default-features = false }
-# Note: rand/getrandom don't work on bare-metal without custom RNG implementation
+rand_core = { version = "0.6", default-features = false }
 
 # Network support for distributed kernel
 # smoltcp = { version = "0.10", default-features = false, features = ["alloc"] }

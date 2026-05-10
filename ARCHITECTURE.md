@@ -16,9 +16,33 @@ The Cognitive Distributed Kernel (CDK) is a bare-metal kernel targeting x86_64 w
 
 Central registry of kernel objects. All access goes through capability tokens. Owns the scheduler and dispatches execution.
 
-### Capabilities (`src/capability.rs`)
+### Capabilities (`src/capability.rs` + `src/rng.rs`)
 
-Permission tokens bound to a specific object. Supports: Read, Write, Execute, SendMessage, ReceiveMessage, Delete. Designed for Ed25519 signing (currently simplified for bare-metal — no RNG yet).
+Permission tokens bound to a specific object. Supports: Read, Write, Execute, SendMessage, ReceiveMessage, Delete.
+
+#### Ed25519 signing
+
+Every capability can optionally carry an Ed25519 signature over a SHA-256 digest:
+
+```
+message = SHA-256(object_id_bytes ‖ sorted_permission_tags)
+signature = Ed25519-Sign(signing_key, message)
+```
+
+| Detail | Value |
+|---|---|
+| Algorithm | Ed25519 (RFC 8032) — deterministic, no random nonce |
+| Digest | SHA-256 over object ID + permission tag bytes (sorted) |
+| Key size | 32-byte signing key, 32-byte verifying key stored inline |
+| Signature size | 64 bytes stored in `Capability.signature` |
+
+`Kernel::check_signature` enforces signature validity on every capability-gated operation: if a signature is present and invalid the operation is rejected with `KernelError::InvalidSignature`.
+
+#### RNG (`src/rng.rs`)
+
+`KernelRng` implements `rand_core::CryptoRng + RngCore`:
+- **Bare-metal**: RDRAND instruction (retried up to 10 times; panics if exhausted)
+- **Host tests**: `rand_core::OsRng` backed by OS entropy
 
 ### Objects (`src/object.rs`)
 
@@ -116,5 +140,8 @@ All dependencies are `no_std` compatible:
 - `heapless` — `FnvIndexMap`, `Vec`, `Deque`, `String` with fixed capacities
 - `spin` — spinlock `Mutex` (no OS primitives needed)
 - `linked_list_allocator` — `no_std`-compatible heap for `#[global_allocator]`
+- `ed25519-dalek` — Ed25519 signing and verification
+- `sha2` — SHA-256 message digest
+- `rand_core` — `CryptoRng` / `RngCore` traits
 - `panic-halt` — halts on panic
 - `volatile` — volatile memory operations
