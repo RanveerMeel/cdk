@@ -41,8 +41,7 @@
 #[cfg(target_os = "none")]
 use x86_64::{
     structures::paging::{
-        PageTable as X86PageTable, PageTableEntry, PageTableFlags as X86Flags,
-        PageTableIndex,
+        PageTableEntry, PageTableFlags as X86Flags,
     },
     PhysAddr, VirtAddr,
 };
@@ -128,7 +127,7 @@ mod host_stubs {
 }
 
 #[cfg(not(target_os = "none"))]
-use host_stubs::{PhysAddr, X86Flags, X86PageTable, PageTableEntry, PageTableIndex};
+use host_stubs::{PhysAddr, X86Flags, X86PageTable, PageTableEntry};
 
 
 // ---------------------------------------------------------------------------
@@ -162,31 +161,17 @@ impl MapFlags {
     }
 
     fn to_x86_leaf(&self) -> X86Flags {
-        #[cfg(target_os = "none")]
-        {
-            let mut f = X86Flags::PRESENT;
-            if self.writable { f |= X86Flags::WRITABLE; }
-            if self.user     { f |= X86Flags::USER_ACCESSIBLE; }
-            if self.no_exec  { f |= X86Flags::NO_EXECUTE; }
-            f
-        }
-        #[cfg(not(target_os = "none"))]
-        {
-            let mut f = X86Flags::PRESENT;
-            if self.writable { f |= X86Flags::WRITABLE; }
-            if self.user     { f |= X86Flags::USER_ACCESSIBLE; }
-            if self.no_exec  { f |= X86Flags::NO_EXECUTE; }
-            f
-        }
+        let mut f = X86Flags::PRESENT;
+        if self.writable { f |= X86Flags::WRITABLE; }
+        if self.user     { f |= X86Flags::USER_ACCESSIBLE; }
+        if self.no_exec  { f |= X86Flags::NO_EXECUTE; }
+        f
     }
 
     /// Flags for an interior table node (always present + writable so the
     /// walk can descend regardless of the leaf permissions).
     fn interior() -> X86Flags {
-        #[cfg(target_os = "none")]
-        { X86Flags::PRESENT | X86Flags::WRITABLE }
-        #[cfg(not(target_os = "none"))]
-        { X86Flags::PRESENT | X86Flags::WRITABLE }
+        X86Flags::PRESENT | X86Flags::WRITABLE
     }
 }
 
@@ -349,9 +334,12 @@ impl PageTableManager {
         let pd_phys   = self.get_or_create(pdpt_phys,      idx.pdpt, alloc)?;
         let pt_phys   = self.get_or_create(pd_phys,        idx.pd,   alloc)?;
 
-        // Write the leaf PTE.
-        let pt = Self::table_mut(pt_phys);
-        let entry = Self::entry_mut(pt, idx.pt);
+        // Write the leaf PTE.  We take the mutable reference only here,
+        // after all interior tables are fully resolved, so no two `&mut`
+        // references to the same frame can exist simultaneously.
+        // SAFETY: pt_phys is a valid, aligned, identity-mapped frame from FrameSource;
+        //         idx.pt is always in 0..512.
+        let entry = unsafe { &mut *Self::entry_ptr_mut(pt_phys, idx.pt) };
 
         if !entry.is_unused() {
             return Err(PagingError::AlreadyMapped);
@@ -375,8 +363,9 @@ impl PageTableManager {
         let pd_phys   = self.descend(pdpt_phys,      idx.pdpt)?;
         let pt_phys   = self.descend(pd_phys,        idx.pd)?;
 
-        let pt = Self::table_mut(pt_phys);
-        let entry = Self::entry_mut(pt, idx.pt);
+        // SAFETY: pt_phys is a valid, aligned, identity-mapped frame from FrameSource;
+        //         idx.pt is always in 0..512.
+        let entry = unsafe { &mut *Self::entry_ptr_mut(pt_phys, idx.pt) };
 
         if entry.is_unused() {
             return Err(PagingError::NotMapped);
@@ -398,8 +387,9 @@ impl PageTableManager {
         let pd_phys   = self.descend(pdpt_phys,      idx.pdpt)?;
         let pt_phys   = self.descend(pd_phys,        idx.pd)?;
 
-        let pt = Self::table_ref(pt_phys);
-        let entry = Self::entry_ref(pt, idx.pt);
+        // SAFETY: pt_phys is a valid, aligned, identity-mapped frame from FrameSource;
+        //         idx.pt is always in 0..512.
+        let entry = unsafe { &*Self::entry_ptr(pt_phys, idx.pt) };
 
         if entry.is_unused() {
             return Err(PagingError::NotMapped);
@@ -420,12 +410,10 @@ impl PageTableManager {
         child_idx: usize,
         alloc: &mut A,
     ) -> PagingResult<u64> {
-        let parent = Self::table_mut(parent_phys);
-        let pti = PageTableIndex::new(child_idx as u16);
-        let entry = &mut parent[pti];
-
+        // SAFETY: parent_phys is a valid, aligned, identity-mapped frame;
+        //         child_idx is always in 0..512.
+        let entry = unsafe { &mut *Self::entry_ptr_mut(parent_phys, child_idx) };
         if entry.is_unused() {
-            // Allocate a new child frame.
             let child_phys = alloc.alloc_zeroed().ok_or(PagingError::OutOfMemory)?;
             entry.set_addr(PhysAddr::new(child_phys), MapFlags::interior());
             Ok(child_phys)
@@ -436,9 +424,9 @@ impl PageTableManager {
 
     /// Walk down one level; return the child frame address or `NotMapped`.
     fn descend(&self, parent_phys: u64, child_idx: usize) -> PagingResult<u64> {
-        let parent = Self::table_ref(parent_phys);
-        let pti = PageTableIndex::new(child_idx as u16);
-        let entry = &parent[pti];
+        // SAFETY: parent_phys is a valid, aligned, identity-mapped frame;
+        //         child_idx is always in 0..512.
+        let entry = unsafe { &*Self::entry_ptr(parent_phys, child_idx) };
         if entry.is_unused() {
             Err(PagingError::NotMapped)
         } else {
@@ -450,22 +438,23 @@ impl PageTableManager {
     // Raw pointer helpers (identity-mapped: phys == virt)
     // -----------------------------------------------------------------------
 
-    fn table_ref(phys: u64) -> &'static X86PageTable {
-        // SAFETY: identity mapping — phys == virt; caller ensures alignment.
-        unsafe { &*(phys as *const X86PageTable) }
+    /// Return a raw mutable pointer to a specific entry inside the page table
+    /// at `phys`.
+    ///
+    /// `idx` must be 0–511.  Using a pointer (rather than `&mut table[idx]`)
+    /// avoids the "implicit autoref of raw pointer deref" lint on nightly.
+    ///
+    /// # Safety
+    /// `phys` must be a valid, 4 KiB-aligned, identity-mapped frame.
+    /// The caller is responsible for ensuring unique access.
+    unsafe fn entry_ptr_mut(phys: u64, idx: usize) -> *mut PageTableEntry {
+        // SAFETY: caller guarantees phys is a valid, aligned frame; idx < 512.
+        (phys as *mut PageTableEntry).add(idx)
     }
 
-    fn table_mut(phys: u64) -> &'static mut X86PageTable {
-        // SAFETY: identity mapping — phys == virt; caller ensures alignment.
-        unsafe { &mut *(phys as *mut X86PageTable) }
-    }
-
-    fn entry_ref(table: &X86PageTable, idx: usize) -> &PageTableEntry {
-        &table[PageTableIndex::new(idx as u16)]
-    }
-
-    fn entry_mut(table: &mut X86PageTable, idx: usize) -> &mut PageTableEntry {
-        &mut table[PageTableIndex::new(idx as u16)]
+    /// Same as `entry_ptr_mut` but returns a shared pointer.
+    unsafe fn entry_ptr(phys: u64, idx: usize) -> *const PageTableEntry {
+        (phys as *const PageTableEntry).add(idx)
     }
 }
 

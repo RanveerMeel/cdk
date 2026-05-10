@@ -2,6 +2,7 @@ use crate::message::Message;
 use heapless::Deque;
 use heapless::String;
 use core::str::FromStr;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 const MAX_ID_LEN: usize = 64;
 const MAX_KIND_LEN: usize = 32;
@@ -41,15 +42,15 @@ impl KernelObject {
     }
 
     fn generate_id() -> String<MAX_ID_LEN> {
-        // Simple counter-based ID (in production, use proper RNG)
-        static mut COUNTER: u64 = 0;
-        unsafe {
-            COUNTER += 1;
-            let mut id = String::new();
-            let _ = id.push_str("obj-");
-            let _ = write_number(&mut id, COUNTER);
-            id
-        }
+        // AtomicU64 avoids a data race if objects are ever created from
+        // multiple contexts (e.g. interrupt + boot path).
+        // TODO(rdrand): switch to a random ID once RDRAND is wired.
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut id = String::new();
+        let _ = id.push_str("obj-");
+        let _ = write_number(&mut id, n);
+        id
     }
 }
 

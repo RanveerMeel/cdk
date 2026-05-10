@@ -16,8 +16,8 @@
 //! expired without the ISR needing to know about `KERNEL` directly.
 
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
-use spin::{Mutex, Once};
-use core::sync::atomic::{AtomicPtr, Ordering as AtomicOrdering};
+use spin::Once;
+use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering as AtomicOrdering};
 
 // ---------------------------------------------------------------------------
 // PIC constants
@@ -43,11 +43,16 @@ pub const KEYBOARD_INTERRUPT_ID: u8 = PIC1_OFFSET + 1;
 // ---------------------------------------------------------------------------
 
 /// Incremented on every PIT timer interrupt.  Read with [`ticks()`].
-static TICKS: Mutex<u64> = Mutex::new(0);
+///
+/// `AtomicU64` is used instead of `spin::Mutex` so the ISR never spins —
+/// a spinlock here would deadlock if the same core interrupted itself while
+/// holding the lock (relevant on multi-core where lock-holder migration is
+/// possible).
+static TICKS: AtomicU64 = AtomicU64::new(0);
 
 /// Returns the number of timer ticks since the IDT was loaded.
 pub fn ticks() -> u64 {
-    *TICKS.lock()
+    TICKS.load(AtomicOrdering::Relaxed)
 }
 
 // ---------------------------------------------------------------------------
@@ -242,17 +247,11 @@ extern "x86-interrupt" fn double_fault_handler(
 // ---------------------------------------------------------------------------
 
 extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
-    let tick = {
-        let mut t = TICKS.lock();
-        *t = t.wrapping_add(1);
-        *t
-        // Lock released here before we call the preemption hook, which may
-        // itself attempt to lock KERNEL.  Keeping TICKS lock-free at that
-        // point prevents priority-inversion deadlocks.
-    };
-    // EOI first so the PIC can accept the next interrupt while we run the hook.
+    // fetch_add is atomic and lock-free — safe to call inside an ISR.
+    let tick = TICKS.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+    // EOI before the hook so the PIC can accept the next interrupt
+    // while the preemption callback runs.
     unsafe { send_eoi(0) };
-    // Invoke the preemption hook registered by main.rs (non-blocking).
     call_preempt_hook(tick);
 }
 

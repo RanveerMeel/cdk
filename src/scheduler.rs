@@ -17,7 +17,7 @@ pub struct ScheduledTask {
 
 impl Ord for ScheduledTask {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Higher priority first
+        // Reversed so the highest-priority entry sorts to index 0.
         other.priority.cmp(&self.priority)
     }
 }
@@ -36,7 +36,6 @@ pub struct RunningTask {
     pub started_at_tick: u64,
 }
 
-// Use Vec with manual priority management (simpler than BinaryHeap API)
 pub struct Scheduler {
     queue: Vec<ScheduledTask, MAX_QUEUE_SIZE>,
     /// The task currently occupying the CPU (if any).
@@ -69,10 +68,13 @@ impl Scheduler {
 
     /// Dispatch the highest-priority queued task, marking it as running.
     ///
-    /// Returns the task's object-id string so the caller can act on it.
-    /// If a task is already running it is returned unchanged (caller must
-    /// wait for `preempt_if_expired` to evict it first).
+    /// Returns `None` and leaves the scheduler unchanged if a task is already
+    /// running — callers must let preemption evict it first.  This prevents
+    /// silently overwriting the `running` slot and losing the current task.
     pub fn execute_next(&mut self) -> Option<heapless::String<64>> {
+        if self.running.is_some() {
+            return None;
+        }
         self.execute_next_at(0)
     }
 
@@ -109,9 +111,13 @@ impl Scheduler {
                     rt.task.object_id,
                     TICKS_PER_SLICE
                 );
-                // Re-enqueue so the task is not lost.
-                let _ = self.queue.push(rt.task);
-                self.queue.sort_unstable();
+                if self.queue.push(rt.task).is_err() {
+                    // Queue is at capacity — task is dropped.  This should
+                    // not happen in normal operation (MAX_QUEUE_SIZE = 32).
+                    crate::println!("[preempt] WARNING: queue full, task dropped");
+                } else {
+                    self.queue.sort_unstable();
+                }
             }
             // Dispatch the next task (if any).
             self.execute_next_at(current_tick)
@@ -138,12 +144,12 @@ impl Scheduler {
 
     fn intent_to_priority(intent: &str) -> u8 {
         match intent {
-            "low_latency" => 10,  // Highest priority
-            "interactive" => 7,
-            "normal" => 5,
-            "batch" => 3,
-            "energy_saving" => 2,  // Lower priority
-            _ => 5,  // Default
+            "low_latency"   => 10,
+            "interactive"   => 7,
+            "normal"        => 5,
+            "batch"         => 3,
+            "energy_saving" => 2,
+            _               => 5,
         }
     }
 }
@@ -184,14 +190,20 @@ mod tests {
         sched.schedule(&make_obj("fast", "low_latency"));   // priority 10
         sched.schedule(&make_obj("mid", "normal"));         // priority 5
 
-        let first  = sched.execute_next().unwrap();
+        // complete_running() clears the running slot so execute_next()
+        // can dispatch the next task without overwriting the previous one.
+        let first = sched.execute_next().unwrap();
+        sched.complete_running();
         let second = sched.execute_next().unwrap();
-        let third  = sched.execute_next().unwrap();
+        sched.complete_running();
+        let third = sched.execute_next().unwrap();
+        sched.complete_running();
 
         assert!(!first.is_empty());
         assert!(!second.is_empty());
         assert!(!third.is_empty());
         assert_eq!(sched.queue_size(), 0);
+        assert!(sched.running_task().is_none());
     }
 
     #[test]

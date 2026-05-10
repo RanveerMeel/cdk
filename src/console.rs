@@ -247,8 +247,11 @@ fn cmd_schedule(id: &str, kernel: &mut Kernel) {
 
 fn cmd_run_next(kernel: &mut Kernel) {
     match kernel.execute_next() {
-        Some(id) => crate::println!("Completed: {}", id),
-        None => crate::println!("(scheduler queue empty)"),
+        Some(id) => crate::println!("Dispatched: {}", id),
+        None => match kernel.running_task_id() {
+            Some(id) => crate::println!("(task '{}' already running — wait for preemption)", id),
+            None     => crate::println!("(scheduler queue empty)"),
+        },
     }
 }
 
