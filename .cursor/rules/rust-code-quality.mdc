@@ -1,0 +1,47 @@
+---
+description: Rust code quality rules for CDK kernel source files
+globs: src/**/*.rs
+alwaysApply: false
+---
+
+# Rust Code Quality — CDK
+
+## No redundant comments
+Only explain *why*, never *what*. Delete comments that restate the code.
+```rust
+// ❌  Increment the counter
+*t = t.wrapping_add(1);
+
+// ✅  wrapping_add avoids UB on tick counter overflow
+*t = t.wrapping_add(1);
+```
+
+## Errors must be handled
+Never silently discard a `Result` or `Option`.  
+Use `ok_or(...)`, `unwrap_or_else(...)`, or propagate with `?`.
+```rust
+// ❌
+let _ = queue.push(task);
+
+// ✅
+if queue.push(task).is_err() {
+    crate::println!("scheduler: queue full, task dropped");
+}
+```
+
+## Unsafe blocks need a SAFETY comment
+Every `unsafe` block must have a `// SAFETY:` comment explaining the invariant.
+```rust
+// ✅
+// SAFETY: identity-mapped — phys == virt; frame is 4 KiB aligned.
+unsafe { &mut *(phys as *mut X86PageTable) }
+```
+
+## Tests are required for new public logic
+Every new public function with non-trivial behaviour needs at least one test.  
+Tests live in `#[cfg(test)] mod tests` at the bottom of the same file.  
+Use the `cargo test-host` alias (`cargo test --target aarch64-apple-darwin --lib`).
+
+## Static globals use spin::Mutex
+Mutable shared kernel state goes in `static FOO: Mutex<T>`.  
+Use `try_lock()` inside interrupt handlers — never `lock()`.
