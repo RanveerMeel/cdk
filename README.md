@@ -91,6 +91,10 @@ CDK_QEMU_GUI=1 ./run_qemu.sh
 | `frames` | Physical frame allocator summary |
 | `palloc` | Allocate one physical frame, print address |
 | `pfree <addr>` | Free a physical frame by hex base address |
+| `vminfo` | Virtual memory summary (PML4 address, mapped pages) |
+| `vmmap <virt> <phys> [flags]` | Map virtual page → physical frame (`flags`: `krx`, `krw`, `urw`) |
+| `vmunmap <virt>` | Remove a virtual page mapping |
+| `vmtranslate <virt>` | Resolve virtual address to physical |
 
 ## Dependencies
 
@@ -107,6 +111,8 @@ CDK_QEMU_GUI=1 ./run_qemu.sh
 - [x] Wire up `BootInfo` and a physical frame allocator
 - [x] Set up IDT with double-fault, timer, and keyboard handlers
 - [x] Timer-driven preemptive scheduling (50 ms time slice, round-robin re-queue)
+- [x] 4-level x86_64 page-table manager (map / unmap / translate, lazy interior allocation)
+- [ ] Kernel heap allocator (`#[global_allocator]` backed by frame allocator)
 - [ ] Restore Ed25519 capability signing (needs bare-metal RNG / RDRAND)
 - [ ] Framebuffer text rendering (replace serial-only output)
 - [ ] Network stack integration

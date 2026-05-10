@@ -1,0 +1,27 @@
+---
+description: CDK project-wide conventions — commit standards, module structure, no_std constraints
+alwaysApply: true
+---
+
+# CDK Project Conventions
+
+## Commit messages (enforced by hook)
+Format: `type(scope): short summary`
+- `type`: feat | fix | docs | refactor | perf | test | chore | ci
+- `scope`: lowercase kebab-case (e.g. `scheduler`, `paging`)
+- `feat`, `fix`, `refactor` **must** include a body with implementation context
+- Never use `WIP`, `tmp`, `fixup!`, or `squash!`
+
+## Branch workflow
+- Never push directly to `main` — always use a topic branch + PR
+- Branch naming: `feat/<scope>`, `fix/<scope>`, `docs/<scope>`
+
+## Module structure
+Each subsystem lives in its own `src/<name>.rs`.  
+Bare-metal-only code is gated with `#[cfg(target_os = "none")]`.  
+Host-runnable code (tests, pure logic) has no cfg gate.
+
+## no_std constraints
+- No `std` imports anywhere in `src/` — use `core::` and `heapless`
+- No dynamic allocation unless a `#[global_allocator]` is explicitly wired
+- New dependencies must be `no_std`-compatible and added to the bare-metal `[target.'cfg(target_os = "none")'.dependencies]` section if hardware-specific
