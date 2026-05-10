@@ -116,6 +116,20 @@ impl Kernel {
         self.scheduler.execute_next()
     }
 
+    /// Advance the scheduler clock by one timer tick.
+    ///
+    /// If the running task's time slice has expired, it is evicted and the
+    /// next queued task is dispatched.  Returns `Some(id)` on a context
+    /// switch, `None` otherwise.
+    pub fn preempt_tick(&mut self, current_tick: u64) -> Option<String<MAX_ID_LEN>> {
+        self.scheduler.preempt_if_expired(current_tick)
+    }
+
+    /// Object id of the task currently occupying the CPU (if any).
+    pub fn running_task_id(&self) -> Option<&str> {
+        self.scheduler.running_task().map(|rt| rt.task.object_id.as_str())
+    }
+
     pub fn get_object(&self, cap: &Capability) -> KernelResult<&KernelObject> {
         // Verify capability signature if present (simplified for bare-metal)
         if cap.signature.is_some() {

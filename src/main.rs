@@ -23,8 +23,22 @@ static FRAME_ALLOCATOR: Mutex<FrameAllocator> = Mutex::new(FrameAllocator::new()
 
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
+/// Preemption callback invoked by the timer ISR on every tick.
+///
+/// Uses `try_lock` so the ISR never spins waiting for the kernel lock — if the
+/// lock is held by the console or boot code the tick is silently skipped and
+/// the scheduler catches up on the next one.
+fn on_timer_tick(tick: u64) {
+    if let Some(mut k) = KERNEL.try_lock() {
+        k.preempt_tick(tick);
+    }
+}
+
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     cdk::serial::init();
+    // Register the preemption hook *before* enabling interrupts so the very
+    // first timer IRQ already has a valid callback.
+    cdk::interrupts::set_preempt_hook(on_timer_tick);
     cdk::interrupts::init();
 
     // Initialise the physical frame allocator from the bootloader memory map.
