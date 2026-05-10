@@ -63,6 +63,20 @@ Tracks per-object memory allocations with reference counting. Provides total mem
 
 Models a multi-machine topology with Local, Edge, and Cloud node types. Supports discovery, latency tracking, and type-preferred routing.
 
+### Virtual Memory (`src/paging.rs`)
+
+Manages a single 4-level x86_64 page-table hierarchy (PML4 → PDPT → PD → PT).
+
+| Concept | Detail |
+|---|---|
+| Root frame | PML4 allocated from `FrameAllocator` at boot; physical address stored in `PageTableManager` |
+| Interior nodes | Allocated lazily on first use via `FrameSource::alloc_zeroed` |
+| Identity mapping | All physical addresses are assumed identity-mapped (phys == virt for kernel space) — the bootloader guarantees this |
+| Page flags | `MapFlags` wraps `PRESENT`, `WRITABLE`, `USER`, `NO_EXECUTE` into three presets: `kernel_rx`, `kernel_rw`, `user_rw` |
+| API | `map(virt, phys, flags)`, `unmap(virt)`, `translate(virt) → phys` |
+
+The `FrameSource` trait decouples the walker from the concrete allocator, enabling lightweight mock allocators in host unit tests.
+
 ### Serial Console (`src/console.rs`)
 
 Interactive command loop over COM1. Locks the global `Kernel`, `MemoryGraph`, and `KernelNode` mutexes per command, then releases them.

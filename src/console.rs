@@ -7,6 +7,7 @@ use crate::memory_graph::MemoryGraph;
 use crate::node::KernelNode;
 use crate::object::KernelObject;
 use crate::message::Message;
+use crate::paging::{MapFlags, PageTableManager};
 use spin::Mutex;
 
 const MAX_LINE: usize = 128;
@@ -17,6 +18,7 @@ pub fn run_static(
     mem_graph: &'static Mutex<MemoryGraph>,
     node: &'static Mutex<KernelNode>,
     frame_alloc: &'static Mutex<FrameAllocator>,
+    page_table: &'static Mutex<Option<PageTableManager>>,
 ) -> ! {
     crate::println!("\n--- CDK Serial Console ---");
     crate::println!("Type 'help' for available commands.\n");
@@ -31,7 +33,14 @@ pub fn run_static(
         if line.is_empty() {
             continue;
         }
-        dispatch(line, &mut kernel.lock(), &mut mem_graph.lock(), &mut node.lock(), &mut frame_alloc.lock());
+        dispatch(
+            line,
+            &mut kernel.lock(),
+            &mut mem_graph.lock(),
+            &mut node.lock(),
+            &mut frame_alloc.lock(),
+            &mut page_table.lock(),
+        );
     }
 }
 
@@ -86,15 +95,17 @@ fn dispatch(
     mem_graph: &mut MemoryGraph,
     node: &mut KernelNode,
     frame_alloc: &mut FrameAllocator,
+    page_table: &mut Option<PageTableManager>,
 ) {
-    let mut parts = line.splitn(3, ' ');
+    let mut parts = line.splitn(4, ' ');
     let cmd = parts.next().unwrap_or("");
     let arg1 = parts.next().unwrap_or("");
     let arg2 = parts.next().unwrap_or("");
+    let arg3 = parts.next().unwrap_or("");
 
     match cmd {
         "help" | "?" => cmd_help(),
-        "status" => cmd_status(kernel, mem_graph, node),
+        "status" => cmd_status(kernel, mem_graph, node, page_table),
         "create" => cmd_create(arg1, arg2, kernel, mem_graph),
         "list" => cmd_list(kernel),
         "schedule" => cmd_schedule(arg1, kernel),
@@ -111,9 +122,13 @@ fn dispatch(
         "ticks" => crate::println!("Timer ticks: (unavailable outside bare-metal)"),
         "timeslice" => cmd_timeslice(),
         "running"   => cmd_running(kernel),
-        "frames" => cmd_frames(frame_alloc),
-        "palloc" => cmd_palloc(frame_alloc),
-        "pfree"  => cmd_pfree(arg1, frame_alloc),
+        "frames"     => cmd_frames(frame_alloc),
+        "palloc"     => cmd_palloc(frame_alloc),
+        "pfree"      => cmd_pfree(arg1, frame_alloc),
+        "vmmap"      => cmd_vmmap(arg1, arg2, arg3, page_table, frame_alloc),
+        "vmunmap"    => cmd_vmunmap(arg1, page_table),
+        "vmtranslate"=> cmd_vmtranslate(arg1, page_table),
+        "vminfo"     => cmd_vminfo(page_table),
         "echo" => crate::println!("{} {}", arg1, arg2),
         "panic" => panic!("user-triggered panic"),
         _ => crate::println!("Unknown command: '{}'. Type 'help'.", cmd),
@@ -143,11 +158,17 @@ fn cmd_help() {
     crate::println!("  frames            Physical frame allocator summary");
     crate::println!("  palloc            Allocate one physical frame, print address");
     crate::println!("  pfree <addr>      Free a physical frame by base address (hex)");
+    crate::println!("  vminfo            Virtual memory: PML4 address + mapped page count");
+    crate::println!("  vmmap <virt> <phys> [flags]");
+    crate::println!("                    Map virtual page to physical frame");
+    crate::println!("                    flags: krx (default), krw, urw");
+    crate::println!("  vmunmap <virt>    Remove mapping for virtual page");
+    crate::println!("  vmtranslate <virt> Resolve virtual address to physical");
     crate::println!("  echo <text>       Echo text back");
     crate::println!("  panic             Trigger a kernel panic (test)");
 }
 
-fn cmd_status(kernel: &mut Kernel, mem_graph: &MemoryGraph, node: &KernelNode) {
+fn cmd_status(kernel: &mut Kernel, mem_graph: &MemoryGraph, node: &KernelNode, page_table: &Option<PageTableManager>) {
     crate::println!("=== CDK Kernel Status ===");
     crate::println!("  Node:         {}", node.node_id());
     crate::println!("  Objects:      {}", kernel.object_count());
@@ -162,6 +183,11 @@ fn cmd_status(kernel: &mut Kernel, mem_graph: &MemoryGraph, node: &KernelNode) {
     crate::println!("  Memory:       {} bytes tracked", mem_graph.total_memory());
     crate::println!("  Mem objects:  {}", mem_graph.object_count());
     crate::println!("  Known nodes:  {}", node.known_nodes_count());
+    match page_table {
+        Some(pt) => crate::println!("  VM pages:     {} mapped (PML4 @ {:#x})",
+            pt.mapped_pages(), pt.pml4_phys()),
+        None => crate::println!("  VM pages:     (page table not initialised)"),
+    }
 }
 
 fn cmd_timeslice() {
@@ -324,6 +350,88 @@ fn cmd_pfree(addr_str: &str, fa: &mut FrameAllocator) {
             Err(e) => crate::println!("Error: {:?}", e),
         },
         None => crate::println!("Error: invalid hex address '{}'", addr_str),
+    }
+}
+
+fn cmd_vminfo(page_table: &Option<PageTableManager>) {
+    match page_table {
+        Some(pt) => {
+            crate::println!("=== Virtual Memory ===");
+            crate::println!("  PML4 root : {:#x}", pt.pml4_phys());
+            crate::println!("  Mapped    : {} pages ({} KiB)",
+                pt.mapped_pages(),
+                pt.mapped_pages() as u64 * crate::paging::PAGE_SIZE / 1024);
+        }
+        None => crate::println!("Page table not initialised."),
+    }
+}
+
+fn cmd_vmmap(
+    virt_str: &str,
+    phys_str: &str,
+    flags_str: &str,
+    page_table: &mut Option<PageTableManager>,
+    frame_alloc: &mut FrameAllocator,
+) {
+    if virt_str.is_empty() || phys_str.is_empty() {
+        crate::println!("Usage: vmmap <virt_hex> <phys_hex> [flags: krx|krw|urw]");
+        return;
+    }
+    let virt = match parse_hex(virt_str) {
+        Some(v) => v,
+        None => { crate::println!("Invalid virtual address '{}'", virt_str); return; }
+    };
+    let phys = match parse_hex(phys_str) {
+        Some(p) => p,
+        None => { crate::println!("Invalid physical address '{}'", phys_str); return; }
+    };
+    let flags = match flags_str {
+        "krw" => MapFlags::kernel_rw(),
+        "urw" => MapFlags::user_rw(),
+        _     => MapFlags::kernel_rx(), // default
+    };
+    match page_table {
+        Some(pt) => match pt.map(virt, phys, flags, frame_alloc) {
+            Ok(()) => crate::println!("Mapped {:#x} -> {:#x}", virt, phys),
+            Err(e) => crate::println!("Error: {:?}", e),
+        },
+        None => crate::println!("Page table not initialised."),
+    }
+}
+
+fn cmd_vmunmap(virt_str: &str, page_table: &mut Option<PageTableManager>) {
+    if virt_str.is_empty() {
+        crate::println!("Usage: vmunmap <virt_hex>");
+        return;
+    }
+    let virt = match parse_hex(virt_str) {
+        Some(v) => v,
+        None => { crate::println!("Invalid address '{}'", virt_str); return; }
+    };
+    match page_table {
+        Some(pt) => match pt.unmap(virt) {
+            Ok(()) => crate::println!("Unmapped {:#x}", virt),
+            Err(e) => crate::println!("Error: {:?}", e),
+        },
+        None => crate::println!("Page table not initialised."),
+    }
+}
+
+fn cmd_vmtranslate(virt_str: &str, page_table: &Option<PageTableManager>) {
+    if virt_str.is_empty() {
+        crate::println!("Usage: vmtranslate <virt_hex>");
+        return;
+    }
+    let virt = match parse_hex(virt_str) {
+        Some(v) => v,
+        None => { crate::println!("Invalid address '{}'", virt_str); return; }
+    };
+    match page_table {
+        Some(pt) => match pt.translate(virt) {
+            Ok(phys) => crate::println!("{:#x} -> {:#x}", virt, phys),
+            Err(e)   => crate::println!("Error: {:?}", e),
+        },
+        None => crate::println!("Page table not initialised."),
     }
 }
 

@@ -9,6 +9,7 @@ use cdk::kernel::Kernel;
 use cdk::memory_graph::MemoryGraph;
 use cdk::node::KernelNode;
 use cdk::object::KernelObject;
+use cdk::paging::PageTableManager;
 
 static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
@@ -20,6 +21,7 @@ static KERNEL: Mutex<Kernel> = Mutex::new(Kernel::new());
 static MEM_GRAPH: Mutex<MemoryGraph> = Mutex::new(MemoryGraph::new());
 static NODE: Mutex<KernelNode> = Mutex::new(KernelNode::new_const());
 static FRAME_ALLOCATOR: Mutex<FrameAllocator> = Mutex::new(FrameAllocator::new());
+static PAGE_TABLE: Mutex<Option<PageTableManager>> = Mutex::new(None);
 
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
@@ -48,6 +50,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         cdk::println!("Frame allocator: {} KiB usable, {} KiB free",
             fa.usable_bytes() / 1024,
             fa.free_bytes() / 1024);
+    }
+
+    // Build the initial kernel page-table hierarchy.
+    {
+        let mut fa = FRAME_ALLOCATOR.lock();
+        match PageTableManager::new(&mut *fa) {
+            Some(pt) => {
+                cdk::println!("Page table: PML4 root at {:#x}", pt.pml4_phys());
+                *PAGE_TABLE.lock() = Some(pt);
+            }
+            None => cdk::println!("Page table: WARNING — could not allocate PML4 frame"),
+        }
     }
 
     cdk::println!("CDK - Cognitive Distributed Kernel");
@@ -87,7 +101,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         cdk::println!("Node ID: {}", node.node_id());
     }
 
-    cdk::console::run_static(&KERNEL, &MEM_GRAPH, &NODE, &FRAME_ALLOCATOR);
+    cdk::console::run_static(&KERNEL, &MEM_GRAPH, &NODE, &FRAME_ALLOCATOR, &PAGE_TABLE);
 }
 
 #[panic_handler]
