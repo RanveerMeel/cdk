@@ -100,6 +100,13 @@ CDK_QEMU_GUI=1 ./run_qemu.sh
 | `netrecv <if>` | Read one packet from an interface RX queue |
 | `nettick` | Service network I/O (drain TX, deliver to RX) |
 | `netcaps` | Show capability-attributed network send/receive telemetry |
+| `net2obj <if> <obj>` | Bridge one packet from interface into object message queue |
+| `obj2net <obj> <if>` | Bridge one object message out as packet bytes |
+| `netbind-in <if> <obj>` | Bind interface ingress for automated bridge pumping |
+| `netbind-out <obj> <if>` | Bind object egress for automated bridge pumping |
+| `netbind-list` | Show configured automated bridge bindings |
+| `netbind-clear` | Clear automated bridge bindings |
+| `netpump` | Run one automated bridge routing tick (in+out) |
 | `capsign <id>` | Sign a fresh capability for object `<id>` and verify the signature |
 | `capverify <id>` | Check whether a capability for `<id>` is signed |
 | `heapinfo` | Kernel heap usage (total / used / free) |

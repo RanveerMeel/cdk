@@ -131,6 +131,13 @@ fn dispatch(
         "netrecv" => cmd_net_recv(arg1, kernel, network, network_cap),
         "nettick" => cmd_net_tick(kernel, network, network_cap),
         "netcaps" => cmd_netcaps(kernel, network_cap),
+        "netbind-in" => cmd_netbind_in(arg1, arg2, kernel),
+        "netbind-out" => cmd_netbind_out(arg1, arg2, kernel),
+        "netbind-list" => cmd_netbind_list(kernel),
+        "netbind-clear" => cmd_netbind_clear(kernel),
+        "netpump" => cmd_netpump(arg1, kernel, network, network_cap),
+        "net2obj" => cmd_net_to_obj(arg1, arg2, kernel, network, network_cap),
+        "obj2net" => cmd_obj_to_net(arg1, arg2, kernel, network, network_cap),
         #[cfg(target_os = "none")]
         "ticks" => crate::println!("Timer ticks: {}", crate::interrupts::ticks()),
         #[cfg(not(target_os = "none"))]
@@ -176,8 +183,19 @@ fn cmd_help() {
     crate::println!("  netsend <if> <text>");
     crate::println!("                    Queue packet bytes to interface");
     crate::println!("  netrecv <if>      Receive one packet from interface RX queue");
-    crate::println!("  nettick           Service network I/O (process TX/RX)");
+    crate::println!("  nettick           Service network + run one bridge routing cycle");
     crate::println!("  netcaps           Show capability-attributed network telemetry");
+    crate::println!("  netbind-in <if> <obj>");
+    crate::println!("                    Bind interface ingress to object queue");
+    crate::println!("  netbind-out <obj> <if>");
+    crate::println!("                    Bind object egress to interface TX");
+    crate::println!("  netbind-list      List active bridge bindings");
+    crate::println!("  netbind-clear     Clear all bridge bindings");
+    crate::println!("  netpump <n>       Run N automated bridge routing cycles (default 1)");
+    crate::println!("  net2obj <if> <obj>");
+    crate::println!("                    Bridge one received packet into object queue");
+    crate::println!("  obj2net <obj> <if>");
+    crate::println!("                    Bridge one object message out as packet bytes");
     crate::println!("  ticks             Show PIT timer tick count since boot");
     crate::println!("  timeslice         Show the preemptive time-slice length (ticks)");
     crate::println!("  fbinfo            Pixel framebuffer info (resolution, format)");
@@ -247,6 +265,15 @@ fn cmd_status(
             );
         }
     }
+    let (in_bindings, out_bindings) = kernel.bridge_binding_counts();
+    let bridge = kernel.bridge_telemetry();
+    crate::println!(
+        "  Bridge:       in_bindings={} out_bindings={} in_moved={} out_moved={}",
+        in_bindings,
+        out_bindings,
+        bridge.ingress_moved,
+        bridge.egress_moved
+    );
     match page_table {
         Some(pt) => crate::println!(
             "  VM pages:     {} mapped (PML4 @ {:#x})",
@@ -580,18 +607,22 @@ fn cmd_net_tick(kernel: &mut Kernel, network: &mut NetworkStack, network_cap: &O
         crate::println!("Error: network capability is not initialised");
         return;
     };
-    if kernel.validate_capability(cap).is_err() {
-        crate::println!("Error: network capability is invalid");
-        return;
+    match kernel.bridge_tick(cap, network) {
+        Ok(tick) => {
+            let summary = network.summary();
+            crate::println!(
+                "Network tick: tx={} rx={} ticks={} | bridge in={} out={} err_in={} err_out={}",
+                summary.total_tx_packets,
+                summary.total_rx_packets,
+                summary.service_ticks,
+                tick.ingress_moved,
+                tick.egress_moved,
+                tick.ingress_errors,
+                tick.egress_errors
+            );
+        }
+        Err(e) => crate::println!("Error: {:?}", e),
     }
-    network.service();
-    let summary = network.summary();
-    crate::println!(
-        "Network serviced: tx={} rx={} ticks={}",
-        summary.total_tx_packets,
-        summary.total_rx_packets,
-        summary.service_ticks
-    );
 }
 
 fn cmd_netcaps(kernel: &Kernel, network_cap: &Option<Capability>) {
@@ -620,6 +651,151 @@ fn cmd_netcaps(kernel: &Kernel, network_cap: &Option<Capability>) {
             stats.recv_err
         );
     });
+}
+
+fn cmd_netbind_in(iface: &str, object_id: &str, kernel: &mut Kernel) {
+    if iface.is_empty() || object_id.is_empty() {
+        crate::println!("Usage: netbind-in <if> <obj>");
+        return;
+    }
+    match kernel.bridge_bind_ingress(iface, object_id) {
+        Ok(()) => crate::println!("Bound ingress '{}' -> '{}'", iface, object_id),
+        Err(e) => crate::println!("Error: {:?}", e),
+    }
+}
+
+fn cmd_netbind_out(object_id: &str, iface: &str, kernel: &mut Kernel) {
+    if iface.is_empty() || object_id.is_empty() {
+        crate::println!("Usage: netbind-out <obj> <if>");
+        return;
+    }
+    match kernel.bridge_bind_egress(object_id, iface) {
+        Ok(()) => crate::println!("Bound egress '{}' -> '{}'", object_id, iface),
+        Err(e) => crate::println!("Error: {:?}", e),
+    }
+}
+
+fn cmd_netbind_list(kernel: &Kernel) {
+    crate::println!("=== Net Bridge Bindings ===");
+    let (in_count, out_count) = kernel.bridge_binding_counts();
+    crate::println!("  Ingress bindings: {}", in_count);
+    kernel.for_each_bridge_ingress_binding(|iface, object_id| {
+        crate::println!("    {} -> {}", iface, object_id);
+    });
+    crate::println!("  Egress bindings: {}", out_count);
+    kernel.for_each_bridge_egress_binding(|object_id, iface| {
+        crate::println!("    {} -> {}", object_id, iface);
+    });
+}
+
+fn cmd_netbind_clear(kernel: &mut Kernel) {
+    kernel.bridge_clear_bindings();
+    crate::println!("Cleared all bridge bindings.");
+}
+
+fn cmd_netpump(
+    cycles_str: &str,
+    kernel: &mut Kernel,
+    network: &mut NetworkStack,
+    network_cap: &Option<Capability>,
+) {
+    let Some(cap) = network_cap.as_ref() else {
+        crate::println!("Error: network capability is not initialised");
+        return;
+    };
+    let cycles = if cycles_str.is_empty() {
+        1
+    } else {
+        match parse_u32(cycles_str) {
+            Some(n) if n > 0 => n,
+            _ => {
+                crate::println!("Usage: netpump <positive-cycle-count>");
+                return;
+            }
+        }
+    };
+
+    let mut total_in = 0u64;
+    let mut total_out = 0u64;
+    let mut total_err_in = 0u64;
+    let mut total_err_out = 0u64;
+
+    for _ in 0..cycles {
+        match kernel.bridge_tick(cap, network) {
+            Ok(tick) => {
+                total_in = total_in.saturating_add(tick.ingress_moved);
+                total_out = total_out.saturating_add(tick.egress_moved);
+                total_err_in = total_err_in.saturating_add(tick.ingress_errors);
+                total_err_out = total_err_out.saturating_add(tick.egress_errors);
+            }
+            Err(e) => {
+                crate::println!("Error: {:?}", e);
+                return;
+            }
+        }
+    }
+    let summary = network.summary();
+    crate::println!(
+        "Bridge pump ({} cycles): in={} out={} err_in={} err_out={} net_ticks={}",
+        cycles,
+        total_in,
+        total_out,
+        total_err_in,
+        total_err_out,
+        summary.service_ticks
+    );
+}
+
+fn cmd_net_to_obj(
+    iface: &str,
+    object_id: &str,
+    kernel: &mut Kernel,
+    network: &mut NetworkStack,
+    network_cap: &Option<Capability>,
+) {
+    if iface.is_empty() || object_id.is_empty() {
+        crate::println!("Usage: net2obj <if> <obj>");
+        return;
+    }
+    let Some(cap) = network_cap.as_ref() else {
+        crate::println!("Error: network capability is not initialised");
+        return;
+    };
+    match kernel.bridge_network_to_object(cap, network, iface, object_id) {
+        Ok(true) => crate::println!(
+            "Bridged one packet from '{}' into object '{}'",
+            iface,
+            object_id
+        ),
+        Ok(false) => crate::println!("No packet available on '{}'", iface),
+        Err(e) => crate::println!("Error: {:?}", e),
+    }
+}
+
+fn cmd_obj_to_net(
+    object_id: &str,
+    iface: &str,
+    kernel: &mut Kernel,
+    network: &mut NetworkStack,
+    network_cap: &Option<Capability>,
+) {
+    if iface.is_empty() || object_id.is_empty() {
+        crate::println!("Usage: obj2net <obj> <if>");
+        return;
+    }
+    let Some(cap) = network_cap.as_ref() else {
+        crate::println!("Error: network capability is not initialised");
+        return;
+    };
+    match kernel.bridge_object_to_network(cap, network, object_id, iface) {
+        Ok(true) => crate::println!(
+            "Bridged one message from object '{}' to interface '{}'",
+            object_id,
+            iface
+        ),
+        Ok(false) => crate::println!("No message available in object '{}'", object_id),
+        Err(e) => crate::println!("Error: {:?}", e),
+    }
 }
 
 fn cmd_heapinfo() {

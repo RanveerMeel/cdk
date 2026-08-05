@@ -1,6 +1,6 @@
 use crate::{
     capability::{Capability, CapabilityError, Permission},
-    message::Message,
+    message::{Message, MessagePayload},
     network::{NetError, NetPacket, NetworkStack},
     object::KernelObject,
     scheduler::Scheduler,
@@ -11,6 +11,7 @@ use heapless::String;
 
 const MAX_OBJECTS: usize = 16;
 const MAX_ID_LEN: usize = 64;
+const MAX_IFACE_LEN: usize = 16;
 
 #[derive(Debug, Clone)]
 pub enum KernelError {
@@ -20,6 +21,10 @@ pub enum KernelError {
     MessageQueueFull,
     InvalidSignature,
     NetworkError,
+    PayloadTooLarge,
+    UnsupportedPayload,
+    BindingTableFull,
+    InvalidBinding,
 }
 
 pub type KernelResult<T> = Result<T, KernelError>;
@@ -33,10 +38,29 @@ pub struct NetworkCapabilityStats {
     pub recv_err: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BridgeTelemetry {
+    pub ingress_moved: u64,
+    pub egress_moved: u64,
+    pub ingress_errors: u64,
+    pub egress_errors: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BridgeTickResult {
+    pub ingress_moved: u64,
+    pub egress_moved: u64,
+    pub ingress_errors: u64,
+    pub egress_errors: u64,
+}
+
 pub struct Kernel {
     objects: FnvIndexMap<String<MAX_ID_LEN>, KernelObject, MAX_OBJECTS>,
     scheduler: Scheduler,
     network_stats: FnvIndexMap<String<MAX_ID_LEN>, NetworkCapabilityStats, MAX_OBJECTS>,
+    bridge_ingress: FnvIndexMap<String<MAX_IFACE_LEN>, String<MAX_ID_LEN>, MAX_OBJECTS>,
+    bridge_egress: FnvIndexMap<String<MAX_ID_LEN>, String<MAX_IFACE_LEN>, MAX_OBJECTS>,
+    bridge_telemetry: BridgeTelemetry,
 }
 
 impl Kernel {
@@ -45,6 +69,14 @@ impl Kernel {
             objects: FnvIndexMap::new(),
             scheduler: Scheduler::new(),
             network_stats: FnvIndexMap::new(),
+            bridge_ingress: FnvIndexMap::new(),
+            bridge_egress: FnvIndexMap::new(),
+            bridge_telemetry: BridgeTelemetry {
+                ingress_moved: 0,
+                egress_moved: 0,
+                ingress_errors: 0,
+                egress_errors: 0,
+            },
         }
     }
 
@@ -204,6 +236,56 @@ impl Kernel {
         }
     }
 
+    pub fn bridge_network_to_object(
+        &mut self,
+        cap: &Capability,
+        network: &mut NetworkStack,
+        iface: &str,
+        target_object_id: &str,
+    ) -> KernelResult<bool> {
+        let packet = self.network_receive(cap, network, iface)?;
+        let Some(packet) = packet else {
+            return Ok(false);
+        };
+
+        let mut data = heapless::Vec::<u8, 64>::new();
+        data.extend_from_slice(packet.payload.as_slice())
+            .map_err(|_| KernelError::PayloadTooLarge)?;
+        let msg = Message::new("net-bridge", target_object_id, MessagePayload::Data(data))
+            .map_err(|_| KernelError::PayloadTooLarge)?;
+        self.send_message_direct(target_object_id, msg)?;
+        Ok(true)
+    }
+
+    pub fn bridge_object_to_network(
+        &mut self,
+        cap: &Capability,
+        network: &mut NetworkStack,
+        source_object_id: &str,
+        iface: &str,
+    ) -> KernelResult<bool> {
+        let maybe_msg = self.receive_message_direct(source_object_id)?;
+        let Some(msg) = maybe_msg else {
+            return Ok(false);
+        };
+
+        let bytes: heapless::Vec<u8, 64> = match msg.payload {
+            MessagePayload::Data(data) => data,
+            MessagePayload::Text(text) | MessagePayload::Command(text) => {
+                let mut out = heapless::Vec::<u8, 64>::new();
+                out.extend_from_slice(text.as_bytes())
+                    .map_err(|_| KernelError::PayloadTooLarge)?;
+                out
+            }
+            MessagePayload::Request { .. } | MessagePayload::Response { .. } => {
+                return Err(KernelError::UnsupportedPayload);
+            }
+        };
+
+        self.network_send(cap, network, iface, bytes.as_slice())?;
+        Ok(true)
+    }
+
     pub fn execute_next(&mut self) -> Option<String<MAX_ID_LEN>> {
         self.scheduler.execute_next()
     }
@@ -271,6 +353,120 @@ impl Kernel {
         for (object_id, stats) in self.network_stats.iter() {
             f(object_id.as_str(), *stats);
         }
+    }
+
+    pub fn bridge_bind_ingress(&mut self, iface: &str, object_id: &str) -> KernelResult<()> {
+        if self.for_each_object_find(object_id).is_none() {
+            return Err(KernelError::ObjectNotFound);
+        }
+        let iface_key: String<MAX_IFACE_LEN> =
+            String::from_str(iface).map_err(|_| KernelError::InvalidBinding)?;
+        let object_key: String<MAX_ID_LEN> =
+            String::from_str(object_id).map_err(|_| KernelError::InvalidBinding)?;
+        self.bridge_ingress
+            .insert(iface_key, object_key)
+            .map_err(|_| KernelError::BindingTableFull)?;
+        Ok(())
+    }
+
+    pub fn bridge_bind_egress(&mut self, object_id: &str, iface: &str) -> KernelResult<()> {
+        if self.for_each_object_find(object_id).is_none() {
+            return Err(KernelError::ObjectNotFound);
+        }
+        let object_key: String<MAX_ID_LEN> =
+            String::from_str(object_id).map_err(|_| KernelError::InvalidBinding)?;
+        let iface_key: String<MAX_IFACE_LEN> =
+            String::from_str(iface).map_err(|_| KernelError::InvalidBinding)?;
+        self.bridge_egress
+            .insert(object_key, iface_key)
+            .map_err(|_| KernelError::BindingTableFull)?;
+        Ok(())
+    }
+
+    pub fn bridge_clear_bindings(&mut self) {
+        self.bridge_ingress.clear();
+        self.bridge_egress.clear();
+    }
+
+    pub fn bridge_telemetry(&self) -> BridgeTelemetry {
+        self.bridge_telemetry
+    }
+
+    pub fn bridge_binding_counts(&self) -> (usize, usize) {
+        (self.bridge_ingress.len(), self.bridge_egress.len())
+    }
+
+    pub fn for_each_bridge_ingress_binding(&self, mut f: impl FnMut(&str, &str)) {
+        for (iface, object_id) in self.bridge_ingress.iter() {
+            f(iface.as_str(), object_id.as_str());
+        }
+    }
+
+    pub fn for_each_bridge_egress_binding(&self, mut f: impl FnMut(&str, &str)) {
+        for (object_id, iface) in self.bridge_egress.iter() {
+            f(object_id.as_str(), iface.as_str());
+        }
+    }
+
+    pub fn bridge_tick(
+        &mut self,
+        cap: &Capability,
+        network: &mut NetworkStack,
+    ) -> KernelResult<BridgeTickResult> {
+        Self::check_signature(cap)?;
+        if !self.objects.contains_key(&cap.object_id) {
+            return Err(KernelError::InvalidCapability);
+        }
+
+        network.service();
+        let mut result = BridgeTickResult::default();
+
+        let mut ingress =
+            heapless::Vec::<(String<MAX_IFACE_LEN>, String<MAX_ID_LEN>), MAX_OBJECTS>::new();
+        for (iface, obj) in self.bridge_ingress.iter() {
+            let _ = ingress.push((iface.clone(), obj.clone()));
+        }
+        for (iface, object_id) in ingress.iter() {
+            match self.bridge_network_to_object(cap, network, iface.as_str(), object_id.as_str()) {
+                Ok(true) => result.ingress_moved = result.ingress_moved.saturating_add(1),
+                Ok(false) => {}
+                Err(_) => result.ingress_errors = result.ingress_errors.saturating_add(1),
+            }
+        }
+
+        let mut egress =
+            heapless::Vec::<(String<MAX_ID_LEN>, String<MAX_IFACE_LEN>), MAX_OBJECTS>::new();
+        for (obj, iface) in self.bridge_egress.iter() {
+            let _ = egress.push((obj.clone(), iface.clone()));
+        }
+        for (object_id, iface) in egress.iter() {
+            match self.bridge_object_to_network(cap, network, object_id.as_str(), iface.as_str()) {
+                Ok(true) => result.egress_moved = result.egress_moved.saturating_add(1),
+                Ok(false) => {}
+                Err(_) => result.egress_errors = result.egress_errors.saturating_add(1),
+            }
+        }
+
+        network.service();
+
+        self.bridge_telemetry.ingress_moved = self
+            .bridge_telemetry
+            .ingress_moved
+            .saturating_add(result.ingress_moved);
+        self.bridge_telemetry.egress_moved = self
+            .bridge_telemetry
+            .egress_moved
+            .saturating_add(result.egress_moved);
+        self.bridge_telemetry.ingress_errors = self
+            .bridge_telemetry
+            .ingress_errors
+            .saturating_add(result.ingress_errors);
+        self.bridge_telemetry.egress_errors = self
+            .bridge_telemetry
+            .egress_errors
+            .saturating_add(result.egress_errors);
+
+        Ok(result)
     }
 
     // --- Console-friendly helpers (operate by string id, no capability needed) ---
@@ -571,5 +767,112 @@ mod tests {
         assert!(got.is_none());
         let stats = k.network_stats_for(cap.object_id.as_str()).unwrap();
         assert_eq!(stats.recv_empty, 1);
+    }
+
+    #[test]
+    fn bridge_network_to_object_delivers_data_message() {
+        let mut k = Kernel::new();
+        let net_obj = make_obj("net-service", "interactive");
+        let net_cap = Capability::with_permissions(
+            &net_obj,
+            &[Permission::SendMessage, Permission::ReceiveMessage],
+        );
+        let _ = k.register_object(net_obj);
+
+        let inbox_obj = make_obj("inbox", "normal");
+        let inbox_cap = k.register_object(inbox_obj);
+        let inbox_id = inbox_cap.object_id.as_str().to_owned();
+
+        let mut net = NetworkStack::new();
+        net.add_loopback_interface("lo").unwrap();
+        k.network_send(&net_cap, &mut net, "lo", b"abc").unwrap();
+        net.service();
+        let moved = k
+            .bridge_network_to_object(&net_cap, &mut net, "lo", &inbox_id)
+            .unwrap();
+        assert!(moved);
+
+        let msg = k.receive_message_direct(&inbox_id).unwrap().unwrap();
+        match msg.payload {
+            MessagePayload::Data(bytes) => assert_eq!(bytes.as_slice(), b"abc"),
+            _ => panic!("expected Data payload"),
+        }
+    }
+
+    #[test]
+    fn bridge_object_to_network_sends_text_payload() {
+        let mut k = Kernel::new();
+        let net_obj = make_obj("net-service", "interactive");
+        let net_cap = Capability::with_permissions(
+            &net_obj,
+            &[Permission::SendMessage, Permission::ReceiveMessage],
+        );
+        let _ = k.register_object(net_obj);
+
+        let worker_obj = make_obj("worker", "normal");
+        let worker_cap = k.register_object(worker_obj);
+        let worker_id = worker_cap.object_id.as_str().to_owned();
+        let outbound = Message::text("src", &worker_id, "payload").unwrap();
+        k.send_message_direct(&worker_id, outbound).unwrap();
+
+        let mut net = NetworkStack::new();
+        net.add_loopback_interface("lo").unwrap();
+        let moved = k
+            .bridge_object_to_network(&net_cap, &mut net, &worker_id, "lo")
+            .unwrap();
+        assert!(moved);
+
+        net.service();
+        let pkt = k
+            .network_receive(&net_cap, &mut net, "lo")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pkt.payload.as_slice(), b"payload");
+    }
+
+    #[test]
+    fn bridge_tick_moves_bound_ingress_and_egress() {
+        let mut k = Kernel::new();
+        let net_obj = make_obj("net-service", "interactive");
+        let net_cap = Capability::with_permissions(
+            &net_obj,
+            &[Permission::SendMessage, Permission::ReceiveMessage],
+        );
+        let _ = k.register_object(net_obj);
+
+        let inbox = make_obj("inbox", "normal");
+        let inbox_cap = k.register_object(inbox);
+        let inbox_id = inbox_cap.object_id.as_str().to_owned();
+
+        let outbox = make_obj("outbox", "normal");
+        let outbox_cap = k.register_object(outbox);
+        let outbox_id = outbox_cap.object_id.as_str().to_owned();
+
+        k.bridge_bind_ingress("lo", &inbox_id).unwrap();
+        k.bridge_bind_egress(&outbox_id, "lo").unwrap();
+
+        let mut net = NetworkStack::new();
+        net.add_loopback_interface("lo").unwrap();
+        k.network_send(&net_cap, &mut net, "lo", b"from-net")
+            .unwrap();
+
+        let outbound = Message::text("src", &outbox_id, "from-obj").unwrap();
+        k.send_message_direct(&outbox_id, outbound).unwrap();
+
+        let tick = k.bridge_tick(&net_cap, &mut net).unwrap();
+        assert_eq!(tick.ingress_moved, 1);
+        assert_eq!(tick.egress_moved, 1);
+
+        let inbox_msg = k.receive_message_direct(&inbox_id).unwrap().unwrap();
+        match inbox_msg.payload {
+            MessagePayload::Data(bytes) => assert_eq!(bytes.as_slice(), b"from-net"),
+            _ => panic!("expected Data payload"),
+        }
+
+        let pkt = k
+            .network_receive(&net_cap, &mut net, "lo")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pkt.payload.as_slice(), b"from-obj");
     }
 }
