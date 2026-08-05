@@ -99,6 +99,26 @@ h3 {
   margin: 0.35rem 0;
 }
 
+.architecture {
+  margin: 1.25rem 0 0;
+}
+
+.architecture img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--panel);
+}
+
+.architecture figcaption {
+  margin-top: 0.65rem;
+  color: var(--muted);
+  font-size: 0.9rem;
+  text-align: center;
+}
+
 pre {
   margin: 0;
   overflow-x: auto;
