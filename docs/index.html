@@ -69,6 +69,26 @@
 
       <section class="section">
         <div class="container">
+          <h2>Architecture</h2>
+          <p class="muted">
+            CDK connects the x86_64 boot platform to capability-secured kernel
+            services, memory management, networking, and an interactive runtime
+            control plane.
+          </p>
+          <figure class="architecture">
+            <a href="./assets/cdk-architecture-diagram.png">
+              <img
+                src="./assets/cdk-architecture-diagram.png"
+                alt="CDK architecture diagram showing boot, kernel core, memory, networking, and runtime layers"
+              />
+            </a>
+            <figcaption>Click the diagram to view it at full resolution.</figcaption>
+          </figure>
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="container">
           <h2>Quick Start</h2>
           <pre><code>rustup target add x86_64-unknown-none
 rustup toolchain install nightly
