@@ -1,6 +1,12 @@
 # CDK — Cognitive Distributed Kernel
 
+**Website:** [https://ranveermeel.github.io/cdk/](https://ranveermeel.github.io/cdk/) _(GitHub Pages)_
+
 A **bare-metal operating system kernel** written in Rust, designed around capability-based security, intent-driven scheduling, and distributed-first architecture.
+
+## Status
+
+**Early development preview.** CDK boots on bare metal (QEMU), exposes an interactive serial console, and includes foundational scheduling, capability, networking, and multicore scaffolding. Interfaces can still change quickly while core subsystems stabilize.
 
 ## Features
 
@@ -15,6 +21,34 @@ A **bare-metal operating system kernel** written in Rust, designed around capabi
 **Memory Object Graph** — Tracks memory allocations per object with reference counting and usage statistics.
 
 **Distributed Node Awareness** — Cloud, Edge, and Local node types with discovery, routing, and latency-aware selection built in from the start.
+
+**Network Stack Integration** — Loopback + external interface scaffolding, capability-gated send/recv, and bridge routing with telemetry.
+
+**Virtio-Net Hardware Path** — Optional `virtio-hw` feature enables MMIO virtio-net bring-up (device probe + status/queue setup) through the same descriptor-oriented adapter boundary.
+
+**Multi-Core Foundation (Phase 1)** — Kernel tracks per-core topology and telemetry (BSP/AP roles, online state, tick/dispatch/completion counters) and exposes it via console status.
+
+**Multi-Core Startup Scaffold (Phase 2)** — AP lifecycle state machine (registered → booting → online/halted), boot-time AP provisioning scaffold, and console controls for AP management.
+
+**Multi-Core Bring-Up Orchestration (Phase 3)** — AP startup mailbox + trampoline vector planning, local APIC INIT/SIPI orchestration hooks, and startup handshake tracking.
+
+**Multi-Core Dispatch Split (Phase 4)** — Initial per-core run-queue depth split with core-targeted dispatch assignment plus AP-entry handshake path wired through startup plans.
+
+**Multi-Core Trampoline Handoff (Phase 5)** — AP startup now carries a concrete trampoline machine-code blob with checksum metadata and an explicit AP entry handoff context (signature, target APIC, stack top, kernel entry).
+
+**Multi-Core Async AP Online (Phase 6)** — AP launch now stages the trampoline slot image into low memory during startup planning and uses sequence-based AP entry acknowledgment before transitioning from booting to online.
+
+**Multi-Core AP Entry Hook (Phase 7)** — Startup handoff now carries a real kernel entry hook pointer + page-table root metadata, and AP bring-up paths invoke the trampoline entry hook for automatic sequence-checked online transition.
+
+**Multi-Core AP Runtime Loop (Phase 8)** — AP trampoline entry path now drives a per-core runtime probe loop that only dispatches work assigned to that AP, establishing the first true core-targeted execution path.
+
+**Multi-Core Runtime Service (Phase 9)** — AP cores are now registered into a persistent runtime set and serviced on each timer tick via per-core runtime steps, replacing one-shot probe behavior with continuous AP scheduling service.
+
+**Multi-Core Local Tick Sources (Phase 10)** — Kernel now tracks per-core local runtime tick cursors and can advance AP runtime independently of BSP tick time, including manual AP tick stepping for local timer simulation.
+
+**Multi-Core LAPIC Drive Modes (Phase 11)** — Per-core runtime drive mode now distinguishes BSP-proxied vs local-APIC execution; AP startup transitions into local-APIC mode and BSP tick service skips those cores while local timer pulses drive runtime.
+
+**Multi-Core LAPIC Timer IRQ Hook (Phase 12)** — Interrupt layer now exposes a dedicated local APIC timer callback path carrying APIC ID, and kernel integrates AP-local timer tick handling for mode-gated runtime servicing.
 
 **Interactive Serial Console** — A `cdk>` prompt over COM1 for creating objects, sending messages, inspecting state, and controlling the scheduler at runtime.
 
@@ -43,6 +77,12 @@ For a graphical QEMU window instead:
 CDK_QEMU_GUI=1 ./run_qemu.sh
 ```
 
+To compile the virtio-net hardware backend path:
+
+```bash
+cargo check --features virtio-hw
+```
+
 ## Architecture
 
 ```
@@ -56,6 +96,7 @@ CDK_QEMU_GUI=1 ./run_qemu.sh
   message.rs       Typed IPC messages and payloads
   memory_graph.rs  Per-object memory tracking
   node.rs          Distributed node types and discovery
+  network.rs       Network interfaces, packet queues, and loopback service
   allocator.rs     Bitmap physical frame allocator
   heap.rs          Kernel heap (#[global_allocator], linked-list, 2 MiB)
   rng.rs           RDRAND RNG (bare-metal) / OsRng (host tests)
@@ -92,6 +133,25 @@ CDK_QEMU_GUI=1 ./run_qemu.sh
 | `mem` | Memory graph summary |
 | `node` | Show local node info |
 | `discover <id> <ms>` | Simulate discovering a remote node |
+| `net` / `net-status` | Show network interface count and packet stats |
+| `netsend <if> <text>` | Queue packet payload bytes on an interface |
+| `netrecv <if>` | Read one packet from an interface RX queue |
+| `nettick` | Service network + run one automated bridge routing cycle |
+| `netcaps` | Show capability-attributed network send/receive telemetry |
+| `net2obj <if> <obj>` | Bridge one packet from interface into object message queue |
+| `obj2net <obj> <if>` | Bridge one object message out as packet bytes |
+| `cpus` | Show registered CPU cores, runtime drive mode, and per-core telemetry |
+| `cpu-add-ap <id>` | Register an application core by APIC id |
+| `cpu-start-ap <id>` | Launch AP startup and complete online transition via trampoline entry hook |
+| `cpu-ack-ap <id> <seq>` | Acknowledge AP entry for startup sequence and mark AP online |
+| `cpu-step-ap <id> <n>` | Simulate `n` local APIC timer ticks and service AP-assigned work |
+| `cpu-halt <id>` | Mark a core as halted |
+| `netbind-in <if> <obj>` | Bind interface ingress for automated bridge pumping |
+| `netbind-out <obj> <if>` | Bind object egress for automated bridge pumping |
+| `netbind-list` | Show configured automated bridge bindings |
+| `netbind-clear` | Clear automated bridge bindings |
+| `netadd-ext <if> <backend>` | Register an external interface backend (`virtio-net` or `stub-tap`) |
+| `netpump <n>` | Run `n` automated bridge routing cycles (default 1) |
 | `capsign <id>` | Sign a fresh capability for object `<id>` and verify the signature |
 | `capverify <id>` | Check whether a capability for `<id>` is signed |
 | `heapinfo` | Kernel heap usage (total / used / free) |
@@ -103,6 +163,30 @@ CDK_QEMU_GUI=1 ./run_qemu.sh
 | `vmmap <virt> <phys> [flags]` | Map virtual page → physical frame (`flags`: `krx`, `krw`, `urw`) |
 | `vmunmap <virt>` | Remove a virtual page mapping |
 | `vmtranslate <virt>` | Resolve virtual address to physical |
+| `clear` | Clear serial console screen |
+
+Console input shortcuts:
+
+- `↑` recalls the previous command
+- `Tab` autocompletes command names
+
+## Website (GitHub Pages)
+
+This repository includes a static website in `docs/` and a GitHub Actions workflow to publish it with GitHub Pages.
+
+Local preview:
+
+```bash
+python3 -m http.server 8080 --directory docs
+```
+
+Then open [http://localhost:8080](http://localhost:8080).
+
+Deployment:
+
+- Workflow file: `.github/workflows/pages.yml`
+- Source: `docs/`
+- Published URL (after enabling Pages): `https://<your-github-username>.github.io/cdk/`
 
 ## Dependencies
 
@@ -123,8 +207,11 @@ CDK_QEMU_GUI=1 ./run_qemu.sh
 - [x] Kernel heap allocator (`#[global_allocator]`, linked-list, 2 MiB reserved at boot)
 - [x] Ed25519 capability signing (RDRAND on bare-metal, OsRng on host; SHA-256 message digest)
 - [x] Framebuffer text rendering (8×16 bitmap font, RGB/BGR/U8 pixel formats, auto-scroll)
-- [ ] Network stack integration
-- [ ] Multi-core support
+- [x] Network stack integration (loopback interfaces, capability-gated send/recv, object bridge routing, bindings, pump telemetry)
+- [x] External network transport (virtio-net MMIO bring-up path + non-loopback external interfaces via `eth0` default external backend and adapter-based transports)
+- [ ] Multi-core support (Phase 12 complete: local APIC timer IRQ hook path integrated to AP runtime service API; next: route real AP local timer vector delivery on AP cores and replace console stepping with hardware interrupts)
+- [ ] GPU support (PCI/virtio-gpu discovery, mode setting, command submission pipeline)
+- [ ] Unified memory support (shared CPU/GPU VA model, page migration/coherency, IOMMU integration)
 
 ## Open Source Guidelines
 
@@ -190,4 +277,7 @@ git push -u origin HEAD
 
 ## License
 
-This project is in early development.
+CDK is licensed under the **Apache License 2.0**.
+
+- Full license text: `LICENSE`
+- Third-party attribution notes: `NOTICE`

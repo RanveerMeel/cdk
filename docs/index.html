@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CDK — Cognitive Distributed Kernel</title>
+    <meta
+      name="description"
+      content="CDK is a bare-metal Rust kernel focused on capability security, intent scheduling, and distributed-first systems design."
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="hero">
+      <div class="container">
+        <p class="eyebrow">Early Preview · Bare Metal · Rust</p>
+        <h1>CDK — Cognitive Distributed Kernel</h1>
+        <p class="lead">
+          A capability-first, distributed-ready kernel that boots on real hardware
+          (via QEMU today) with preemptive scheduling, object IPC, network service
+          routing, and evolving multicore runtime support.
+        </p>
+        <div class="cta-row">
+          <a class="btn primary" href="https://github.com/RanveerMeel/cdk">View on GitHub</a>
+          <a class="btn" href="https://github.com/RanveerMeel/cdk/blob/main/README.md">Read Docs</a>
+        </div>
+      </div>
+    </header>
+
+    <main>
+      <section class="section">
+        <div class="container">
+          <h2>Why CDK</h2>
+          <div class="grid three">
+            <article class="card">
+              <h3>Capability Security</h3>
+              <p>
+                Operations are gated through cryptographic capabilities instead of ambient authority.
+              </p>
+            </article>
+            <article class="card">
+              <h3>Intent Scheduling</h3>
+              <p>
+                Tasks carry intent labels (`low_latency`, `batch`, `interactive`) mapped to priorities.
+              </p>
+            </article>
+            <article class="card">
+              <h3>Distributed by Design</h3>
+              <p>
+                Node awareness, message routing patterns, and bridge telemetry are built into the model.
+              </p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="section alt">
+        <div class="container">
+          <h2>Current Scope</h2>
+          <ul class="checklist">
+            <li>x86_64 bare-metal boot flow with `bootloader_api` and serial console</li>
+            <li>Priority scheduler with timer-driven preemption</li>
+            <li>Kernel object model + typed IPC message queues</li>
+            <li>Loopback and external network interfaces with capability-gated access</li>
+            <li>Multicore bring-up scaffolding through AP startup phases</li>
+          </ul>
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="container">
+          <h2>Quick Start</h2>
+          <pre><code>rustup target add x86_64-unknown-none
+rustup toolchain install nightly
+rustup component add rust-src llvm-tools-preview --toolchain nightly
+sudo apt install qemu-system-x86
+
+./run_qemu.sh</code></pre>
+          <p class="muted">
+            After boot, use the <code>cdk&gt;</code> prompt and run <code>help</code>.
+          </p>
+        </div>
+      </section>
+
+      <section class="section alt">
+        <div class="container">
+          <h2>Open Source</h2>
+          <p>
+            CDK is released under the Apache License 2.0. Contributions are welcome
+            through branch + pull request workflow.
+          </p>
+          <div class="cta-row">
+            <a class="btn" href="https://github.com/RanveerMeel/cdk/blob/main/LICENSE">License</a>
+            <a class="btn" href="https://github.com/RanveerMeel/cdk/blob/main/CONTRIBUTING.md">Contributing</a>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <div class="container">
+        <p>CDK — Cognitive Distributed Kernel</p>
+      </div>
+    </footer>
+  </body>
+</html>

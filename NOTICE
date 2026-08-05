@@ -1,0 +1,10 @@
+CDK (Cognitive Distributed Kernel)
+Copyright 2026 CDK contributors
+
+This product includes third-party software components under their own licenses.
+Primary dependencies and their upstream license terms should be consulted in:
+
+- Cargo.toml / Cargo.lock
+- Dependency source repositories on crates.io
+
+No additional trademark rights are granted by this notice.

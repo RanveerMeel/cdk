@@ -12,6 +12,10 @@ set -e
 
 echo "Building CDK for bare metal..."
 
+# Force all cargo invocations to share the workspace target dir so the disk
+# image tool always packages the kernel binary built in this run.
+export CARGO_TARGET_DIR="$PWD/target"
+
 # Check if QEMU is installed
 if ! command -v qemu-system-x86_64 &> /dev/null; then
     echo "Error: qemu-system-x86_64 not found. Please install QEMU:"
@@ -21,7 +25,10 @@ fi
 
 # Build the kernel
 echo "Building kernel..."
-cargo build --release --bin cdk
+# Work around an LLVM backend crash observed with curve25519-dalek SIMD codegen
+# on some host toolchains by forcing the serial backend.
+RUSTFLAGS="${RUSTFLAGS:-} --cfg curve25519_dalek_backend=\"serial\"" \
+    cargo build --release --bin cdk
 
 # BIOS bootable raw image (bootloader 0.11)
 echo "Creating bootable image..."
