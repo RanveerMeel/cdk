@@ -22,6 +22,7 @@ pub fn run_static(
     mem_graph: &'static Mutex<MemoryGraph>,
     node: &'static Mutex<KernelNode>,
     network: &'static Mutex<NetworkStack>,
+    network_cap: &'static Mutex<Option<Capability>>,
     frame_alloc: &'static Mutex<FrameAllocator>,
     page_table: &'static Mutex<Option<PageTableManager>>,
 ) -> ! {
@@ -44,6 +45,7 @@ pub fn run_static(
             &mut mem_graph.lock(),
             &mut node.lock(),
             &mut network.lock(),
+            &network_cap.lock(),
             &mut frame_alloc.lock(),
             &mut page_table.lock(),
         );
@@ -101,6 +103,7 @@ fn dispatch(
     mem_graph: &mut MemoryGraph,
     node: &mut KernelNode,
     network: &mut NetworkStack,
+    network_cap: &Option<Capability>,
     frame_alloc: &mut FrameAllocator,
     page_table: &mut Option<PageTableManager>,
 ) {
@@ -112,7 +115,7 @@ fn dispatch(
 
     match cmd {
         "help" | "?" => cmd_help(),
-        "status" => cmd_status(kernel, mem_graph, node, network, page_table),
+        "status" => cmd_status(kernel, mem_graph, node, network, network_cap, page_table),
         "create" => cmd_create(arg1, arg2, kernel, mem_graph),
         "list" => cmd_list(kernel),
         "schedule" => cmd_schedule(arg1, kernel),
@@ -124,9 +127,10 @@ fn dispatch(
         "node" => cmd_node(node),
         "discover" => cmd_discover(arg1, arg2, node),
         "net" => cmd_net_status(network),
-        "netsend" => cmd_net_send(arg1, arg2, network),
-        "netrecv" => cmd_net_recv(arg1, network),
-        "nettick" => cmd_net_tick(network),
+        "netsend" => cmd_net_send(arg1, arg2, kernel, network, network_cap),
+        "netrecv" => cmd_net_recv(arg1, kernel, network, network_cap),
+        "nettick" => cmd_net_tick(kernel, network, network_cap),
+        "netcaps" => cmd_netcaps(kernel, network_cap),
         #[cfg(target_os = "none")]
         "ticks" => crate::println!("Timer ticks: {}", crate::interrupts::ticks()),
         #[cfg(not(target_os = "none"))]
@@ -173,6 +177,7 @@ fn cmd_help() {
     crate::println!("                    Queue packet bytes to interface");
     crate::println!("  netrecv <if>      Receive one packet from interface RX queue");
     crate::println!("  nettick           Service network I/O (process TX/RX)");
+    crate::println!("  netcaps           Show capability-attributed network telemetry");
     crate::println!("  ticks             Show PIT timer tick count since boot");
     crate::println!("  timeslice         Show the preemptive time-slice length (ticks)");
     crate::println!("  fbinfo            Pixel framebuffer info (resolution, format)");
@@ -197,6 +202,7 @@ fn cmd_status(
     mem_graph: &MemoryGraph,
     node: &KernelNode,
     network: &NetworkStack,
+    network_cap: &Option<Capability>,
     page_table: &Option<PageTableManager>,
 ) {
     crate::println!("=== CDK Kernel Status ===");
@@ -217,11 +223,30 @@ fn cmd_status(
     crate::println!("  Known nodes:  {}", node.known_nodes_count());
     let net = network.summary();
     crate::println!(
-        "  Network:      {} iface(s), tx={}, rx={}",
+        "  Network:      {} iface(s), tx={}, rx={}, ticks={}",
         net.interfaces,
         net.total_tx_packets,
-        net.total_rx_packets
+        net.total_rx_packets,
+        net.service_ticks
     );
+    crate::println!(
+        "  Net queues:   tx_depth={}, rx_depth={}",
+        net.total_tx_queue_depth,
+        net.total_rx_queue_depth
+    );
+    if let Some(cap) = network_cap.as_ref() {
+        if let Some(stats) = kernel.network_stats_for(cap.object_id.as_str()) {
+            crate::println!(
+                "  Net cap '{}': send(ok={}, err={}) recv(ok={}, empty={}, err={})",
+                cap.object_id.as_str(),
+                stats.send_ok,
+                stats.send_err,
+                stats.recv_ok,
+                stats.recv_empty,
+                stats.recv_err
+            );
+        }
+    }
     match page_table {
         Some(pt) => crate::println!(
             "  VM pages:     {} mapped (PML4 @ {:#x})",
@@ -471,41 +496,70 @@ fn cmd_net_status(network: &NetworkStack) {
     crate::println!("=== Network ===");
     crate::println!("  Interfaces: {}", summary.interfaces);
     crate::println!(
-        "  Totals: tx={} rx={} tx_drop={} rx_drop={}",
+        "  Totals: tx={} rx={} tx_drop={} rx_drop={} ticks={}",
         summary.total_tx_packets,
         summary.total_rx_packets,
         summary.total_tx_dropped,
-        summary.total_rx_dropped
+        summary.total_rx_dropped,
+        summary.service_ticks
     );
-    network.for_each_interface(|name, stats| {
+    crate::println!(
+        "  Queue depth: tx={} rx={}",
+        summary.total_tx_queue_depth,
+        summary.total_rx_queue_depth
+    );
+    network.for_each_interface(|name, stats, tx_depth, rx_depth| {
         crate::println!(
-            "  - {}: tx={} rx={} tx_drop={} rx_drop={}",
+            "  - {}: tx={} rx={} tx_drop={} rx_drop={} tx_q={} rx_q={} tx_hwm={} rx_hwm={}",
             name,
             stats.tx_packets,
             stats.rx_packets,
             stats.tx_dropped,
-            stats.rx_dropped
+            stats.rx_dropped,
+            tx_depth,
+            rx_depth,
+            stats.tx_high_watermark,
+            stats.rx_high_watermark
         );
     });
 }
 
-fn cmd_net_send(iface: &str, text: &str, network: &mut NetworkStack) {
+fn cmd_net_send(
+    iface: &str,
+    text: &str,
+    kernel: &mut Kernel,
+    network: &mut NetworkStack,
+    network_cap: &Option<Capability>,
+) {
     if iface.is_empty() || text.is_empty() {
         crate::println!("Usage: netsend <if> <text>");
         return;
     }
-    match network.send_bytes(iface, text.as_bytes()) {
+    let Some(cap) = network_cap.as_ref() else {
+        crate::println!("Error: network capability is not initialised");
+        return;
+    };
+    match kernel.network_send(cap, network, iface, text.as_bytes()) {
         Ok(()) => crate::println!("Queued {} byte(s) on '{}'", text.len(), iface),
         Err(e) => crate::println!("Error: {:?}", e),
     }
 }
 
-fn cmd_net_recv(iface: &str, network: &mut NetworkStack) {
+fn cmd_net_recv(
+    iface: &str,
+    kernel: &mut Kernel,
+    network: &mut NetworkStack,
+    network_cap: &Option<Capability>,
+) {
     if iface.is_empty() {
         crate::println!("Usage: netrecv <if>");
         return;
     }
-    match network.recv_packet(iface) {
+    let Some(cap) = network_cap.as_ref() else {
+        crate::println!("Error: network capability is not initialised");
+        return;
+    };
+    match kernel.network_receive(cap, network, iface) {
         Ok(Some(packet)) => match core::str::from_utf8(packet.payload.as_slice()) {
             Ok(text) => {
                 crate::println!("RX '{}': {} byte(s): {}", iface, packet.payload.len(), text)
@@ -521,14 +575,51 @@ fn cmd_net_recv(iface: &str, network: &mut NetworkStack) {
     }
 }
 
-fn cmd_net_tick(network: &mut NetworkStack) {
+fn cmd_net_tick(kernel: &mut Kernel, network: &mut NetworkStack, network_cap: &Option<Capability>) {
+    let Some(cap) = network_cap.as_ref() else {
+        crate::println!("Error: network capability is not initialised");
+        return;
+    };
+    if kernel.validate_capability(cap).is_err() {
+        crate::println!("Error: network capability is invalid");
+        return;
+    }
     network.service();
     let summary = network.summary();
     crate::println!(
-        "Network serviced: tx={} rx={}",
+        "Network serviced: tx={} rx={} ticks={}",
         summary.total_tx_packets,
-        summary.total_rx_packets
+        summary.total_rx_packets,
+        summary.service_ticks
     );
+}
+
+fn cmd_netcaps(kernel: &Kernel, network_cap: &Option<Capability>) {
+    crate::println!("=== Network Capability Telemetry ===");
+    if let Some(cap) = network_cap.as_ref() {
+        crate::println!("  Active capability object: {}", cap.object_id.as_str());
+    } else {
+        crate::println!("  Active capability object: (not initialised)");
+    }
+    kernel.for_each_network_stats(|object_id, stats| {
+        if stats.send_ok == 0
+            && stats.send_err == 0
+            && stats.recv_ok == 0
+            && stats.recv_empty == 0
+            && stats.recv_err == 0
+        {
+            return;
+        }
+        crate::println!(
+            "  - {}: send(ok={}, err={}) recv(ok={}, empty={}, err={})",
+            object_id,
+            stats.send_ok,
+            stats.send_err,
+            stats.recv_ok,
+            stats.recv_empty,
+            stats.recv_err
+        );
+    });
 }
 
 fn cmd_heapinfo() {

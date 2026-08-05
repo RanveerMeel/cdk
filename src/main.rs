@@ -5,6 +5,7 @@ use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
 use spin::Mutex;
 
 use cdk::allocator::FrameAllocator;
+use cdk::capability::{Capability, Permission};
 use cdk::heap::KERNEL_HEAP;
 use cdk::kernel::Kernel;
 use cdk::memory_graph::MemoryGraph;
@@ -23,6 +24,7 @@ static KERNEL: Mutex<Kernel> = Mutex::new(Kernel::new());
 static MEM_GRAPH: Mutex<MemoryGraph> = Mutex::new(MemoryGraph::new());
 static NODE: Mutex<KernelNode> = Mutex::new(KernelNode::new_const());
 static NETWORK: Mutex<NetworkStack> = Mutex::new(NetworkStack::new());
+static NETWORK_CAP: Mutex<Option<Capability>> = Mutex::new(None);
 static FRAME_ALLOCATOR: Mutex<FrameAllocator> = Mutex::new(FrameAllocator::new());
 static PAGE_TABLE: Mutex<Option<PageTableManager>> = Mutex::new(None);
 
@@ -123,6 +125,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         mem_graph.register_object(cap1.object_id.as_str(), 1024);
         mem_graph.register_object(cap2.object_id.as_str(), 2048);
         cdk::println!("Total memory tracked: {} bytes", mem_graph.total_memory());
+
+        let net_obj = KernelObject::new_compute("net0", "interactive");
+        let net_cap = Capability::with_permissions(
+            &net_obj,
+            &[Permission::SendMessage, Permission::ReceiveMessage],
+        );
+        kernel.register_object(net_obj);
+        *NETWORK_CAP.lock() = Some(net_cap);
     }
 
     cdk::println!("\nKernel initialized successfully!");
@@ -145,6 +155,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         &MEM_GRAPH,
         &NODE,
         &NETWORK,
+        &NETWORK_CAP,
         &FRAME_ALLOCATOR,
         &PAGE_TABLE,
     );

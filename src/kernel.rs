@@ -1,12 +1,13 @@
 use crate::{
     capability::{Capability, CapabilityError, Permission},
     message::Message,
+    network::{NetError, NetPacket, NetworkStack},
     object::KernelObject,
     scheduler::Scheduler,
 };
+use core::str::FromStr;
 use heapless::FnvIndexMap;
 use heapless::String;
-use core::str::FromStr;
 
 const MAX_OBJECTS: usize = 16;
 const MAX_ID_LEN: usize = 64;
@@ -18,13 +19,24 @@ pub enum KernelError {
     PermissionDenied,
     MessageQueueFull,
     InvalidSignature,
+    NetworkError,
 }
 
 pub type KernelResult<T> = Result<T, KernelError>;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NetworkCapabilityStats {
+    pub send_ok: u64,
+    pub send_err: u64,
+    pub recv_ok: u64,
+    pub recv_empty: u64,
+    pub recv_err: u64,
+}
+
 pub struct Kernel {
     objects: FnvIndexMap<String<MAX_ID_LEN>, KernelObject, MAX_OBJECTS>,
     scheduler: Scheduler,
+    network_stats: FnvIndexMap<String<MAX_ID_LEN>, NetworkCapabilityStats, MAX_OBJECTS>,
 }
 
 impl Kernel {
@@ -32,6 +44,7 @@ impl Kernel {
         Self {
             objects: FnvIndexMap::new(),
             scheduler: Scheduler::new(),
+            network_stats: FnvIndexMap::new(),
         }
     }
 
@@ -39,6 +52,9 @@ impl Kernel {
         let cap = Capability::new(&obj);
         let id = obj.id.clone();
         let _ = self.objects.insert(id, obj);
+        let _ = self
+            .network_stats
+            .insert(cap.object_id.clone(), NetworkCapabilityStats::default());
         cap
     }
 
@@ -99,14 +115,13 @@ impl Kernel {
             return Err(KernelError::MessageQueueFull);
         }
 
-        to_obj.receive_message(msg).map_err(|_| KernelError::MessageQueueFull)?;
+        to_obj
+            .receive_message(msg)
+            .map_err(|_| KernelError::MessageQueueFull)?;
         Ok(())
     }
 
-    pub fn receive_message(
-        &mut self,
-        cap: &Capability,
-    ) -> KernelResult<Option<Message>> {
+    pub fn receive_message(&mut self, cap: &Capability) -> KernelResult<Option<Message>> {
         Self::check_signature(cap)?;
 
         if !cap.has_permission(&Permission::ReceiveMessage) {
@@ -119,6 +134,74 @@ impl Kernel {
             .ok_or(KernelError::ObjectNotFound)?;
 
         Ok(obj.pop_message())
+    }
+
+    pub fn network_send(
+        &mut self,
+        cap: &Capability,
+        network: &mut NetworkStack,
+        iface: &str,
+        payload: &[u8],
+    ) -> KernelResult<()> {
+        if let Err(e) = Self::check_signature(cap) {
+            self.bump_net_send_err(&cap.object_id);
+            return Err(e);
+        }
+        if !self.objects.contains_key(&cap.object_id) {
+            self.bump_net_send_err(&cap.object_id);
+            return Err(KernelError::InvalidCapability);
+        }
+        if !cap.has_permission(&Permission::SendMessage) {
+            self.bump_net_send_err(&cap.object_id);
+            return Err(KernelError::PermissionDenied);
+        }
+        match network
+            .send_bytes(iface, payload)
+            .map_err(Self::map_net_error)
+        {
+            Ok(()) => {
+                self.bump_net_send_ok(&cap.object_id);
+                Ok(())
+            }
+            Err(e) => {
+                self.bump_net_send_err(&cap.object_id);
+                Err(e)
+            }
+        }
+    }
+
+    pub fn network_receive(
+        &mut self,
+        cap: &Capability,
+        network: &mut NetworkStack,
+        iface: &str,
+    ) -> KernelResult<Option<NetPacket>> {
+        if let Err(e) = Self::check_signature(cap) {
+            self.bump_net_recv_err(&cap.object_id);
+            return Err(e);
+        }
+        if !self.objects.contains_key(&cap.object_id) {
+            self.bump_net_recv_err(&cap.object_id);
+            return Err(KernelError::InvalidCapability);
+        }
+        if !cap.has_permission(&Permission::ReceiveMessage) {
+            self.bump_net_recv_err(&cap.object_id);
+            return Err(KernelError::PermissionDenied);
+        }
+        match network.recv_packet(iface).map_err(Self::map_net_error) {
+            Ok(Some(packet)) => {
+                self.bump_net_recv_ok(&cap.object_id);
+                Ok(Some(packet))
+            }
+            Ok(None) => {
+                self.bump_net_recv_empty(&cap.object_id);
+                Ok(None)
+            }
+            Err(e) => {
+                self.bump_net_recv_err(&cap.object_id);
+                Err(e)
+            }
+        }
     }
 
     pub fn execute_next(&mut self) -> Option<String<MAX_ID_LEN>> {
@@ -136,7 +219,9 @@ impl Kernel {
 
     /// Object id of the task currently occupying the CPU (if any).
     pub fn running_task_id(&self) -> Option<&str> {
-        self.scheduler.running_task().map(|rt| rt.task.object_id.as_str())
+        self.scheduler
+            .running_task()
+            .map(|rt| rt.task.object_id.as_str())
     }
 
     pub fn get_object(&self, cap: &Capability) -> KernelResult<&KernelObject> {
@@ -177,6 +262,17 @@ impl Kernel {
         Ok(())
     }
 
+    pub fn network_stats_for(&self, object_id: &str) -> Option<NetworkCapabilityStats> {
+        let key: String<MAX_ID_LEN> = String::from_str(object_id).ok()?;
+        self.network_stats.get(&key).copied()
+    }
+
+    pub fn for_each_network_stats(&self, mut f: impl FnMut(&str, NetworkCapabilityStats)) {
+        for (object_id, stats) in self.network_stats.iter() {
+            f(object_id.as_str(), *stats);
+        }
+    }
+
     // --- Console-friendly helpers (operate by string id, no capability needed) ---
 
     pub fn object_count(&self) -> usize {
@@ -204,16 +300,23 @@ impl Kernel {
 
     pub fn send_message_direct(&mut self, to_id: &str, msg: Message) -> KernelResult<()> {
         let key: String<MAX_ID_LEN> = String::from_str(to_id).unwrap_or_default();
-        let obj = self.objects.get_mut(&key).ok_or(KernelError::ObjectNotFound)?;
+        let obj = self
+            .objects
+            .get_mut(&key)
+            .ok_or(KernelError::ObjectNotFound)?;
         if obj.message_count() >= 8 {
             return Err(KernelError::MessageQueueFull);
         }
-        obj.receive_message(msg).map_err(|_| KernelError::MessageQueueFull)
+        obj.receive_message(msg)
+            .map_err(|_| KernelError::MessageQueueFull)
     }
 
     pub fn receive_message_direct(&mut self, id: &str) -> KernelResult<Option<Message>> {
         let key: String<MAX_ID_LEN> = String::from_str(id).unwrap_or_default();
-        let obj = self.objects.get_mut(&key).ok_or(KernelError::ObjectNotFound)?;
+        let obj = self
+            .objects
+            .get_mut(&key)
+            .ok_or(KernelError::ObjectNotFound)?;
         Ok(obj.pop_message())
     }
 
@@ -227,15 +330,56 @@ impl Kernel {
             return Ok(());
         }
         match cap.verify() {
-            Ok(true)  => Ok(()),
+            Ok(true) => Ok(()),
             Ok(false) => Err(KernelError::InvalidSignature),
-            Err(_)    => Err(KernelError::InvalidSignature),
+            Err(_) => Err(KernelError::InvalidSignature),
         }
+    }
+
+    fn map_net_error(_err: NetError) -> KernelError {
+        KernelError::NetworkError
+    }
+
+    fn bump_net_send_ok(&mut self, object_id: &str) {
+        if let Some(stats) = self.net_stats_mut(object_id) {
+            stats.send_ok = stats.send_ok.saturating_add(1);
+        }
+    }
+
+    fn bump_net_send_err(&mut self, object_id: &str) {
+        if let Some(stats) = self.net_stats_mut(object_id) {
+            stats.send_err = stats.send_err.saturating_add(1);
+        }
+    }
+
+    fn bump_net_recv_ok(&mut self, object_id: &str) {
+        if let Some(stats) = self.net_stats_mut(object_id) {
+            stats.recv_ok = stats.recv_ok.saturating_add(1);
+        }
+    }
+
+    fn bump_net_recv_empty(&mut self, object_id: &str) {
+        if let Some(stats) = self.net_stats_mut(object_id) {
+            stats.recv_empty = stats.recv_empty.saturating_add(1);
+        }
+    }
+
+    fn bump_net_recv_err(&mut self, object_id: &str) {
+        if let Some(stats) = self.net_stats_mut(object_id) {
+            stats.recv_err = stats.recv_err.saturating_add(1);
+        }
+    }
+
+    fn net_stats_mut(&mut self, object_id: &str) -> Option<&mut NetworkCapabilityStats> {
+        let key: String<MAX_ID_LEN> = String::from_str(object_id).ok()?;
+        self.network_stats.get_mut(&key)
     }
 
     pub fn delete_by_id(&mut self, id: &str) -> KernelResult<()> {
         let key: String<MAX_ID_LEN> = String::from_str(id).unwrap_or_default();
-        self.objects.remove(&key).ok_or(KernelError::ObjectNotFound)?;
+        self.objects
+            .remove(&key)
+            .ok_or(KernelError::ObjectNotFound)?;
         Ok(())
     }
 }
@@ -243,8 +387,8 @@ impl Kernel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::object::KernelObject;
     use crate::message::Message;
+    use crate::object::KernelObject;
 
     fn make_obj(name: &str, intent: &str) -> KernelObject {
         KernelObject::new_compute(name, intent)
@@ -378,6 +522,54 @@ mod tests {
         let k = Kernel::new();
         let obj = make_obj("ghost", "normal");
         let cap = Capability::new(&obj);
-        assert!(matches!(k.validate_capability(&cap), Err(KernelError::InvalidCapability)));
+        assert!(matches!(
+            k.validate_capability(&cap),
+            Err(KernelError::InvalidCapability)
+        ));
+    }
+
+    #[test]
+    fn network_send_and_receive_with_capability_permissions() {
+        let mut k = Kernel::new();
+        let obj = make_obj("net-service", "interactive");
+        let mut cap = Capability::with_permissions(
+            &obj,
+            &[Permission::SendMessage, Permission::ReceiveMessage],
+        );
+        let _ = k.register_object(obj);
+
+        let mut net = NetworkStack::new();
+        net.add_loopback_interface("lo").unwrap();
+        k.network_send(&cap, &mut net, "lo", b"hello").unwrap();
+        net.service();
+        let pkt = k.network_receive(&cap, &mut net, "lo").unwrap().unwrap();
+        assert_eq!(pkt.payload.as_slice(), b"hello");
+
+        cap.remove_permission(&Permission::ReceiveMessage);
+        let denied = k.network_receive(&cap, &mut net, "lo");
+        assert!(matches!(denied, Err(KernelError::PermissionDenied)));
+
+        let stats = k.network_stats_for(cap.object_id.as_str()).unwrap();
+        assert_eq!(stats.send_ok, 1);
+        assert_eq!(stats.send_err, 0);
+        assert_eq!(stats.recv_ok, 1);
+        assert_eq!(stats.recv_err, 1);
+    }
+
+    #[test]
+    fn network_receive_empty_updates_telemetry() {
+        let mut k = Kernel::new();
+        let obj = make_obj("net-empty", "interactive");
+        let cap = Capability::with_permissions(
+            &obj,
+            &[Permission::SendMessage, Permission::ReceiveMessage],
+        );
+        let _ = k.register_object(obj);
+        let mut net = NetworkStack::new();
+        net.add_loopback_interface("lo").unwrap();
+        let got = k.network_receive(&cap, &mut net, "lo").unwrap();
+        assert!(got.is_none());
+        let stats = k.network_stats_for(cap.object_id.as_str()).unwrap();
+        assert_eq!(stats.recv_empty, 1);
     }
 }

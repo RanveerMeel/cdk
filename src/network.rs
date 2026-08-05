@@ -27,6 +27,8 @@ pub struct InterfaceStats {
     pub rx_packets: u64,
     pub tx_dropped: u64,
     pub rx_dropped: u64,
+    pub tx_high_watermark: usize,
+    pub rx_high_watermark: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -63,6 +65,7 @@ impl NetworkInterface {
             self.stats.tx_dropped = self.stats.tx_dropped.saturating_add(1);
             return Err(NetError::QueueFull);
         }
+        self.stats.tx_high_watermark = self.stats.tx_high_watermark.max(self.tx_queue.len());
         self.stats.tx_packets = self.stats.tx_packets.saturating_add(1);
         Ok(())
     }
@@ -79,6 +82,8 @@ impl NetworkInterface {
             if self.rx_queue.push_back(packet).is_err() {
                 self.stats.rx_dropped = self.stats.rx_dropped.saturating_add(1);
             } else {
+                self.stats.rx_high_watermark =
+                    self.stats.rx_high_watermark.max(self.rx_queue.len());
                 self.stats.rx_packets = self.stats.rx_packets.saturating_add(1);
             }
         }
@@ -88,20 +93,25 @@ impl NetworkInterface {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NetworkSummary {
     pub interfaces: usize,
+    pub service_ticks: u64,
     pub total_tx_packets: u64,
     pub total_rx_packets: u64,
     pub total_tx_dropped: u64,
     pub total_rx_dropped: u64,
+    pub total_tx_queue_depth: usize,
+    pub total_rx_queue_depth: usize,
 }
 
 pub struct NetworkStack {
     interfaces: FnvIndexMap<String<MAX_IFACE_NAME>, NetworkInterface, MAX_INTERFACES>,
+    service_ticks: u64,
 }
 
 impl NetworkStack {
     pub const fn new() -> Self {
         Self {
             interfaces: FnvIndexMap::new(),
+            service_ticks: 0,
         }
     }
 
@@ -137,6 +147,7 @@ impl NetworkStack {
     }
 
     pub fn service(&mut self) {
+        self.service_ticks = self.service_ticks.saturating_add(1);
         for iface in self.interfaces.values_mut() {
             iface.service_io();
         }
@@ -145,6 +156,7 @@ impl NetworkStack {
     pub fn summary(&self) -> NetworkSummary {
         let mut out = NetworkSummary {
             interfaces: self.interfaces.len(),
+            service_ticks: self.service_ticks,
             ..NetworkSummary::default()
         };
         for iface in self.interfaces.values() {
@@ -152,13 +164,24 @@ impl NetworkStack {
             out.total_rx_packets = out.total_rx_packets.saturating_add(iface.stats.rx_packets);
             out.total_tx_dropped = out.total_tx_dropped.saturating_add(iface.stats.tx_dropped);
             out.total_rx_dropped = out.total_rx_dropped.saturating_add(iface.stats.rx_dropped);
+            out.total_tx_queue_depth = out
+                .total_tx_queue_depth
+                .saturating_add(iface.tx_queue.len());
+            out.total_rx_queue_depth = out
+                .total_rx_queue_depth
+                .saturating_add(iface.rx_queue.len());
         }
         out
     }
 
-    pub fn for_each_interface(&self, mut f: impl FnMut(&str, InterfaceStats)) {
+    pub fn for_each_interface(&self, mut f: impl FnMut(&str, InterfaceStats, usize, usize)) {
         for iface in self.interfaces.values() {
-            f(iface.name.as_str(), iface.stats);
+            f(
+                iface.name.as_str(),
+                iface.stats,
+                iface.tx_queue.len(),
+                iface.rx_queue.len(),
+            );
         }
     }
 }
@@ -209,7 +232,22 @@ mod tests {
         stack.send_bytes("lo", b"b").unwrap();
         stack.service();
         let summary = stack.summary();
+        assert_eq!(summary.service_ticks, 1);
         assert_eq!(summary.total_tx_packets, 2);
         assert_eq!(summary.total_rx_packets, 2);
+    }
+
+    #[test]
+    fn tracks_queue_high_watermarks() {
+        let mut stack = NetworkStack::new();
+        stack.add_loopback_interface("lo").unwrap();
+        for _ in 0..4 {
+            stack.send_bytes("lo", b"x").unwrap();
+        }
+        let mut tx_high = 0usize;
+        stack.for_each_interface(|_, stats, _, _| {
+            tx_high = stats.tx_high_watermark;
+        });
+        assert_eq!(tx_high, 4);
     }
 }

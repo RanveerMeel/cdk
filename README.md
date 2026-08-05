@@ -99,6 +99,7 @@ CDK_QEMU_GUI=1 ./run_qemu.sh
 | `netsend <if> <text>` | Queue packet payload bytes on an interface |
 | `netrecv <if>` | Read one packet from an interface RX queue |
 | `nettick` | Service network I/O (drain TX, deliver to RX) |
+| `netcaps` | Show capability-attributed network send/receive telemetry |
 | `capsign <id>` | Sign a fresh capability for object `<id>` and verify the signature |
 | `capverify <id>` | Check whether a capability for `<id>` is signed |
 | `heapinfo` | Kernel heap usage (total / used / free) |
