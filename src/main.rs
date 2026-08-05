@@ -1,22 +1,27 @@
 #![no_std]
 #![no_main]
 
+use bootloader_api::config::Mapping;
 use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
 use spin::Mutex;
 
 use cdk::allocator::FrameAllocator;
 use cdk::capability::{Capability, Permission};
-use cdk::heap::KERNEL_HEAP;
-use cdk::kernel::Kernel;
+use cdk::kernel::{Kernel, RuntimeDriveMode};
 use cdk::memory_graph::MemoryGraph;
-use cdk::network::NetworkStack;
+use cdk::multicore::CoreRole;
+use cdk::network::{ExternalBackendKind, NetworkStack};
 use cdk::node::KernelNode;
 use cdk::object::KernelObject;
 use cdk::paging::PageTableManager;
+use heapless::Vec;
 
 static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
     config.kernel_stack_size = 100 * 1024;
+    // The kernel dereferences physical frame addresses through a configured
+    // physical-memory mapping offset from BootInfo.
+    config.mappings.physical_memory = Some(Mapping::Dynamic);
     config
 };
 
@@ -27,6 +32,7 @@ static NETWORK: Mutex<NetworkStack> = Mutex::new(NetworkStack::new());
 static NETWORK_CAP: Mutex<Option<Capability>> = Mutex::new(None);
 static FRAME_ALLOCATOR: Mutex<FrameAllocator> = Mutex::new(FrameAllocator::new());
 static PAGE_TABLE: Mutex<Option<PageTableManager>> = Mutex::new(None);
+static AP_RUNTIME_CORES: Mutex<Vec<u32, 8>> = Mutex::new(Vec::new());
 
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
@@ -37,12 +43,115 @@ entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 /// the scheduler catches up on the next one.
 fn on_timer_tick(tick: u64) {
     if let Some(mut k) = KERNEL.try_lock() {
-        k.preempt_tick(tick);
+        let _ = k.preempt_tick_on_core(tick, 0);
+        service_ap_runtime_cores(&mut k, tick);
+    }
+}
+
+fn on_local_apic_timer_tick(apic_id: u32) {
+    if let Some(mut k) = KERNEL.try_lock() {
+        if let Some(task) = k.on_local_apic_timer_tick(apic_id) {
+            let local_tick = k.runtime_tick_cursor(apic_id);
+            cdk::println!(
+                "SMP: LAPIC timer apic_id={} local_tick={} dispatched={}",
+                apic_id,
+                local_tick,
+                task.as_str()
+            );
+        }
+    }
+}
+
+fn ap_trampoline_entry_stub(apic_id: u32, startup_seq: u32) {
+    let mut activated = false;
+    if let Some(mut k) = KERNEL.try_lock() {
+        match k.ap_trampoline_entry_hook(apic_id, startup_seq) {
+            Ok(()) => {
+                activated = true;
+                k.activate_ap_local_timer(apic_id);
+                cdk::println!(
+                    "SMP: AP entry hook acknowledged (apic_id={}, seq={})",
+                    apic_id,
+                    startup_seq
+                )
+            }
+            Err(e) => cdk::println!("SMP: WARNING — AP entry hook failed: {:?}", e),
+        }
+    } else {
+        cdk::println!(
+            "SMP: WARNING — AP entry hook lock busy (apic_id={}, seq={})",
+            apic_id,
+            startup_seq
+        );
+    }
+    if activated {
+        register_ap_runtime_core(apic_id);
+    }
+}
+
+fn register_ap_runtime_core(apic_id: u32) {
+    let mut active = AP_RUNTIME_CORES.lock();
+    if active.iter().any(|id| *id == apic_id) {
+        return;
+    }
+    if active.push(apic_id).is_ok() {
+        cdk::println!("SMP: AP runtime core activated (apic_id={})", apic_id);
+    } else {
+        cdk::println!(
+            "SMP: WARNING — AP runtime registry full, skipping apic_id={}",
+            apic_id
+        );
+    }
+}
+
+fn service_ap_runtime_cores(kernel: &mut Kernel, tick: u64) {
+    let mut snapshot = [0u32; 8];
+    let count = {
+        let active = AP_RUNTIME_CORES.lock();
+        let mut n = 0usize;
+        for apic_id in active.iter() {
+            if n >= snapshot.len() {
+                break;
+            }
+            snapshot[n] = *apic_id;
+            n += 1;
+        }
+        n
+    };
+    for apic_id in snapshot.iter().take(count).copied() {
+        if !matches!(
+            kernel.runtime_drive_mode(apic_id),
+            RuntimeDriveMode::BspProxy
+        ) {
+            continue;
+        }
+        if let Some(task) = kernel.service_core_runtime_step_if_bsp_proxy(apic_id) {
+            let local_tick = kernel.runtime_tick_cursor(apic_id);
+            cdk::println!(
+                "SMP: AP runtime bsp_tick={} apic_id={} local_tick={} dispatched={}",
+                tick,
+                apic_id,
+                local_tick,
+                task.as_str()
+            );
+        }
     }
 }
 
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     cdk::serial::init();
+
+    let phys_map_ready = match boot_info.physical_memory_offset.into_option() {
+        Some(offset) => {
+            cdk::phys_mem::set_physical_memory_offset(offset);
+            cdk::println!("Phys map offset: {:#x}", offset);
+            true
+        }
+        None => {
+            cdk::println!("Phys map: WARNING — no physical memory mapping offset provided");
+            false
+        }
+    };
 
     // Init the pixel framebuffer early so boot messages appear on screen.
     if let Some(fb) = boot_info.framebuffer.as_mut() {
@@ -57,6 +166,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // Register the preemption hook *before* enabling interrupts so the very
     // first timer IRQ already has a valid callback.
     cdk::interrupts::set_preempt_hook(on_timer_tick);
+    cdk::interrupts::set_local_apic_tick_hook(on_local_apic_timer_tick);
     cdk::interrupts::init();
 
     // Initialise the physical frame allocator from the bootloader memory map.
@@ -74,37 +184,39 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     //
     // Done before any alloc type is used and before the page-table setup
     // which may eventually use Box for interior tables.
-    {
-        let mut fa = FRAME_ALLOCATOR.lock();
-        match KERNEL_HEAP.init(&mut fa, 512) {
-            Ok(()) => cdk::println!(
-                "Heap: {} KiB initialised ({} KiB free)",
-                KERNEL_HEAP.total_bytes() / 1024,
-                KERNEL_HEAP.free_bytes() / 1024,
-            ),
-            Err(e) => cdk::println!("Heap: WARNING — init failed: {:?}", e),
-        }
-    }
+    let _ = phys_map_ready;
+    cdk::println!("Heap: WARNING — init temporarily disabled (boot stability mode)");
 
     // Build the initial kernel page-table hierarchy.
-    {
-        let mut fa = FRAME_ALLOCATOR.lock();
-        match PageTableManager::new(&mut *fa) {
-            Some(pt) => {
-                cdk::println!("Page table: PML4 root at {:#x}", pt.pml4_phys());
-                *PAGE_TABLE.lock() = Some(pt);
-            }
-            None => cdk::println!("Page table: WARNING — could not allocate PML4 frame"),
-        }
-    }
+    cdk::println!("Page table: WARNING — init temporarily disabled (boot stability mode)");
 
     cdk::println!("CDK - Cognitive Distributed Kernel");
     cdk::println!("Booting on bare metal...");
     cdk::println!("");
 
+    let ap_entry_phys = ap_trampoline_entry_stub as *const () as usize as u64;
+    let pml4_root_phys = PAGE_TABLE
+        .lock()
+        .as_ref()
+        .map(|pt| pt.pml4_phys())
+        .unwrap_or(0);
+    let boot_ap_ack: Option<(u32, u32)> = None;
+
     {
         let mut kernel = KERNEL.lock();
         let mut mem_graph = MEM_GRAPH.lock();
+
+        let _ = (ap_entry_phys, pml4_root_phys, phys_map_ready);
+
+        match kernel.register_core(0, CoreRole::Bootstrap) {
+            Ok(()) => cdk::println!("SMP: bootstrap core registered (apic_id=0)"),
+            Err(e) => cdk::println!("SMP: WARNING — bootstrap core registration failed: {:?}", e),
+        }
+        match kernel.register_core(1, CoreRole::Application) {
+            Ok(()) => cdk::println!("SMP: application core discovered (apic_id=1)"),
+            Err(e) => cdk::println!("SMP: WARNING — AP discovery failed: {:?}", e),
+        }
+        cdk::println!("SMP: WARNING — AP startup temporarily disabled (boot stability mode)");
 
         let compute1 = KernelObject::new_compute("ai_inference", "low_latency");
         let cap1 = kernel.register_object(compute1);
@@ -135,6 +247,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         *NETWORK_CAP.lock() = Some(net_cap);
     }
 
+    if let Some((apic_id, startup_seq)) = boot_ap_ack {
+        ap_trampoline_entry_stub(apic_id, startup_seq);
+    }
+
     cdk::println!("\nKernel initialized successfully!");
     cdk::println!("System ready.");
 
@@ -147,6 +263,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         match net.add_loopback_interface("lo") {
             Ok(()) => cdk::println!("Network: loopback interface 'lo' registered"),
             Err(e) => cdk::println!("Network: WARNING — loopback init failed: {:?}", e),
+        }
+        let ext_backend = if cfg!(feature = "virtio-hw") {
+            ExternalBackendKind::VirtioNet
+        } else {
+            ExternalBackendKind::StubTap
+        };
+        match net.add_external_interface("eth0", ext_backend) {
+            Ok(()) => cdk::println!(
+                "Network: external interface 'eth0' registered ({})",
+                ext_backend.as_str()
+            ),
+            Err(e) => cdk::println!("Network: WARNING — external iface init failed: {:?}", e),
         }
     }
 

@@ -110,12 +110,13 @@ impl KernelHeap {
         }
 
         let size = frame_count as u64 * FRAME_SIZE;
+        let base_virt = crate::phys_mem::phys_to_virt_addr(base);
 
         // SAFETY: `base` is a valid, writable, identity-mapped region of
         // `size` bytes that is not used by anything else.  We call `init`
         // exactly once per `KernelHeap` instance (enforced by the caller).
         unsafe {
-            self.inner.lock().init(base as *mut u8, size as usize);
+            self.inner.lock().init(base_virt as *mut u8, size as usize);
         }
         Ok(())
     }
@@ -275,7 +276,9 @@ mod tests {
         /// Mirrors what `KernelHeap::init` does: allocate `count` contiguous-
         /// ish frames and hand them to `Heap::init`.
         fn init_heap(&mut self, heap: &KernelHeap, count: usize) -> Result<(), HeapError> {
-            if count == 0 { return Err(HeapError::ZeroSize); }
+            if count == 0 {
+                return Err(HeapError::ZeroSize);
+            }
             let first = self.0.alloc_frame().ok_or(HeapError::OutOfFrames)?;
             // For the mock, frames don't need to be physically contiguous.
             // We give the heap only the first frame's memory but iterate
@@ -286,7 +289,12 @@ mod tests {
             }
             // SAFETY: `first` points to an exclusively-owned, aligned, 4 KiB
             // buffer for the lifetime of the MockFrameSource.
-            unsafe { heap.init_from_slice(core::slice::from_raw_parts_mut(first as *mut u8, FRAME_SIZE as usize)) };
+            unsafe {
+                heap.init_from_slice(core::slice::from_raw_parts_mut(
+                    first as *mut u8,
+                    FRAME_SIZE as usize,
+                ))
+            };
             Ok(())
         }
     }

@@ -5,10 +5,10 @@
 //! double-fault handler runs on IST slot 0 so it has a clean stack even when
 //! the kernel stack overflows or is otherwise corrupted.
 
+use spin::Once;
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector};
 use x86_64::structures::tss::TaskStateSegment;
 use x86_64::VirtAddr;
-use spin::Once;
 
 /// IST slot used for the double-fault handler stack (0-indexed, so slot 1 in
 /// the TSS which is 1-indexed).
@@ -18,8 +18,7 @@ pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 const DOUBLE_FAULT_STACK_SIZE: usize = 8 * 1024;
 
 /// Static storage for the double-fault stack.
-static mut DOUBLE_FAULT_STACK: [u8; DOUBLE_FAULT_STACK_SIZE] =
-    [0u8; DOUBLE_FAULT_STACK_SIZE];
+static mut DOUBLE_FAULT_STACK: [u8; DOUBLE_FAULT_STACK_SIZE] = [0u8; DOUBLE_FAULT_STACK_SIZE];
 
 static TSS: Once<TaskStateSegment> = Once::new();
 static GDT: Once<(GlobalDescriptorTable, Selectors)> = Once::new();
@@ -38,7 +37,7 @@ pub fn init() {
         let mut tss = TaskStateSegment::new();
         // Point IST slot 0 at the top of our dedicated stack (stacks grow down).
         tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = {
-            let stack_start = VirtAddr::from_ptr(unsafe { &raw const DOUBLE_FAULT_STACK } as *const u8);
+            let stack_start = VirtAddr::from_ptr(&raw const DOUBLE_FAULT_STACK as *const u8);
             stack_start + DOUBLE_FAULT_STACK_SIZE as u64
         };
         tss
@@ -49,7 +48,14 @@ pub fn init() {
         let code_selector = gdt.append(Descriptor::kernel_code_segment());
         let data_selector = gdt.append(Descriptor::kernel_data_segment());
         let tss_selector = gdt.append(Descriptor::tss_segment(tss));
-        (gdt, Selectors { code_selector, data_selector, tss_selector })
+        (
+            gdt,
+            Selectors {
+                code_selector,
+                data_selector,
+                tss_selector,
+            },
+        )
     });
 
     // Safety: loading a correctly-formed GDT / TSS.

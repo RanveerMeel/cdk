@@ -52,36 +52,54 @@ mod host_stubs {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct PhysAddr(pub u64);
     impl PhysAddr {
-        pub fn new(v: u64) -> Self { Self(v) }
-        pub fn as_u64(self)  -> u64 { self.0 }
+        pub fn new(v: u64) -> Self {
+            Self(v)
+        }
+        pub fn as_u64(self) -> u64 {
+            self.0
+        }
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
     pub struct X86Flags(pub u64);
     impl X86Flags {
-        pub const PRESENT:          X86Flags = X86Flags(1 << 0);
-        pub const WRITABLE:         X86Flags = X86Flags(1 << 1);
-        pub const USER_ACCESSIBLE:  X86Flags = X86Flags(1 << 2);
-        pub const NO_EXECUTE:       X86Flags = X86Flags(1 << 63);
+        pub const PRESENT: X86Flags = X86Flags(1 << 0);
+        pub const WRITABLE: X86Flags = X86Flags(1 << 1);
+        pub const USER_ACCESSIBLE: X86Flags = X86Flags(1 << 2);
+        pub const NO_EXECUTE: X86Flags = X86Flags(1 << 63);
 
-        pub fn bits(self) -> u64 { self.0 }
-        pub fn from_bits_truncate(v: u64) -> Self { Self(v) }
-        pub fn contains(self, other: X86Flags) -> bool { self.0 & other.0 == other.0 }
+        pub fn bits(self) -> u64 {
+            self.0
+        }
+        pub fn from_bits_truncate(v: u64) -> Self {
+            Self(v)
+        }
+        pub fn contains(self, other: X86Flags) -> bool {
+            self.0 & other.0 == other.0
+        }
     }
     impl core::ops::BitOr for X86Flags {
         type Output = Self;
-        fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) }
+        fn bitor(self, rhs: Self) -> Self {
+            Self(self.0 | rhs.0)
+        }
     }
     impl core::ops::BitOrAssign for X86Flags {
-        fn bitor_assign(&mut self, rhs: Self) { self.0 |= rhs.0; }
+        fn bitor_assign(&mut self, rhs: Self) {
+            self.0 |= rhs.0;
+        }
     }
 
     /// Index into a 512-entry page table level.
     #[derive(Clone, Copy, Debug)]
     pub struct PageTableIndex(u16);
     impl PageTableIndex {
-        pub fn new(v: u16) -> Self { Self(v & 0x1ff) }
-        pub fn into_usize(self) -> usize { self.0 as usize }
+        pub fn new(v: u16) -> Self {
+            Self(v & 0x1ff)
+        }
+        pub fn into_usize(self) -> usize {
+            self.0 as usize
+        }
     }
 
     /// One 8-byte page-table entry.
@@ -90,9 +108,15 @@ mod host_stubs {
         bits: u64,
     }
     impl PageTableEntry {
-        pub fn is_unused(&self) -> bool { self.bits == 0 }
-        pub fn set_unused(&mut self) { self.bits = 0; }
-        pub fn flags(&self) -> X86Flags { X86Flags::from_bits_truncate(self.bits) }
+        pub fn is_unused(&self) -> bool {
+            self.bits == 0
+        }
+        pub fn set_unused(&mut self) {
+            self.bits = 0;
+        }
+        pub fn flags(&self) -> X86Flags {
+            X86Flags::from_bits_truncate(self.bits)
+        }
         pub fn addr(&self) -> PhysAddr {
             PhysAddr::new(self.bits & 0x000f_ffff_ffff_f000)
         }
@@ -108,7 +132,9 @@ mod host_stubs {
     }
     impl X86PageTable {
         pub const fn new() -> Self {
-            Self { entries: [PageTableEntry { bits: 0 }; 512] }
+            Self {
+                entries: [PageTableEntry { bits: 0 }; 512],
+            }
         }
     }
     impl core::ops::Index<PageTableIndex> for X86PageTable {
@@ -125,8 +151,7 @@ mod host_stubs {
 }
 
 #[cfg(not(target_os = "none"))]
-use host_stubs::{PhysAddr, X86Flags, X86PageTable, PageTableEntry};
-
+use host_stubs::{PageTableEntry, PhysAddr, X86Flags, X86PageTable};
 
 // ---------------------------------------------------------------------------
 // Page size
@@ -143,26 +168,44 @@ pub const PAGE_SIZE: u64 = 4096;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MapFlags {
     pub writable: bool,
-    pub user:     bool,
-    pub no_exec:  bool,
+    pub user: bool,
+    pub no_exec: bool,
 }
 
 impl MapFlags {
     pub const fn kernel_rx() -> Self {
-        Self { writable: false, user: false, no_exec: false }
+        Self {
+            writable: false,
+            user: false,
+            no_exec: false,
+        }
     }
     pub const fn kernel_rw() -> Self {
-        Self { writable: true, user: false, no_exec: true }
+        Self {
+            writable: true,
+            user: false,
+            no_exec: true,
+        }
     }
     pub const fn user_rw() -> Self {
-        Self { writable: true, user: true, no_exec: true }
+        Self {
+            writable: true,
+            user: true,
+            no_exec: true,
+        }
     }
 
     fn to_x86_leaf(&self) -> X86Flags {
         let mut f = X86Flags::PRESENT;
-        if self.writable { f |= X86Flags::WRITABLE; }
-        if self.user     { f |= X86Flags::USER_ACCESSIBLE; }
-        if self.no_exec  { f |= X86Flags::NO_EXECUTE; }
+        if self.writable {
+            f |= X86Flags::WRITABLE;
+        }
+        if self.user {
+            f |= X86Flags::USER_ACCESSIBLE;
+        }
+        if self.no_exec {
+            f |= X86Flags::NO_EXECUTE;
+        }
         f
     }
 
@@ -197,7 +240,7 @@ impl FrameSource for crate::allocator::FrameAllocator {
         let frame = self.alloc().ok()?;
         let phys = frame.base_addr();
         unsafe {
-            core::ptr::write_bytes(phys as *mut u8, 0, PAGE_SIZE as usize);
+            core::ptr::write_bytes(crate::phys_mem::phys_to_mut_ptr::<u8>(phys), 0, PAGE_SIZE as usize);
         }
         Some(phys)
     }
@@ -253,19 +296,17 @@ pub type PagingResult<T> = Result<T, PagingError>;
 struct VirtIndices {
     pml4: usize,
     pdpt: usize,
-    pd:   usize,
-    pt:   usize,
-    offset: u64,
+    pd: usize,
+    pt: usize,
 }
 
 impl VirtIndices {
     fn from_u64(addr: u64) -> Self {
         Self {
-            pml4:   ((addr >> 39) & 0x1ff) as usize,
-            pdpt:   ((addr >> 30) & 0x1ff) as usize,
-            pd:     ((addr >> 21) & 0x1ff) as usize,
-            pt:     ((addr >> 12) & 0x1ff) as usize,
-            offset:  (addr        & 0xfff),
+            pml4: ((addr >> 39) & 0x1ff) as usize,
+            pdpt: ((addr >> 30) & 0x1ff) as usize,
+            pd: ((addr >> 21) & 0x1ff) as usize,
+            pt: ((addr >> 12) & 0x1ff) as usize,
         }
     }
 }
@@ -294,7 +335,10 @@ impl PageTableManager {
     /// Allocates and zeroes the PML4 root frame from `alloc`.
     pub fn new<A: FrameSource>(alloc: &mut A) -> Option<Self> {
         let pml4_phys = alloc.alloc_zeroed()?;
-        Some(Self { pml4_phys, mapped_pages: 0 })
+        Some(Self {
+            pml4_phys,
+            mapped_pages: 0,
+        })
     }
 
     /// Physical address of the PML4 root (load into `CR3` to activate).
@@ -322,15 +366,19 @@ impl PageTableManager {
         flags: MapFlags,
         alloc: &mut A,
     ) -> PagingResult<()> {
-        if virt & 0xfff != 0 { return Err(PagingError::UnalignedAddress); }
-        if phys & 0xfff != 0 { return Err(PagingError::UnalignedPhysical); }
+        if virt & 0xfff != 0 {
+            return Err(PagingError::UnalignedAddress);
+        }
+        if phys & 0xfff != 0 {
+            return Err(PagingError::UnalignedPhysical);
+        }
 
         let idx = VirtIndices::from_u64(virt);
 
         // Walk PML4 → PDPT → PD → PT, creating tables on demand.
         let pdpt_phys = self.get_or_create(self.pml4_phys, idx.pml4, alloc)?;
-        let pd_phys   = self.get_or_create(pdpt_phys,      idx.pdpt, alloc)?;
-        let pt_phys   = self.get_or_create(pd_phys,        idx.pd,   alloc)?;
+        let pd_phys = self.get_or_create(pdpt_phys, idx.pdpt, alloc)?;
+        let pt_phys = self.get_or_create(pd_phys, idx.pd, alloc)?;
 
         // Write the leaf PTE.  We take the mutable reference only here,
         // after all interior tables are fully resolved, so no two `&mut`
@@ -353,13 +401,15 @@ impl PageTableManager {
     /// Does not reclaim interior table frames (they may still hold other
     /// mappings).  Returns `Err(NotMapped)` if the address has no mapping.
     pub fn unmap(&mut self, virt: u64) -> PagingResult<()> {
-        if virt & 0xfff != 0 { return Err(PagingError::UnalignedAddress); }
+        if virt & 0xfff != 0 {
+            return Err(PagingError::UnalignedAddress);
+        }
 
         let idx = VirtIndices::from_u64(virt);
 
         let pdpt_phys = self.descend(self.pml4_phys, idx.pml4)?;
-        let pd_phys   = self.descend(pdpt_phys,      idx.pdpt)?;
-        let pt_phys   = self.descend(pd_phys,        idx.pd)?;
+        let pd_phys = self.descend(pdpt_phys, idx.pdpt)?;
+        let pt_phys = self.descend(pd_phys, idx.pd)?;
 
         // SAFETY: pt_phys is a valid, aligned, identity-mapped frame from FrameSource;
         //         idx.pt is always in 0..512.
@@ -382,8 +432,8 @@ impl PageTableManager {
         let idx = VirtIndices::from_u64(virt);
 
         let pdpt_phys = self.descend(self.pml4_phys, idx.pml4)?;
-        let pd_phys   = self.descend(pdpt_phys,      idx.pdpt)?;
-        let pt_phys   = self.descend(pd_phys,        idx.pd)?;
+        let pd_phys = self.descend(pdpt_phys, idx.pdpt)?;
+        let pt_phys = self.descend(pd_phys, idx.pd)?;
 
         // SAFETY: pt_phys is a valid, aligned, identity-mapped frame from FrameSource;
         //         idx.pt is always in 0..512.
@@ -447,12 +497,12 @@ impl PageTableManager {
     /// The caller is responsible for ensuring unique access.
     unsafe fn entry_ptr_mut(phys: u64, idx: usize) -> *mut PageTableEntry {
         // SAFETY: caller guarantees phys is a valid, aligned frame; idx < 512.
-        (phys as *mut PageTableEntry).add(idx)
+        crate::phys_mem::phys_to_mut_ptr::<PageTableEntry>(phys).add(idx)
     }
 
     /// Same as `entry_ptr_mut` but returns a shared pointer.
     unsafe fn entry_ptr(phys: u64, idx: usize) -> *const PageTableEntry {
-        (phys as *const PageTableEntry).add(idx)
+        crate::phys_mem::phys_to_ptr::<PageTableEntry>(phys).add(idx)
     }
 }
 
@@ -542,7 +592,9 @@ mod tests {
     fn map_single_page_succeeds() {
         let (mut mgr, mut alloc) = make_mgr();
         let phys = alloc_phys(&mut alloc);
-        assert!(mgr.map(VA1, phys, MapFlags::kernel_rw(), &mut alloc).is_ok());
+        assert!(mgr
+            .map(VA1, phys, MapFlags::kernel_rw(), &mut alloc)
+            .is_ok());
         assert_eq!(mgr.mapped_pages(), 1);
     }
 
@@ -588,9 +640,17 @@ mod tests {
     fn map_out_of_frames_returns_out_of_memory() {
         // Give the manager exactly one frame (for the PML4 root).
         // The next alloc (for the PDPT) returns None → OutOfMemory.
-        struct OneFrameAlloc { frame: Box<X86PageTable>, used: bool }
+        struct OneFrameAlloc {
+            frame: Box<X86PageTable>,
+            used: bool,
+        }
         impl OneFrameAlloc {
-            fn new() -> Self { Self { frame: Box::new(X86PageTable::new()), used: false } }
+            fn new() -> Self {
+                Self {
+                    frame: Box::new(X86PageTable::new()),
+                    used: false,
+                }
+            }
         }
         impl FrameSource for OneFrameAlloc {
             fn alloc_zeroed(&mut self) -> Option<u64> {
@@ -619,7 +679,8 @@ mod tests {
     fn translate_mapped_page_returns_correct_phys() {
         let (mut mgr, mut alloc) = make_mgr();
         let phys = alloc_phys(&mut alloc);
-        mgr.map(VA1, phys, MapFlags::kernel_rw(), &mut alloc).unwrap();
+        mgr.map(VA1, phys, MapFlags::kernel_rw(), &mut alloc)
+            .unwrap();
         assert_eq!(mgr.translate(VA1).unwrap(), phys);
     }
 
@@ -648,7 +709,8 @@ mod tests {
     fn unmap_mapped_page_succeeds() {
         let (mut mgr, mut alloc) = make_mgr();
         let phys = alloc_phys(&mut alloc);
-        mgr.map(VA1, phys, MapFlags::kernel_rw(), &mut alloc).unwrap();
+        mgr.map(VA1, phys, MapFlags::kernel_rw(), &mut alloc)
+            .unwrap();
         assert!(mgr.unmap(VA1).is_ok());
         assert_eq!(mgr.mapped_pages(), 0);
     }
@@ -657,7 +719,8 @@ mod tests {
     fn unmap_makes_address_untranslatable() {
         let (mut mgr, mut alloc) = make_mgr();
         let phys = alloc_phys(&mut alloc);
-        mgr.map(VA1, phys, MapFlags::kernel_rw(), &mut alloc).unwrap();
+        mgr.map(VA1, phys, MapFlags::kernel_rw(), &mut alloc)
+            .unwrap();
         mgr.unmap(VA1).unwrap();
         assert_eq!(mgr.translate(VA1), Err(PagingError::NotMapped));
     }
@@ -695,11 +758,11 @@ mod tests {
         //   bits 47-39 = (0x0000_CAFE_1234_5000 >> 39) & 0x1ff
         let addr: u64 = 0x0000_0040_0020_1000;
         let vi = VirtIndices::from_u64(addr);
-        assert_eq!(vi.pml4,   (addr >> 39) as usize & 0x1ff);
-        assert_eq!(vi.pdpt,   (addr >> 30) as usize & 0x1ff);
-        assert_eq!(vi.pd,     (addr >> 21) as usize & 0x1ff);
-        assert_eq!(vi.pt,     (addr >> 12) as usize & 0x1ff);
-        assert_eq!(vi.offset,  addr & 0xfff);
+        assert_eq!(vi.pml4, (addr >> 39) as usize & 0x1ff);
+        assert_eq!(vi.pdpt, (addr >> 30) as usize & 0x1ff);
+        assert_eq!(vi.pd, (addr >> 21) as usize & 0x1ff);
+        assert_eq!(vi.pt, (addr >> 12) as usize & 0x1ff);
+        assert_eq!(addr & 0xfff, 0);
     }
 
     #[test]
@@ -718,7 +781,7 @@ mod tests {
         let rw = MapFlags::kernel_rw();
         let ur = MapFlags::user_rw();
         assert!(!rx.writable && !rx.user && !rx.no_exec);
-        assert!( rw.writable && !rw.user &&  rw.no_exec);
-        assert!( ur.writable &&  ur.user &&  ur.no_exec);
+        assert!(rw.writable && !rw.user && rw.no_exec);
+        assert!(ur.writable && ur.user && ur.no_exec);
     }
 }

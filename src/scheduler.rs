@@ -1,6 +1,6 @@
 use crate::object::KernelObject;
-use heapless::Vec;
 use core::cmp::Ordering;
+use heapless::Vec;
 
 const MAX_QUEUE_SIZE: usize = 32;
 
@@ -85,9 +85,11 @@ impl Scheduler {
         }
         // sort_unstable keeps highest-priority at index 0; swap_remove(0) pops it.
         let task = self.queue.swap_remove(0);
-        crate::println!("Executing: {} (priority: {})", task.object_id, task.priority);
         let id = task.object_id.clone();
-        self.running = Some(RunningTask { task, started_at_tick: current_tick });
+        self.running = Some(RunningTask {
+            task,
+            started_at_tick: current_tick,
+        });
         Some(id)
     }
 
@@ -103,14 +105,19 @@ impl Scheduler {
         };
 
         if expired {
+            // If no alternative work is queued, keep running the same task and
+            // just reset its slice start. This avoids pointless evict/requeue
+            // churn and serial-console spam.
+            if self.queue.is_empty() {
+                if let Some(rt) = self.running.as_mut() {
+                    rt.started_at_tick = current_tick;
+                }
+                return None;
+            }
+
             // Evict the current task.  Re-queue it at the back so it gets
             // another turn (round-robin within the same priority band).
             if let Some(rt) = self.running.take() {
-                crate::println!(
-                    "[preempt] evicting {} after {} ticks",
-                    rt.task.object_id,
-                    TICKS_PER_SLICE
-                );
                 if self.queue.push(rt.task).is_err() {
                     // Queue is at capacity — task is dropped.  This should
                     // not happen in normal operation (MAX_QUEUE_SIZE = 32).
@@ -144,12 +151,12 @@ impl Scheduler {
 
     fn intent_to_priority(intent: &str) -> u8 {
         match intent {
-            "low_latency"   => 10,
-            "interactive"   => 7,
-            "normal"        => 5,
-            "batch"         => 3,
+            "low_latency" => 10,
+            "interactive" => 7,
+            "normal" => 5,
+            "batch" => 3,
             "energy_saving" => 2,
-            _               => 5,
+            _ => 5,
         }
     }
 }
@@ -187,8 +194,8 @@ mod tests {
     fn high_priority_task_executes_before_low_priority() {
         let mut sched = Scheduler::new();
         sched.schedule(&make_obj("slow", "energy_saving")); // priority 2
-        sched.schedule(&make_obj("fast", "low_latency"));   // priority 10
-        sched.schedule(&make_obj("mid", "normal"));         // priority 5
+        sched.schedule(&make_obj("fast", "low_latency")); // priority 10
+        sched.schedule(&make_obj("mid", "normal")); // priority 5
 
         // complete_running() clears the running slot so execute_next()
         // can dispatch the next task without overwriting the previous one.
@@ -281,7 +288,11 @@ mod tests {
         let switched = sched.preempt_if_expired(TICKS_PER_SLICE);
         assert!(switched.is_some(), "preemption did not fire at boundary");
         let new_id = switched.unwrap();
-        assert_ne!(new_id.as_str(), first_id.as_str(), "same task should not re-run immediately");
+        assert_ne!(
+            new_id.as_str(),
+            first_id.as_str(),
+            "same task should not re-run immediately"
+        );
     }
 
     /// After eviction the old task is re-queued (not lost).
@@ -317,20 +328,21 @@ mod tests {
     }
 
     /// If the queue is empty when preemption fires, the sole task is
-    /// re-queued and immediately re-dispatched (it keeps the CPU).
+    /// kept running and its slice boundary is refreshed.
     #[test]
-    fn preempt_with_single_task_requeues_and_redispatches() {
+    fn preempt_with_single_task_refreshes_slice_without_switch() {
         let mut sched = Scheduler::new();
         sched.schedule(&make_obj("solo", "normal"));
         let first_id = sched.execute_next_at(0).unwrap();
 
-        // Only one task exists — after eviction it re-queues itself and
-        // execute_next_at picks it straight back up.
+        // Only one task exists — no context switch should occur.
         let switched = sched.preempt_if_expired(TICKS_PER_SLICE);
-        assert!(switched.is_some(), "sole task should be re-dispatched");
-        assert_eq!(switched.unwrap().as_str(), first_id.as_str());
-        // CPU is occupied again, queue is empty.
+        assert!(switched.is_none(), "sole task should keep running");
         assert!(sched.running_task().is_some());
+        assert_eq!(
+            sched.running_task().unwrap().task.object_id.as_str(),
+            first_id.as_str()
+        );
         assert_eq!(sched.queue_size(), 0);
     }
 
@@ -382,9 +394,9 @@ mod tests {
     fn preempt_dispatches_highest_priority_next() {
         let mut sched = Scheduler::new();
         // Schedule a low-priority task first so it gets dispatched.
-        sched.schedule(&make_obj("low", "energy_saving"));  // priority 2
-        // Then add a high-priority one to the queue.
-        sched.schedule(&make_obj("high", "low_latency"));   // priority 10
+        sched.schedule(&make_obj("low", "energy_saving")); // priority 2
+                                                           // Then add a high-priority one to the queue.
+        sched.schedule(&make_obj("high", "low_latency")); // priority 10
 
         // Dispatch — "high" has higher priority, gets the CPU first.
         let first = sched.execute_next_at(0).unwrap();
