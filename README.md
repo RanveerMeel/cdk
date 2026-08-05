@@ -16,6 +16,8 @@ A **bare-metal operating system kernel** written in Rust, designed around capabi
 
 **Distributed Node Awareness** — Cloud, Edge, and Local node types with discovery, routing, and latency-aware selection built in from the start.
 
+**Network Stack Foundation (Phase 1)** — Loopback interface, bounded TX/RX packet queues, and service-tick processing for deterministic `no_std` networking primitives.
+
 **Interactive Serial Console** — A `cdk>` prompt over COM1 for creating objects, sending messages, inspecting state, and controlling the scheduler at runtime.
 
 ## Quick Start
@@ -56,6 +58,7 @@ CDK_QEMU_GUI=1 ./run_qemu.sh
   message.rs       Typed IPC messages and payloads
   memory_graph.rs  Per-object memory tracking
   node.rs          Distributed node types and discovery
+  network.rs       Network interfaces, packet queues, and loopback service
   allocator.rs     Bitmap physical frame allocator
   heap.rs          Kernel heap (#[global_allocator], linked-list, 2 MiB)
   rng.rs           RDRAND RNG (bare-metal) / OsRng (host tests)
@@ -92,6 +95,10 @@ CDK_QEMU_GUI=1 ./run_qemu.sh
 | `mem` | Memory graph summary |
 | `node` | Show local node info |
 | `discover <id> <ms>` | Simulate discovering a remote node |
+| `net` | Show network interface count and packet stats |
+| `netsend <if> <text>` | Queue packet payload bytes on an interface |
+| `netrecv <if>` | Read one packet from an interface RX queue |
+| `nettick` | Service network I/O (drain TX, deliver to RX) |
 | `capsign <id>` | Sign a fresh capability for object `<id>` and verify the signature |
 | `capverify <id>` | Check whether a capability for `<id>` is signed |
 | `heapinfo` | Kernel heap usage (total / used / free) |
@@ -123,7 +130,7 @@ CDK_QEMU_GUI=1 ./run_qemu.sh
 - [x] Kernel heap allocator (`#[global_allocator]`, linked-list, 2 MiB reserved at boot)
 - [x] Ed25519 capability signing (RDRAND on bare-metal, OsRng on host; SHA-256 message digest)
 - [x] Framebuffer text rendering (8×16 bitmap font, RGB/BGR/U8 pixel formats, auto-scroll)
-- [ ] Network stack integration
+- [ ] Network stack integration (Phase 1 complete: loopback + bounded queues + service tick)
 - [ ] Multi-core support
 
 ## Open Source Guidelines

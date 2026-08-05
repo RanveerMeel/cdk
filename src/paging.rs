@@ -40,10 +40,8 @@
 
 #[cfg(target_os = "none")]
 use x86_64::{
-    structures::paging::{
-        PageTableEntry, PageTableFlags as X86Flags,
-    },
-    PhysAddr, VirtAddr,
+    structures::paging::{page_table::PageTableEntry, PageTableFlags as X86Flags},
+    PhysAddr,
 };
 
 #[cfg(not(target_os = "none"))]

@@ -8,6 +8,7 @@ use cdk::allocator::FrameAllocator;
 use cdk::heap::KERNEL_HEAP;
 use cdk::kernel::Kernel;
 use cdk::memory_graph::MemoryGraph;
+use cdk::network::NetworkStack;
 use cdk::node::KernelNode;
 use cdk::object::KernelObject;
 use cdk::paging::PageTableManager;
@@ -21,6 +22,7 @@ static BOOTLOADER_CONFIG: BootloaderConfig = {
 static KERNEL: Mutex<Kernel> = Mutex::new(Kernel::new());
 static MEM_GRAPH: Mutex<MemoryGraph> = Mutex::new(MemoryGraph::new());
 static NODE: Mutex<KernelNode> = Mutex::new(KernelNode::new_const());
+static NETWORK: Mutex<NetworkStack> = Mutex::new(NetworkStack::new());
 static FRAME_ALLOCATOR: Mutex<FrameAllocator> = Mutex::new(FrameAllocator::new());
 static PAGE_TABLE: Mutex<Option<PageTableManager>> = Mutex::new(None);
 
@@ -42,8 +44,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // Init the pixel framebuffer early so boot messages appear on screen.
     if let Some(fb) = boot_info.framebuffer.as_mut() {
+        let (width, height) = {
+            let info = fb.info();
+            (info.width, info.height)
+        };
         cdk::framebuffer::init(fb);
-        cdk::println!("Framebuffer: {}x{} pixels", fb.info().width, fb.info().height);
+        cdk::println!("Framebuffer: {}x{} pixels", width, height);
     }
 
     // Register the preemption hook *before* enabling interrupts so the very
@@ -55,9 +61,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     {
         let mut fa = FRAME_ALLOCATOR.lock();
         cdk::allocator::boot::init(&mut fa, &boot_info.memory_regions);
-        cdk::println!("Frame allocator: {} KiB usable, {} KiB free",
+        cdk::println!(
+            "Frame allocator: {} KiB usable, {} KiB free",
             fa.usable_bytes() / 1024,
-            fa.free_bytes() / 1024);
+            fa.free_bytes() / 1024
+        );
     }
 
     // Initialise the kernel heap: 512 frames = 2 MiB.
@@ -124,14 +132,30 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let node = NODE.lock();
         cdk::println!("Node ID: {}", node.node_id());
     }
+    {
+        let mut net = NETWORK.lock();
+        match net.add_loopback_interface("lo") {
+            Ok(()) => cdk::println!("Network: loopback interface 'lo' registered"),
+            Err(e) => cdk::println!("Network: WARNING — loopback init failed: {:?}", e),
+        }
+    }
 
-    cdk::console::run_static(&KERNEL, &MEM_GRAPH, &NODE, &FRAME_ALLOCATOR, &PAGE_TABLE);
+    cdk::console::run_static(
+        &KERNEL,
+        &MEM_GRAPH,
+        &NODE,
+        &NETWORK,
+        &FRAME_ALLOCATOR,
+        &PAGE_TABLE,
+    );
 }
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     cdk::println!("PANIC: {}", info);
     loop {
-        unsafe { core::arch::asm!("hlt"); }
+        unsafe {
+            core::arch::asm!("hlt");
+        }
     }
 }

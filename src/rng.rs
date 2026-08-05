@@ -52,7 +52,8 @@ mod backend {
             }
             if i < dest.len() {
                 let v = self.next_u64().to_le_bytes();
-                dest[i..].copy_from_slice(&v[..dest.len() - i]);
+                let tail_len = dest.len() - i;
+                dest[i..].copy_from_slice(&v[..tail_len]);
             }
         }
 

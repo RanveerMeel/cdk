@@ -1,16 +1,17 @@
 //! Interactive serial console — reads lines from COM1 and dispatches commands.
 
-use crate::serial;
 use crate::allocator::FrameAllocator;
 use crate::capability::Capability;
 use crate::framebuffer::FRAMEBUFFER;
 use crate::heap::KERNEL_HEAP;
 use crate::kernel::Kernel;
 use crate::memory_graph::MemoryGraph;
+use crate::message::Message;
+use crate::network::NetworkStack;
 use crate::node::KernelNode;
 use crate::object::KernelObject;
-use crate::message::Message;
 use crate::paging::{MapFlags, PageTableManager};
+use crate::serial;
 use spin::Mutex;
 
 const MAX_LINE: usize = 128;
@@ -20,6 +21,7 @@ pub fn run_static(
     kernel: &'static Mutex<Kernel>,
     mem_graph: &'static Mutex<MemoryGraph>,
     node: &'static Mutex<KernelNode>,
+    network: &'static Mutex<NetworkStack>,
     frame_alloc: &'static Mutex<FrameAllocator>,
     page_table: &'static Mutex<Option<PageTableManager>>,
 ) -> ! {
@@ -41,6 +43,7 @@ pub fn run_static(
             &mut kernel.lock(),
             &mut mem_graph.lock(),
             &mut node.lock(),
+            &mut network.lock(),
             &mut frame_alloc.lock(),
             &mut page_table.lock(),
         );
@@ -97,6 +100,7 @@ fn dispatch(
     kernel: &mut Kernel,
     mem_graph: &mut MemoryGraph,
     node: &mut KernelNode,
+    network: &mut NetworkStack,
     frame_alloc: &mut FrameAllocator,
     page_table: &mut Option<PageTableManager>,
 ) {
@@ -108,7 +112,7 @@ fn dispatch(
 
     match cmd {
         "help" | "?" => cmd_help(),
-        "status" => cmd_status(kernel, mem_graph, node, page_table),
+        "status" => cmd_status(kernel, mem_graph, node, network, page_table),
         "create" => cmd_create(arg1, arg2, kernel, mem_graph),
         "list" => cmd_list(kernel),
         "schedule" => cmd_schedule(arg1, kernel),
@@ -119,23 +123,27 @@ fn dispatch(
         "mem" => cmd_mem(mem_graph),
         "node" => cmd_node(node),
         "discover" => cmd_discover(arg1, arg2, node),
+        "net" => cmd_net_status(network),
+        "netsend" => cmd_net_send(arg1, arg2, network),
+        "netrecv" => cmd_net_recv(arg1, network),
+        "nettick" => cmd_net_tick(network),
         #[cfg(target_os = "none")]
         "ticks" => crate::println!("Timer ticks: {}", crate::interrupts::ticks()),
         #[cfg(not(target_os = "none"))]
         "ticks" => crate::println!("Timer ticks: (unavailable outside bare-metal)"),
         "timeslice" => cmd_timeslice(),
-        "running"   => cmd_running(kernel),
-        "frames"     => cmd_frames(frame_alloc),
-        "heapinfo"   => cmd_heapinfo(),
-        "palloc"     => cmd_palloc(frame_alloc),
-        "pfree"      => cmd_pfree(arg1, frame_alloc),
-        "fbinfo"     => cmd_fbinfo(),
-        "capsign"    => cmd_capsign(arg1, kernel),
-        "capverify"  => cmd_capverify(arg1, kernel),
-        "vmmap"      => cmd_vmmap(arg1, arg2, arg3, page_table, frame_alloc),
-        "vmunmap"    => cmd_vmunmap(arg1, page_table),
-        "vmtranslate"=> cmd_vmtranslate(arg1, page_table),
-        "vminfo"     => cmd_vminfo(page_table),
+        "running" => cmd_running(kernel),
+        "frames" => cmd_frames(frame_alloc),
+        "heapinfo" => cmd_heapinfo(),
+        "palloc" => cmd_palloc(frame_alloc),
+        "pfree" => cmd_pfree(arg1, frame_alloc),
+        "fbinfo" => cmd_fbinfo(),
+        "capsign" => cmd_capsign(arg1, kernel),
+        "capverify" => cmd_capverify(arg1, kernel),
+        "vmmap" => cmd_vmmap(arg1, arg2, arg3, page_table, frame_alloc),
+        "vmunmap" => cmd_vmunmap(arg1, page_table),
+        "vmtranslate" => cmd_vmtranslate(arg1, page_table),
+        "vminfo" => cmd_vminfo(page_table),
         "echo" => crate::println!("{} {}", arg1, arg2),
         "panic" => panic!("user-triggered panic"),
         _ => crate::println!("Unknown command: '{}'. Type 'help'.", cmd),
@@ -160,6 +168,11 @@ fn cmd_help() {
     crate::println!("  node              Show this node's info");
     crate::println!("  discover <id> <latency_ms>");
     crate::println!("                    Simulate discovering a remote node");
+    crate::println!("  net               Show network interface and packet stats");
+    crate::println!("  netsend <if> <text>");
+    crate::println!("                    Queue packet bytes to interface");
+    crate::println!("  netrecv <if>      Receive one packet from interface RX queue");
+    crate::println!("  nettick           Service network I/O (process TX/RX)");
     crate::println!("  ticks             Show PIT timer tick count since boot");
     crate::println!("  timeslice         Show the preemptive time-slice length (ticks)");
     crate::println!("  fbinfo            Pixel framebuffer info (resolution, format)");
@@ -179,50 +192,77 @@ fn cmd_help() {
     crate::println!("  panic             Trigger a kernel panic (test)");
 }
 
-fn cmd_status(kernel: &mut Kernel, mem_graph: &MemoryGraph, node: &KernelNode, page_table: &Option<PageTableManager>) {
+fn cmd_status(
+    kernel: &mut Kernel,
+    mem_graph: &MemoryGraph,
+    node: &KernelNode,
+    network: &NetworkStack,
+    page_table: &Option<PageTableManager>,
+) {
     crate::println!("=== CDK Kernel Status ===");
     crate::println!("  Node:         {}", node.node_id());
     crate::println!("  Objects:      {}", kernel.object_count());
     crate::println!("  Sched queue:  {}", kernel.scheduler_queue_size());
     match kernel.running_task_id() {
         Some(id) => crate::println!("  Running task: {}", id),
-        None      => crate::println!("  Running task: (idle)"),
+        None => crate::println!("  Running task: (idle)"),
     }
-    crate::println!("  Time slice:   {} ticks (~{}ms at 1kHz)",
+    crate::println!(
+        "  Time slice:   {} ticks (~{}ms at 1kHz)",
         crate::scheduler::TICKS_PER_SLICE,
-        crate::scheduler::TICKS_PER_SLICE);
+        crate::scheduler::TICKS_PER_SLICE
+    );
     crate::println!("  Memory:       {} bytes tracked", mem_graph.total_memory());
     crate::println!("  Mem objects:  {}", mem_graph.object_count());
     crate::println!("  Known nodes:  {}", node.known_nodes_count());
+    let net = network.summary();
+    crate::println!(
+        "  Network:      {} iface(s), tx={}, rx={}",
+        net.interfaces,
+        net.total_tx_packets,
+        net.total_rx_packets
+    );
     match page_table {
-        Some(pt) => crate::println!("  VM pages:     {} mapped (PML4 @ {:#x})",
-            pt.mapped_pages(), pt.pml4_phys()),
+        Some(pt) => crate::println!(
+            "  VM pages:     {} mapped (PML4 @ {:#x})",
+            pt.mapped_pages(),
+            pt.pml4_phys()
+        ),
         None => crate::println!("  VM pages:     (page table not initialised)"),
     }
     if KERNEL_HEAP.is_initialised() {
-        crate::println!("  Heap:         {} KiB used / {} KiB total",
+        crate::println!(
+            "  Heap:         {} KiB used / {} KiB total",
             KERNEL_HEAP.used_bytes() / 1024,
-            KERNEL_HEAP.total_bytes() / 1024);
+            KERNEL_HEAP.total_bytes() / 1024
+        );
     } else {
         crate::println!("  Heap:         (not initialised)");
     }
     match FRAMEBUFFER.lock().as_ref() {
-        Some(fb) => crate::println!("  Framebuffer:  {}x{} px ({}x{} chars)",
-            fb.width(), fb.height(), fb.cols(), fb.rows()),
-        None     => crate::println!("  Framebuffer:  (not initialised)"),
+        Some(fb) => crate::println!(
+            "  Framebuffer:  {}x{} px ({}x{} chars)",
+            fb.width(),
+            fb.height(),
+            fb.cols(),
+            fb.rows()
+        ),
+        None => crate::println!("  Framebuffer:  (not initialised)"),
     }
 }
 
 fn cmd_timeslice() {
-    crate::println!("Time slice: {} ticks (~{}ms at default PIT ~1kHz)",
+    crate::println!(
+        "Time slice: {} ticks (~{}ms at default PIT ~1kHz)",
         crate::scheduler::TICKS_PER_SLICE,
-        crate::scheduler::TICKS_PER_SLICE);
+        crate::scheduler::TICKS_PER_SLICE
+    );
 }
 
 fn cmd_running(kernel: &Kernel) {
     match kernel.running_task_id() {
         Some(id) => crate::println!("Running: {}", id),
-        None      => crate::println!("(idle — no task currently running)"),
+        None => crate::println!("(idle — no task currently running)"),
     }
 }
 
@@ -231,8 +271,13 @@ fn cmd_fbinfo() {
         Some(fb) => {
             crate::println!("=== Pixel Framebuffer ===");
             crate::println!("  Resolution : {}x{} px", fb.width(), fb.height());
-            crate::println!("  Text grid  : {}x{} chars ({}x{} px/char)",
-                fb.cols(), fb.rows(), crate::framebuffer::CHAR_W, crate::framebuffer::CHAR_H);
+            crate::println!(
+                "  Text grid  : {}x{} chars ({}x{} px/char)",
+                fb.cols(),
+                fb.rows(),
+                crate::framebuffer::CHAR_W,
+                crate::framebuffer::CHAR_H
+            );
         }
         None => crate::println!("Framebuffer: not initialised"),
     }
@@ -261,9 +306,9 @@ fn cmd_capsign(id: &str, kernel: &mut Kernel) {
         Ok(_sk) => {
             crate::println!("Signed capability for '{}'", id);
             match cap.verify() {
-                Ok(true)  => crate::println!("  Signature valid ✓"),
+                Ok(true) => crate::println!("  Signature valid ✓"),
                 Ok(false) => crate::println!("  WARNING: signature not present"),
-                Err(e)    => crate::println!("  ERROR: verification failed: {:?}", e),
+                Err(e) => crate::println!("  ERROR: verification failed: {:?}", e),
             }
         }
         Err(e) => crate::println!("Error: signing failed: {:?}", e),
@@ -286,9 +331,9 @@ fn cmd_capverify(id: &str, kernel: &mut Kernel) {
     // Unsigned capability: verify returns false (not an error).
     let cap = Capability::new(obj_ref);
     match Kernel::verify_capability(&cap) {
-        Ok(true)  => crate::println!("Capability for '{}': signature valid", id),
+        Ok(true) => crate::println!("Capability for '{}': signature valid", id),
         Ok(false) => crate::println!("Capability for '{}': unsigned (no signature)", id),
-        Err(e)    => crate::println!("Capability for '{}': error: {:?}", id, e),
+        Err(e) => crate::println!("Capability for '{}': error: {:?}", id, e),
     }
 }
 
@@ -302,7 +347,12 @@ fn cmd_create(name: &str, intent: &str, kernel: &mut Kernel, mem_graph: &mut Mem
     let id_str: heapless::String<64> = obj.id.clone();
     let cap = kernel.register_object(obj);
     mem_graph.register_object(cap.object_id.as_str(), 0);
-    crate::println!("Created object '{}' (id={}, intent={})", name, id_str, intent);
+    crate::println!(
+        "Created object '{}' (id={}, intent={})",
+        name,
+        id_str,
+        intent
+    );
 }
 
 fn cmd_list(kernel: &Kernel) {
@@ -339,7 +389,7 @@ fn cmd_run_next(kernel: &mut Kernel) {
         Some(id) => crate::println!("Dispatched: {}", id),
         None => match kernel.running_task_id() {
             Some(id) => crate::println!("(task '{}' already running — wait for preemption)", id),
-            None     => crate::println!("(scheduler queue empty)"),
+            None => crate::println!("(scheduler queue empty)"),
         },
     }
 }
@@ -388,8 +438,11 @@ fn cmd_delete(id: &str, kernel: &mut Kernel, mem_graph: &mut MemoryGraph) {
 }
 
 fn cmd_mem(mem_graph: &MemoryGraph) {
-    crate::println!("Memory: {} bytes across {} objects",
-        mem_graph.total_memory(), mem_graph.object_count());
+    crate::println!(
+        "Memory: {} bytes across {} objects",
+        mem_graph.total_memory(),
+        mem_graph.object_count()
+    );
 }
 
 fn cmd_node(node: &KernelNode) {
@@ -413,14 +466,79 @@ fn cmd_discover(id: &str, latency_str: &str, node: &mut KernelNode) {
     crate::println!("Discovered node '{}' (latency={}ms)", id, latency);
 }
 
+fn cmd_net_status(network: &NetworkStack) {
+    let summary = network.summary();
+    crate::println!("=== Network ===");
+    crate::println!("  Interfaces: {}", summary.interfaces);
+    crate::println!(
+        "  Totals: tx={} rx={} tx_drop={} rx_drop={}",
+        summary.total_tx_packets,
+        summary.total_rx_packets,
+        summary.total_tx_dropped,
+        summary.total_rx_dropped
+    );
+    network.for_each_interface(|name, stats| {
+        crate::println!(
+            "  - {}: tx={} rx={} tx_drop={} rx_drop={}",
+            name,
+            stats.tx_packets,
+            stats.rx_packets,
+            stats.tx_dropped,
+            stats.rx_dropped
+        );
+    });
+}
+
+fn cmd_net_send(iface: &str, text: &str, network: &mut NetworkStack) {
+    if iface.is_empty() || text.is_empty() {
+        crate::println!("Usage: netsend <if> <text>");
+        return;
+    }
+    match network.send_bytes(iface, text.as_bytes()) {
+        Ok(()) => crate::println!("Queued {} byte(s) on '{}'", text.len(), iface),
+        Err(e) => crate::println!("Error: {:?}", e),
+    }
+}
+
+fn cmd_net_recv(iface: &str, network: &mut NetworkStack) {
+    if iface.is_empty() {
+        crate::println!("Usage: netrecv <if>");
+        return;
+    }
+    match network.recv_packet(iface) {
+        Ok(Some(packet)) => match core::str::from_utf8(packet.payload.as_slice()) {
+            Ok(text) => {
+                crate::println!("RX '{}': {} byte(s): {}", iface, packet.payload.len(), text)
+            }
+            Err(_) => crate::println!(
+                "RX '{}': {} byte(s) (non-utf8 payload)",
+                iface,
+                packet.payload.len()
+            ),
+        },
+        Ok(None) => crate::println!("RX '{}': (no packets)", iface),
+        Err(e) => crate::println!("Error: {:?}", e),
+    }
+}
+
+fn cmd_net_tick(network: &mut NetworkStack) {
+    network.service();
+    let summary = network.summary();
+    crate::println!(
+        "Network serviced: tx={} rx={}",
+        summary.total_tx_packets,
+        summary.total_rx_packets
+    );
+}
+
 fn cmd_heapinfo() {
     if !KERNEL_HEAP.is_initialised() {
         crate::println!("Heap: not initialised");
         return;
     }
     let total = KERNEL_HEAP.total_bytes();
-    let used  = KERNEL_HEAP.used_bytes();
-    let free  = KERNEL_HEAP.free_bytes();
+    let used = KERNEL_HEAP.used_bytes();
+    let free = KERNEL_HEAP.free_bytes();
     crate::println!("=== Kernel Heap ===");
     crate::println!("  Total : {} KiB", total / 1024);
     crate::println!("  Used  : {} KiB ({} bytes)", used / 1024, used);
@@ -464,9 +582,11 @@ fn cmd_vminfo(page_table: &Option<PageTableManager>) {
         Some(pt) => {
             crate::println!("=== Virtual Memory ===");
             crate::println!("  PML4 root : {:#x}", pt.pml4_phys());
-            crate::println!("  Mapped    : {} pages ({} KiB)",
+            crate::println!(
+                "  Mapped    : {} pages ({} KiB)",
                 pt.mapped_pages(),
-                pt.mapped_pages() as u64 * crate::paging::PAGE_SIZE / 1024);
+                pt.mapped_pages() as u64 * crate::paging::PAGE_SIZE / 1024
+            );
         }
         None => crate::println!("Page table not initialised."),
     }
@@ -485,16 +605,22 @@ fn cmd_vmmap(
     }
     let virt = match parse_hex(virt_str) {
         Some(v) => v,
-        None => { crate::println!("Invalid virtual address '{}'", virt_str); return; }
+        None => {
+            crate::println!("Invalid virtual address '{}'", virt_str);
+            return;
+        }
     };
     let phys = match parse_hex(phys_str) {
         Some(p) => p,
-        None => { crate::println!("Invalid physical address '{}'", phys_str); return; }
+        None => {
+            crate::println!("Invalid physical address '{}'", phys_str);
+            return;
+        }
     };
     let flags = match flags_str {
         "krw" => MapFlags::kernel_rw(),
         "urw" => MapFlags::user_rw(),
-        _     => MapFlags::kernel_rx(), // default
+        _ => MapFlags::kernel_rx(), // default
     };
     match page_table {
         Some(pt) => match pt.map(virt, phys, flags, frame_alloc) {
@@ -512,7 +638,10 @@ fn cmd_vmunmap(virt_str: &str, page_table: &mut Option<PageTableManager>) {
     }
     let virt = match parse_hex(virt_str) {
         Some(v) => v,
-        None => { crate::println!("Invalid address '{}'", virt_str); return; }
+        None => {
+            crate::println!("Invalid address '{}'", virt_str);
+            return;
+        }
     };
     match page_table {
         Some(pt) => match pt.unmap(virt) {
@@ -530,19 +659,25 @@ fn cmd_vmtranslate(virt_str: &str, page_table: &Option<PageTableManager>) {
     }
     let virt = match parse_hex(virt_str) {
         Some(v) => v,
-        None => { crate::println!("Invalid address '{}'", virt_str); return; }
+        None => {
+            crate::println!("Invalid address '{}'", virt_str);
+            return;
+        }
     };
     match page_table {
         Some(pt) => match pt.translate(virt) {
             Ok(phys) => crate::println!("{:#x} -> {:#x}", virt, phys),
-            Err(e)   => crate::println!("Error: {:?}", e),
+            Err(e) => crate::println!("Error: {:?}", e),
         },
         None => crate::println!("Page table not initialised."),
     }
 }
 
 fn parse_hex(s: &str) -> Option<u64> {
-    let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    let s = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
     if s.is_empty() {
         return None;
     }
