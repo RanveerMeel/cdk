@@ -20,13 +20,13 @@
 //! `Capability::generate_key()` draws entropy from [`crate::rng::KernelRng`]
 //! (RDRAND on bare-metal, OS entropy on host).
 
+use core::str::FromStr;
 use heapless::FnvIndexSet;
 use heapless::String;
-use core::str::FromStr;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use sha2::{Digest, Sha256};
 use rand_core::RngCore;
+use sha2::{Digest, Sha256};
 
 use crate::rng::KernelRng;
 
@@ -51,12 +51,12 @@ impl Permission {
     /// Stable byte tag used in the signable message digest.
     fn tag(&self) -> u8 {
         match self {
-            Permission::Read           => 0x01,
-            Permission::Write          => 0x02,
-            Permission::Execute        => 0x03,
-            Permission::SendMessage    => 0x04,
+            Permission::Read => 0x01,
+            Permission::Write => 0x02,
+            Permission::Execute => 0x03,
+            Permission::SendMessage => 0x04,
             Permission::ReceiveMessage => 0x05,
-            Permission::Delete         => 0x06,
+            Permission::Delete => 0x06,
         }
     }
 }
@@ -90,10 +90,7 @@ impl Capability {
     }
 
     /// Create a new unsigned capability with a caller-supplied permission set.
-    pub fn with_permissions(
-        obj: &crate::object::KernelObject,
-        permissions: &[Permission],
-    ) -> Self {
+    pub fn with_permissions(obj: &crate::object::KernelObject, permissions: &[Permission]) -> Self {
         let mut perms = FnvIndexSet::new();
         for perm in permissions {
             let _ = perms.insert(perm.clone());
@@ -134,7 +131,7 @@ impl Capability {
         let signing_key = SigningKey::from_bytes(signing_key_bytes);
         let msg = self.signable_message();
         let sig: Signature = signing_key.sign(&msg);
-        self.signature  = Some(sig.to_bytes());
+        self.signature = Some(sig.to_bytes());
         self.signer_key = Some(signing_key.verifying_key().to_bytes());
         Ok(())
     }
@@ -145,11 +142,17 @@ impl Capability {
     /// `Ok(false)` when no signature has been set, and `Err` when the
     /// stored key or signature bytes are malformed.
     pub fn verify(&self) -> Result<bool, CapabilityError> {
-        let sig_bytes  = match self.signature  { Some(s) => s, None => return Ok(false) };
-        let key_bytes  = match self.signer_key { Some(k) => k, None => return Ok(false) };
+        let sig_bytes = match self.signature {
+            Some(s) => s,
+            None => return Ok(false),
+        };
+        let key_bytes = match self.signer_key {
+            Some(k) => k,
+            None => return Ok(false),
+        };
 
-        let verifying_key = VerifyingKey::from_bytes(&key_bytes)
-            .map_err(|_| CapabilityError::InvalidKey)?;
+        let verifying_key =
+            VerifyingKey::from_bytes(&key_bytes).map_err(|_| CapabilityError::InvalidKey)?;
         let signature = Signature::from_bytes(&sig_bytes);
         let msg = self.signable_message();
 

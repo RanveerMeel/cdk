@@ -34,7 +34,9 @@ unsafe fn inb(port: u16) -> u8 {
 
 #[cfg(not(target_arch = "x86_64"))]
 #[inline]
-unsafe fn inb(_port: u16) -> u8 { 0 }
+unsafe fn inb(_port: u16) -> u8 {
+    0
+}
 
 /// Minimal 8N1 @ 38400 — sufficient for QEMU and matches common bootloader expectations.
 pub fn init() {

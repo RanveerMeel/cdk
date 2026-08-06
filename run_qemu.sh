@@ -27,8 +27,14 @@ fi
 echo "Building kernel..."
 # Work around an LLVM backend crash observed with curve25519-dalek SIMD codegen
 # on some host toolchains by forcing the serial backend.
+# Optional: CDK_VIRTIO_HW=1 enables virtio-net/gpu MMIO+PCI probe paths.
+FEATURES=()
+if [[ "${CDK_VIRTIO_HW:-}" == "1" ]]; then
+    FEATURES=(--features virtio-hw)
+fi
+
 RUSTFLAGS="${RUSTFLAGS:-} --cfg curve25519_dalek_backend=\"serial\"" \
-    cargo build --release --bin cdk
+    cargo build --release --bin cdk "${FEATURES[@]}"
 
 # BIOS bootable raw image (bootloader 0.11)
 echo "Creating bootable image..."
@@ -57,9 +63,17 @@ else
     DISPLAY_ARGS=(-display none)
 fi
 
+# -smp 2: exercise AP trampoline / LAPIC path (roadmap reset M1).
+SMP_ARGS=(-smp "${CDK_QEMU_SMP:-2}")
+
+# Virtio-gpu on the PCI bus (soft backend always works without it).
+GPU_ARGS=(-device virtio-gpu-pci)
+
 qemu-system-x86_64 \
     -drive format=raw,file="$RUN_IMG",snapshot=on \
     -serial stdio \
+    "${SMP_ARGS[@]}" \
+    "${GPU_ARGS[@]}" \
     "${DISPLAY_ARGS[@]}" \
     -no-reboot \
     -no-shutdown

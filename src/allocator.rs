@@ -135,6 +135,39 @@ impl FrameAllocator {
         Err(AllocError::OutOfMemory)
     }
 
+    /// Allocate `count` physically contiguous frames. Returns the base frame.
+    ///
+    /// Marks the entire run atomically (no partial allocation on failure).
+    pub fn alloc_contiguous(&mut self, count: usize) -> Result<PhysFrame, AllocError> {
+        if count == 0 {
+            return Err(AllocError::OutOfMemory);
+        }
+        if count > self.free_frames {
+            return Err(AllocError::OutOfMemory);
+        }
+        let limit = self.total_frames.saturating_sub(count);
+        let mut start = 0usize;
+        while start <= limit {
+            let mut ok = true;
+            for i in 0..count {
+                if self.is_used(start + i) {
+                    start = start + i + 1;
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                continue;
+            }
+            for i in 0..count {
+                self.set_used(start + i);
+            }
+            self.free_frames = self.free_frames.saturating_sub(count);
+            return Ok(PhysFrame(start as u64 * FRAME_SIZE));
+        }
+        Err(AllocError::OutOfMemory)
+    }
+
     /// Free a previously allocated frame.
     pub fn free(&mut self, frame: PhysFrame) -> Result<(), AllocError> {
         let idx = (frame.0 / FRAME_SIZE) as usize;
@@ -153,10 +186,18 @@ impl FrameAllocator {
     // Statistics
     // -----------------------------------------------------------------
 
-    pub fn total_frames(&self) -> usize { self.total_frames }
-    pub fn free_frames(&self) -> usize  { self.free_frames }
-    pub fn used_frames(&self) -> usize  { self.total_frames - self.free_frames }
-    pub fn reserved_frames(&self) -> usize { self.reserved_frames }
+    pub fn total_frames(&self) -> usize {
+        self.total_frames
+    }
+    pub fn free_frames(&self) -> usize {
+        self.free_frames
+    }
+    pub fn used_frames(&self) -> usize {
+        self.total_frames - self.free_frames
+    }
+    pub fn reserved_frames(&self) -> usize {
+        self.reserved_frames
+    }
 
     /// Total usable memory in bytes (free + allocated, excludes reserved).
     pub fn usable_bytes(&self) -> u64 {
@@ -204,8 +245,8 @@ impl FrameAllocator {
         if remainder > 0 {
             // Mask keeps only the `remainder` lowest bits.
             let mask = (1u64 << remainder) - 1;
-            n += (self.bitmap[full_words] & mask).count_zeros() as usize
-                - (64 - remainder); // subtract the upper phantom bits counted by count_zeros
+            n += (self.bitmap[full_words] & mask).count_zeros() as usize - (64 - remainder);
+            // subtract the upper phantom bits counted by count_zeros
         }
         n
     }
@@ -296,15 +337,18 @@ mod tests {
     fn non_usable_regions_are_reserved() {
         // Mix of usable and reserved regions.
         let regions = [
-            (0,              FRAME_SIZE,      false), // reserved
-            (FRAME_SIZE,     2 * FRAME_SIZE,  true),  // usable: frames 1..3
-            (3 * FRAME_SIZE, FRAME_SIZE,      false), // reserved
+            (0, FRAME_SIZE, false),              // reserved
+            (FRAME_SIZE, 2 * FRAME_SIZE, true),  // usable: frames 1..3
+            (3 * FRAME_SIZE, FRAME_SIZE, false), // reserved
         ];
         let mut a = make_allocator(&regions);
         assert_eq!(a.free_frames(), 2);
         // First allocation must NOT return frame 0 (reserved).
         let f = a.alloc().unwrap();
-        assert!(f.base_addr() >= FRAME_SIZE, "should not allocate reserved frame 0");
+        assert!(
+            f.base_addr() >= FRAME_SIZE,
+            "should not allocate reserved frame 0"
+        );
     }
 
     #[test]
@@ -314,9 +358,7 @@ mod tests {
         let total = a.total_frames();
         assert_eq!(a.free_frames() + a.used_frames(), total);
 
-        let frames: heapless::Vec<PhysFrame, 8> = (0..4)
-            .map(|_| a.alloc().unwrap())
-            .collect();
+        let frames: heapless::Vec<PhysFrame, 8> = (0..4).map(|_| a.alloc().unwrap()).collect();
         assert_eq!(a.used_frames(), 4);
         assert_eq!(a.free_frames(), 4);
 
@@ -343,5 +385,31 @@ mod tests {
         assert_eq!(a.usable_bytes(), 4 * FRAME_SIZE);
         let _ = a.alloc().unwrap();
         assert_eq!(a.free_bytes(), 3 * FRAME_SIZE);
+    }
+
+    #[test]
+    fn alloc_contiguous_finds_run_across_holes() {
+        let mut a = make_allocator(&[(0, 16 * FRAME_SIZE, true)]);
+        let mut held = heapless::Vec::<PhysFrame, 16>::new();
+        for _ in 0..16 {
+            held.push(a.alloc().unwrap()).unwrap();
+        }
+        // Free frames 5..10 (6 frames).
+        for i in 5..11 {
+            a.free(held[i]).unwrap();
+        }
+        let base = a.alloc_contiguous(4).unwrap();
+        assert_eq!(base.base_addr(), 5 * FRAME_SIZE);
+        assert_eq!(a.free_frames(), 2);
+    }
+
+    #[test]
+    fn alloc_contiguous_fails_atomically() {
+        let mut a = make_allocator(&[(0, 3 * FRAME_SIZE, true)]);
+        assert!(matches!(
+            a.alloc_contiguous(4),
+            Err(AllocError::OutOfMemory)
+        ));
+        assert_eq!(a.free_frames(), 3);
     }
 }

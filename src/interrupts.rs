@@ -15,9 +15,9 @@
 //! tick count so it can decide whether the running task's time slice has
 //! expired without the ISR needing to know about `KERNEL` directly.
 
-use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
-use spin::Once;
 use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering as AtomicOrdering};
+use spin::Once;
+use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
 // ---------------------------------------------------------------------------
 // PIC constants
@@ -37,6 +37,12 @@ const PIC2_OFFSET: u8 = PIC1_OFFSET + 8;
 pub const TIMER_INTERRUPT_ID: u8 = PIC1_OFFSET;
 /// Vector for IRQ 1 (PS/2 keyboard).
 pub const KEYBOARD_INTERRUPT_ID: u8 = PIC1_OFFSET + 1;
+/// Vector reserved for local APIC timer interrupts.
+pub const LOCAL_APIC_TIMER_INTERRUPT_ID: u8 = crate::local_apic::LOCAL_APIC_TIMER_VECTOR;
+/// Vector reserved for cross-core reschedule IPIs.
+pub const RESCHEDULE_INTERRUPT_ID: u8 = crate::local_apic::RESCHEDULE_IPI_VECTOR;
+/// Vector reserved for TLB shootdown IPIs.
+pub const TLB_SHOOTDOWN_INTERRUPT_ID: u8 = crate::local_apic::TLB_SHOOTDOWN_IPI_VECTOR;
 
 // ---------------------------------------------------------------------------
 // Global tick counter
@@ -66,20 +72,41 @@ pub fn ticks() -> u64 {
 /// lock is busy (console command in progress) the tick is silently skipped —
 /// the scheduler will catch up on the next tick.
 pub type PreemptFn = fn(u64);
+pub type LocalApicTickFn = fn(u32);
+pub type RescheduleIpiFn = fn(u32);
+pub type TlbShootdownIpiFn = fn(u32);
 
 /// Null sentinel: no hook installed yet.
 fn noop_preempt(_tick: u64) {}
+fn noop_local_apic_tick(_apic_id: u32) {}
+fn noop_reschedule_ipi(_apic_id: u32) {}
+fn noop_tlb_shootdown_ipi(_apic_id: u32) {}
 
 /// Atomic pointer holding the current preemption callback.
 ///
 /// We store a raw function pointer cast to `*mut u8` so we can use
 /// `AtomicPtr` (the only atomic pointer type stable in `no_std`).
 static PREEMPT_HOOK: AtomicPtr<u8> = AtomicPtr::new(noop_preempt as *mut u8);
+static LOCAL_APIC_TICK_HOOK: AtomicPtr<u8> = AtomicPtr::new(noop_local_apic_tick as *mut u8);
+static RESCHEDULE_IPI_HOOK: AtomicPtr<u8> = AtomicPtr::new(noop_reschedule_ipi as *mut u8);
+static TLB_SHOOTDOWN_IPI_HOOK: AtomicPtr<u8> = AtomicPtr::new(noop_tlb_shootdown_ipi as *mut u8);
 
 /// Register the preemption callback.  Call once from `kernel_main` before
 /// enabling interrupts (or immediately after — the hook is set atomically).
 pub fn set_preempt_hook(f: PreemptFn) {
     PREEMPT_HOOK.store(f as *mut u8, AtomicOrdering::Release);
+}
+
+pub fn set_local_apic_tick_hook(f: LocalApicTickFn) {
+    LOCAL_APIC_TICK_HOOK.store(f as *mut u8, AtomicOrdering::Release);
+}
+
+pub fn set_reschedule_ipi_hook(f: RescheduleIpiFn) {
+    RESCHEDULE_IPI_HOOK.store(f as *mut u8, AtomicOrdering::Release);
+}
+
+pub fn set_tlb_shootdown_ipi_hook(f: TlbShootdownIpiFn) {
+    TLB_SHOOTDOWN_IPI_HOOK.store(f as *mut u8, AtomicOrdering::Release);
 }
 
 #[inline]
@@ -88,6 +115,30 @@ fn call_preempt_hook(tick: u64) {
     // SAFETY: we only ever store valid `PreemptFn` function pointers here.
     let f: PreemptFn = unsafe { core::mem::transmute(raw) };
     f(tick);
+}
+
+#[inline]
+fn call_local_apic_tick_hook(apic_id: u32) {
+    let raw = LOCAL_APIC_TICK_HOOK.load(AtomicOrdering::Acquire);
+    // SAFETY: we only ever store valid `LocalApicTickFn` function pointers here.
+    let f: LocalApicTickFn = unsafe { core::mem::transmute(raw) };
+    f(apic_id);
+}
+
+#[inline]
+fn call_reschedule_ipi_hook(apic_id: u32) {
+    let raw = RESCHEDULE_IPI_HOOK.load(AtomicOrdering::Acquire);
+    // SAFETY: we only ever store valid `RescheduleIpiFn` function pointers here.
+    let f: RescheduleIpiFn = unsafe { core::mem::transmute(raw) };
+    f(apic_id);
+}
+
+#[inline]
+fn call_tlb_shootdown_ipi_hook(apic_id: u32) {
+    let raw = TLB_SHOOTDOWN_IPI_HOOK.load(AtomicOrdering::Acquire);
+    // SAFETY: we only ever store valid `TlbShootdownIpiFn` function pointers here.
+    let f: TlbShootdownIpiFn = unsafe { core::mem::transmute(raw) };
+    f(apic_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -121,6 +172,9 @@ pub fn init() {
         // Hardware interrupts — IDT indexed by u8 in x86_64 0.15
         idt[TIMER_INTERRUPT_ID].set_handler_fn(timer_handler);
         idt[KEYBOARD_INTERRUPT_ID].set_handler_fn(keyboard_handler);
+        idt[LOCAL_APIC_TIMER_INTERRUPT_ID].set_handler_fn(local_apic_timer_handler);
+        idt[RESCHEDULE_INTERRUPT_ID].set_handler_fn(reschedule_ipi_handler);
+        idt[TLB_SHOOTDOWN_INTERRUPT_ID].set_handler_fn(tlb_shootdown_ipi_handler);
 
         idt
     });
@@ -130,7 +184,14 @@ pub fn init() {
     // Enable hardware interrupts.
     x86_64::instructions::interrupts::enable();
 
-    crate::println!("IDT loaded — double-fault, timer, keyboard handlers active");
+    crate::println!("IDT loaded — double-fault, timer, keyboard, LAPIC, reschedule, TLB handlers active");
+}
+
+/// Reload the IDT on an application processor (same table as the BSP).
+pub fn load_idt() {
+    if let Some(idt) = IDT.get() {
+        idt.load();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -173,20 +234,28 @@ fn remap_pic() {
         let mask2 = inb(PIC2_DATA);
 
         // Start initialisation sequence (ICW1).
-        outb(PIC1_CMD, 0x11); io_wait();
-        outb(PIC2_CMD, 0x11); io_wait();
+        outb(PIC1_CMD, 0x11);
+        io_wait();
+        outb(PIC2_CMD, 0x11);
+        io_wait();
 
         // ICW2 — vector offsets.
-        outb(PIC1_DATA, PIC1_OFFSET); io_wait();
-        outb(PIC2_DATA, PIC2_OFFSET); io_wait();
+        outb(PIC1_DATA, PIC1_OFFSET);
+        io_wait();
+        outb(PIC2_DATA, PIC2_OFFSET);
+        io_wait();
 
         // ICW3 — cascade wiring.
-        outb(PIC1_DATA, 0x04); io_wait(); // PIC1: slave on IRQ2
-        outb(PIC2_DATA, 0x02); io_wait(); // PIC2: cascade identity = 2
+        outb(PIC1_DATA, 0x04);
+        io_wait(); // PIC1: slave on IRQ2
+        outb(PIC2_DATA, 0x02);
+        io_wait(); // PIC2: cascade identity = 2
 
         // ICW4 — 8086 mode.
-        outb(PIC1_DATA, 0x01); io_wait();
-        outb(PIC2_DATA, 0x01); io_wait();
+        outb(PIC1_DATA, 0x01);
+        io_wait();
+        outb(PIC2_DATA, 0x01);
+        io_wait();
 
         // Restore masks.
         outb(PIC1_DATA, mask1);
@@ -195,8 +264,17 @@ fn remap_pic() {
         // Unmask IRQ 0 (timer) and IRQ 1 (keyboard) on PIC1;
         // mask everything else on both PICs.
         outb(PIC1_DATA, 0b1111_1100); // keep IRQ0 + IRQ1 unmasked
-        outb(PIC2_DATA, 0xFF);        // all PIC2 IRQs masked
+        outb(PIC2_DATA, 0xFF); // all PIC2 IRQs masked
     }
+}
+
+/// Mask all 8259 lines (used after IOAPIC takes ownership of ISA IRQs).
+pub fn mask_all_pic() {
+    unsafe {
+        outb(PIC1_DATA, 0xFF);
+        outb(PIC2_DATA, 0xFF);
+    }
+    crate::println!("PIC: all IRQs masked (IOAPIC active)");
 }
 
 /// Send End-of-Interrupt to the appropriate PIC(s).
@@ -261,4 +339,65 @@ extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
     // its output buffer is drained).
     let _scancode: u8 = unsafe { inb(0x60) };
     unsafe { send_eoi(1) };
+}
+
+extern "x86-interrupt" fn local_apic_timer_handler(_stack_frame: InterruptStackFrame) {
+    // Local APIC timer is per-core, so we read the APIC ID to route
+    // runtime service to the currently interrupted CPU.
+    let apic_id = current_local_apic_id();
+    unsafe { local_apic_eoi() };
+    call_local_apic_tick_hook(apic_id);
+}
+
+extern "x86-interrupt" fn reschedule_ipi_handler(_stack_frame: InterruptStackFrame) {
+    let apic_id = current_local_apic_id();
+    unsafe { local_apic_eoi() };
+    call_reschedule_ipi_hook(apic_id);
+}
+
+extern "x86-interrupt" fn tlb_shootdown_ipi_handler(_stack_frame: InterruptStackFrame) {
+    let apic_id = current_local_apic_id();
+    unsafe { local_apic_eoi() };
+    call_tlb_shootdown_ipi_hook(apic_id);
+}
+
+/// Software injection path used by debug scaffolding (`cpu-step-ap`) when an
+/// AP's local APIC timer is not yet delivering hardware IRQs.
+///
+/// Prefer [`crate::local_apic::arm_current_core_runtime_timer`] on the AP so
+/// [`local_apic_timer_handler`] drives runtime instead.
+pub fn inject_local_apic_timer_tick(apic_id: u32) {
+    call_local_apic_tick_hook(apic_id);
+}
+
+/// Software injection of a reschedule IPI (console / tests).
+pub fn inject_reschedule_ipi(apic_id: u32) {
+    call_reschedule_ipi_hook(apic_id);
+}
+
+/// Software injection of a TLB shootdown IPI (console / tests).
+pub fn inject_tlb_shootdown_ipi(apic_id: u32) {
+    call_tlb_shootdown_ipi_hook(apic_id);
+}
+
+#[inline]
+fn current_local_apic_id() -> u32 {
+    #[cfg(target_os = "none")]
+    unsafe {
+        let reg = (0xFEE0_0000u64 + 0x20) as *const u32;
+        (core::ptr::read_volatile(reg) >> 24) & 0xff
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        0
+    }
+}
+
+#[inline]
+unsafe fn local_apic_eoi() {
+    #[cfg(target_os = "none")]
+    {
+        let eoi = (0xFEE0_0000u64 + 0xB0) as *mut u32;
+        core::ptr::write_volatile(eoi, 0);
+    }
 }

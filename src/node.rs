@@ -1,7 +1,7 @@
 // Distributed kernel node - cloud/edge aware
-use heapless::String;
-use heapless::FnvIndexMap;
 use core::str::FromStr;
+use heapless::FnvIndexMap;
+use heapless::String;
 
 const MAX_NODES: usize = 8;
 const MAX_ID_LEN: usize = 64;
@@ -71,7 +71,7 @@ impl KernelNode {
     ) {
         let id: String<MAX_ID_LEN> = String::from_str(node_id).unwrap_or_default();
         let addr: String<MAX_ADDR_LEN> = String::from_str(address).unwrap_or_default();
-        
+
         let remote_node = RemoteNode {
             node_id: id.clone(),
             node_type,
@@ -79,7 +79,7 @@ impl KernelNode {
             latency_ms,
             last_seen: self.node_counter, // Use counter as simple timestamp
         };
-        
+
         let _ = self.known_nodes.insert(id, remote_node);
     }
 
@@ -167,7 +167,7 @@ mod tests {
         let mut node = KernelNode::new();
         node.discover_node("edge-fast", NodeType::Edge, "a", 10);
         node.discover_node("edge-slow", NodeType::Edge, "b", 100);
-        node.discover_node("cloud-1",   NodeType::Cloud, "c", 5);
+        node.discover_node("cloud-1", NodeType::Cloud, "c", 5);
 
         let best_edge = node.find_best_node(NodeType::Edge).unwrap();
         assert_eq!(best_edge.node_id.as_str(), "edge-fast");
@@ -196,19 +196,18 @@ fn write_number(s: &mut String<MAX_ID_LEN>, n: u64) -> Result<(), ()> {
     if n == 0 {
         return s.push_str("0");
     }
-    
+
     let mut num = n;
     let mut digits = heapless::Vec::<u8, 20>::new();
-    
+
     while num > 0 {
         digits.push((num % 10) as u8 + b'0').map_err(|_| ())?;
         num /= 10;
     }
-    
+
     for &digit in digits.iter().rev() {
         s.push(digit as char).map_err(|_| ())?;
     }
-    
+
     Ok(())
 }
-

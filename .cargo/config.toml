@@ -11,4 +11,5 @@ runner = "qemu-system-x86_64 -drive format=raw,file=target/x86_64-unknown-none/d
 #   aarch64-apple-darwin     — Apple Silicon macOS  (current machine)
 #   x86_64-apple-darwin      — Intel macOS
 #   x86_64-unknown-linux-gnu — Linux x86_64
-test-host = "test --target aarch64-apple-darwin --lib"
+# Prefer serial host tests when sharing process-global SMP atomics.
+test-host = "test --target x86_64-unknown-linux-gnu --lib -- --test-threads=1"

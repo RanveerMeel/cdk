@@ -30,17 +30,27 @@ mod backend {
         fn next_u32(&mut self) -> u32 {
             for _ in 0..MAX_RETRIES {
                 let (ok, val) = rdrand32();
-                if ok { return val; }
+                if ok {
+                    return val;
+                }
             }
-            panic!("RDRAND failed after {} retries — hardware RNG unavailable", MAX_RETRIES);
+            panic!(
+                "RDRAND failed after {} retries — hardware RNG unavailable",
+                MAX_RETRIES
+            );
         }
 
         fn next_u64(&mut self) -> u64 {
             for _ in 0..MAX_RETRIES {
                 let (ok, val) = rdrand64();
-                if ok { return val; }
+                if ok {
+                    return val;
+                }
             }
-            panic!("RDRAND failed after {} retries — hardware RNG unavailable", MAX_RETRIES);
+            panic!(
+                "RDRAND failed after {} retries — hardware RNG unavailable",
+                MAX_RETRIES
+            );
         }
 
         fn fill_bytes(&mut self, dest: &mut [u8]) {
@@ -116,9 +126,15 @@ mod backend {
     pub struct KernelRng;
 
     impl RngCore for KernelRng {
-        fn next_u32(&mut self) -> u32 { OsRng.next_u32() }
-        fn next_u64(&mut self) -> u64 { OsRng.next_u64() }
-        fn fill_bytes(&mut self, dest: &mut [u8]) { OsRng.fill_bytes(dest) }
+        fn next_u32(&mut self) -> u32 {
+            OsRng.next_u32()
+        }
+        fn next_u64(&mut self) -> u64 {
+            OsRng.next_u64()
+        }
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            OsRng.fill_bytes(dest)
+        }
         fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
             OsRng.try_fill_bytes(dest)
         }
@@ -155,7 +171,10 @@ mod tests {
         let mut rng = KernelRng;
         let a = rng.next_u64();
         let b = rng.next_u64();
-        assert_ne!(a, b, "two consecutive RNG values identical — extremely unlikely");
+        assert_ne!(
+            a, b,
+            "two consecutive RNG values identical — extremely unlikely"
+        );
     }
 
     #[test]

@@ -16,6 +16,61 @@ use crate::serial;
 use spin::Mutex;
 
 const MAX_LINE: usize = 128;
+/// How many prior commands ↑/↓ can scroll through.
+const HISTORY_CAP: usize = 32;
+
+/// Ring of recent command lines for arrow-key navigation.
+struct CmdHistory {
+    slots: [[u8; MAX_LINE]; HISTORY_CAP],
+    lens: [usize; HISTORY_CAP],
+    /// Valid entry count (`0..=HISTORY_CAP`).
+    count: usize,
+}
+
+impl CmdHistory {
+    const fn new() -> Self {
+        Self {
+            slots: [[0u8; MAX_LINE]; HISTORY_CAP],
+            lens: [0usize; HISTORY_CAP],
+            count: 0,
+        }
+    }
+
+    fn push(&mut self, line: &[u8]) {
+        if line.is_empty() {
+            return;
+        }
+        // Skip consecutive duplicates (bash-style).
+        if self.count > 0 {
+            let n = self.count - 1;
+            let prev = &self.slots[n][..self.lens[n]];
+            if prev == line {
+                return;
+            }
+        }
+        if self.count == HISTORY_CAP {
+            for i in 0..HISTORY_CAP - 1 {
+                self.slots[i] = self.slots[i + 1];
+                self.lens[i] = self.lens[i + 1];
+            }
+            self.count = HISTORY_CAP - 1;
+        }
+        let i = self.count;
+        let n = line.len().min(MAX_LINE);
+        self.slots[i][..n].copy_from_slice(&line[..n]);
+        self.lens[i] = n;
+        self.count += 1;
+    }
+
+    fn get(&self, index: usize) -> Option<(&[u8], usize)> {
+        if index >= self.count {
+            return None;
+        }
+        let n = self.lens[index];
+        Some((&self.slots[index][..n], n))
+    }
+}
+
 const COMMANDS: &[&str] = &[
     "help",
     "?",
@@ -24,8 +79,12 @@ const COMMANDS: &[&str] = &[
     "create",
     "list",
     "schedule",
+    "complete",
+    "yield",
     "run",
     "running",
+    "user-smoke",
+    "irq-route",
     "send",
     "recv",
     "delete",
@@ -50,6 +109,10 @@ const COMMANDS: &[&str] = &[
     "cpu-add-ap",
     "cpu-start-ap",
     "cpu-ack-ap",
+    "cpu-arm-timer",
+    "cpu-calibrate",
+    "cpu-ipi-resched",
+    "cpu-ipi-tlb",
     "cpu-step-ap",
     "cpu-halt",
     "ticks",
@@ -59,6 +122,12 @@ const COMMANDS: &[&str] = &[
     "palloc",
     "pfree",
     "fbinfo",
+    "gpuinfo",
+    "gpusmoke",
+    "uminfo",
+    "umalloc",
+    "umfree",
+    "um-smoke",
     "capsign",
     "capverify",
     "vmmap",
@@ -83,20 +152,17 @@ pub fn run_static(
     crate::println!("Type 'help' for available commands.\n");
 
     let mut buf = [0u8; MAX_LINE];
-    let mut last_cmd = [0u8; MAX_LINE];
-    let mut last_cmd_len = 0usize;
+    let mut history = CmdHistory::new();
 
     loop {
         print_prompt();
-        let len = read_line(&mut buf, &last_cmd, last_cmd_len);
+        let len = read_line(&mut buf, &history);
         let line = core::str::from_utf8(&buf[..len]).unwrap_or("");
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        let hist_len = line.len().min(MAX_LINE);
-        last_cmd[..hist_len].copy_from_slice(&line.as_bytes()[..hist_len]);
-        last_cmd_len = hist_len;
+        history.push(line.as_bytes());
         dispatch(
             line,
             &mut kernel.lock(),
@@ -115,24 +181,85 @@ fn print_prompt() {
     let _ = write!(serial::SerialPort, "cdk> ");
 }
 
-fn read_line(buf: &mut [u8; MAX_LINE], last_cmd: &[u8; MAX_LINE], last_cmd_len: usize) -> usize {
-    let mut pos = 0usize;
+fn ansi_cursor_left() {
+    serial::write_byte(0x1b);
+    serial::write_byte(b'[');
+    serial::write_byte(b'D');
+}
+
+fn ansi_cursor_right() {
+    serial::write_byte(0x1b);
+    serial::write_byte(b'[');
+    serial::write_byte(b'C');
+}
+
+/// Clear the displayed line back to an empty prompt input (cursor at column 0 of input).
+fn clear_input_display(len: usize, cursor: usize) {
+    // Move to end, then rub out each character.
+    for _ in cursor..len {
+        ansi_cursor_right();
+    }
+    for _ in 0..len {
+        serial::write_byte(0x08);
+        serial::write_byte(b' ');
+        serial::write_byte(0x08);
+    }
+}
+
+/// After buffer[cursor..len] changed, reprint that tail and park the cursor at `cursor`.
+fn redraw_tail(buf: &[u8], cursor: usize, len: usize) {
+    for i in cursor..len {
+        serial::write_byte(buf[i]);
+    }
+    // Erase any leftover glyph from a shorter previous tail.
+    serial::write_byte(b' ');
+    // Physical cursor is at len+1; walk back to `cursor`.
+    for _ in 0..(len + 1 - cursor) {
+        ansi_cursor_left();
+    }
+}
+
+fn apply_history_line(buf: &mut [u8; MAX_LINE], len: &mut usize, cursor: &mut usize, src: &[u8]) {
+    clear_input_display(*len, *cursor);
+    let copy_len = src.len().min(MAX_LINE);
+    for i in 0..copy_len {
+        buf[i] = src[i];
+        serial::write_byte(src[i]);
+    }
+    *len = copy_len;
+    *cursor = copy_len;
+}
+
+fn read_line(buf: &mut [u8; MAX_LINE], history: &CmdHistory) -> usize {
+    let mut len = 0usize;
+    let mut cursor = 0usize;
+    // None = editing a fresh/draft line; Some(i) = viewing history[i] (0 = oldest).
+    let mut hist_nav: Option<usize> = None;
+    // Draft saved the first time ↑ leaves a non-history line (restored by ↓ past newest).
+    let mut draft = [0u8; MAX_LINE];
+    let mut draft_len = 0usize;
+
     loop {
         let b = serial::read_byte();
         match b {
             b'\r' | b'\n' => {
                 serial::write_byte(b'\r');
                 serial::write_byte(b'\n');
-                return pos;
+                return len;
             }
-            // Backspace / DEL
+            // Backspace / DEL — delete the character before the cursor.
             0x08 | 0x7f => {
-                if pos > 0 {
-                    pos -= 1;
-                    serial::write_byte(0x08);
-                    serial::write_byte(b' ');
-                    serial::write_byte(0x08);
+                if cursor == 0 {
+                    continue;
                 }
+                hist_nav = None;
+                cursor -= 1;
+                for i in cursor..len.saturating_sub(1) {
+                    buf[i] = buf[i + 1];
+                }
+                len -= 1;
+                ansi_cursor_left();
+                redraw_tail(buf, cursor, len);
             }
             // Ctrl-C — abandon current line
             0x03 => {
@@ -142,36 +269,172 @@ fn read_line(buf: &mut [u8; MAX_LINE], last_cmd: &[u8; MAX_LINE], last_cmd_len: 
                 serial::write_byte(b'\n');
                 return 0;
             }
-            // Tab: command autocomplete (first token only).
-            0x09 => autocomplete_command(buf, &mut pos),
-            // ANSI escape sequence (arrow keys, etc.)
-            0x1b => {
-                let b1 = serial::read_byte();
-                if b1 == b'[' {
-                    let b2 = serial::read_byte();
-                    // Up arrow: recall previous command.
-                    if b2 == b'A' && last_cmd_len > 0 {
-                        while pos > 0 {
-                            pos -= 1;
-                            serial::write_byte(0x08);
-                            serial::write_byte(b' ');
-                            serial::write_byte(0x08);
-                        }
-                        let copy_len = last_cmd_len.min(MAX_LINE);
-                        for i in 0..copy_len {
-                            buf[i] = last_cmd[i];
-                            serial::write_byte(last_cmd[i]);
-                        }
-                        pos = copy_len;
-                    }
+            // Ctrl-A / Ctrl-E — home / end (handy when arrows are awkward).
+            0x01 => {
+                while cursor > 0 {
+                    cursor -= 1;
+                    ansi_cursor_left();
                 }
             }
-            // Printable ASCII
+            0x05 => {
+                while cursor < len {
+                    ansi_cursor_right();
+                    cursor += 1;
+                }
+            }
+            // Ctrl-U — clear entire line.
+            0x15 => {
+                clear_input_display(len, cursor);
+                len = 0;
+                cursor = 0;
+                hist_nav = None;
+            }
+            // Tab: command autocomplete (first token only).
+            0x09 => {
+                // Autocomplete only when the cursor is at the end of the first token.
+                if cursor == len {
+                    autocomplete_command(buf, &mut len);
+                    cursor = len;
+                    hist_nav = None;
+                }
+            }
+            // ANSI escape sequence (arrow keys, Home/End/Delete).
+            0x1b => {
+                let b1 = serial::read_byte();
+                if b1 != b'[' {
+                    continue;
+                }
+                let mut b2 = serial::read_byte();
+                // CSI params like `3~` (Delete) or `1~`/`4~` (Home/End).
+                let mut param: u32 = 0;
+                let mut saw_digit = false;
+                while b2.is_ascii_digit() {
+                    saw_digit = true;
+                    param = param
+                        .saturating_mul(10)
+                        .saturating_add((b2 - b'0') as u32);
+                    b2 = serial::read_byte();
+                }
+                match b2 {
+                    // Up arrow: older history.
+                    b'A' => {
+                        if history.count == 0 {
+                            continue;
+                        }
+                        let next = match hist_nav {
+                            None => {
+                                draft[..len].copy_from_slice(&buf[..len]);
+                                draft_len = len;
+                                Some(history.count - 1)
+                            }
+                            Some(0) => Some(0), // already at oldest
+                            Some(i) => Some(i - 1),
+                        };
+                        if let Some(i) = next {
+                            if let Some((src, _)) = history.get(i) {
+                                apply_history_line(buf, &mut len, &mut cursor, src);
+                                hist_nav = Some(i);
+                            }
+                        }
+                    }
+                    // Down arrow: newer history, then draft/empty.
+                    b'B' => {
+                        match hist_nav {
+                            None => {
+                                // Already on draft — stay (optionally clear like bash empty).
+                            }
+                            Some(i) if i + 1 < history.count => {
+                                let i = i + 1;
+                                if let Some((src, _)) = history.get(i) {
+                                    apply_history_line(buf, &mut len, &mut cursor, src);
+                                    hist_nav = Some(i);
+                                }
+                            }
+                            Some(_) => {
+                                // Past newest → restore draft.
+                                apply_history_line(buf, &mut len, &mut cursor, &draft[..draft_len]);
+                                hist_nav = None;
+                            }
+                        }
+                    }
+                    // Right arrow.
+                    b'C' => {
+                        if cursor < len {
+                            ansi_cursor_right();
+                            cursor += 1;
+                        }
+                    }
+                    // Left arrow.
+                    b'D' => {
+                        if cursor > 0 {
+                            cursor -= 1;
+                            ansi_cursor_left();
+                        }
+                    }
+                    // Home.
+                    b'H' => {
+                        while cursor > 0 {
+                            cursor -= 1;
+                            ansi_cursor_left();
+                        }
+                    }
+                    // End.
+                    b'F' => {
+                        while cursor < len {
+                            ansi_cursor_right();
+                            cursor += 1;
+                        }
+                    }
+                    // `ESC [ n ~` — Delete / Home / End variants.
+                    b'~' if saw_digit => match param {
+                        1 | 7 => {
+                            while cursor > 0 {
+                                cursor -= 1;
+                                ansi_cursor_left();
+                            }
+                        }
+                        3 => {
+                            // Forward-delete character under the cursor.
+                            if cursor < len {
+                                hist_nav = None;
+                                for i in cursor..len.saturating_sub(1) {
+                                    buf[i] = buf[i + 1];
+                                }
+                                len -= 1;
+                                redraw_tail(buf, cursor, len);
+                            }
+                        }
+                        4 | 8 => {
+                            while cursor < len {
+                                ansi_cursor_right();
+                                cursor += 1;
+                            }
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+            // Printable ASCII — insert at cursor (or append at end).
             0x20..=0x7e => {
-                if pos < MAX_LINE {
-                    buf[pos] = b;
-                    pos += 1;
+                if len >= MAX_LINE {
+                    continue;
+                }
+                hist_nav = None;
+                if cursor == len {
+                    buf[len] = b;
+                    len += 1;
+                    cursor += 1;
                     serial::write_byte(b);
+                } else {
+                    for i in (cursor..len).rev() {
+                        buf[i + 1] = buf[i];
+                    }
+                    buf[cursor] = b;
+                    len += 1;
+                    redraw_tail(buf, cursor, len);
+                    ansi_cursor_right();
+                    cursor += 1;
                 }
             }
             _ => {}
@@ -271,7 +534,11 @@ fn dispatch(
         "create" => cmd_create(arg1, arg2, kernel, mem_graph),
         "list" => cmd_list(kernel),
         "schedule" => cmd_schedule(arg1, kernel),
+        "complete" => cmd_complete(arg1, kernel),
+        "yield" => cmd_yield(arg1, kernel),
         "run" => cmd_run_next(kernel),
+        "user-smoke" => cmd_user_smoke(page_table, frame_alloc),
+        "irq-route" => cmd_irq_route(arg1, arg2),
         "send" => cmd_send(arg1, arg2, kernel),
         "recv" => cmd_recv(arg1, kernel),
         "delete" => cmd_delete(arg1, kernel, mem_graph),
@@ -293,8 +560,12 @@ fn dispatch(
         "obj2net" => cmd_obj_to_net(arg1, arg2, kernel, network, network_cap),
         "cpus" => cmd_cpus(kernel),
         "cpu-add-ap" => cmd_cpu_add_ap(arg1, kernel),
-        "cpu-start-ap" => cmd_cpu_start_ap(arg1, kernel),
+        "cpu-start-ap" => cmd_cpu_start_ap(arg1, arg2, kernel),
         "cpu-ack-ap" => cmd_cpu_ack_ap(arg1, arg2, kernel),
+        "cpu-arm-timer" => cmd_cpu_arm_timer(kernel),
+        "cpu-calibrate" => cmd_cpu_calibrate(arg1, kernel),
+        "cpu-ipi-resched" => cmd_cpu_ipi_resched(arg1, kernel),
+        "cpu-ipi-tlb" => cmd_cpu_ipi_tlb(arg1, arg2, kernel),
         "cpu-step-ap" => cmd_cpu_step_ap(arg1, arg2, kernel),
         "cpu-halt" => cmd_cpu_halt(arg1, kernel),
         #[cfg(target_os = "none")]
@@ -308,10 +579,16 @@ fn dispatch(
         "palloc" => cmd_palloc(frame_alloc),
         "pfree" => cmd_pfree(arg1, frame_alloc),
         "fbinfo" => cmd_fbinfo(),
+        "gpuinfo" => cmd_gpuinfo(),
+        "gpusmoke" => cmd_gpusmoke(),
+        "uminfo" => cmd_uminfo(),
+        "umalloc" => cmd_umalloc(arg1, frame_alloc),
+        "umfree" => cmd_umfree(arg1, frame_alloc),
+        "um-smoke" => cmd_um_smoke(frame_alloc),
         "capsign" => cmd_capsign(arg1, kernel),
         "capverify" => cmd_capverify(arg1, kernel),
-        "vmmap" => cmd_vmmap(arg1, arg2, arg3, page_table, frame_alloc),
-        "vmunmap" => cmd_vmunmap(arg1, page_table),
+        "vmmap" => cmd_vmmap(arg1, arg2, arg3, page_table, frame_alloc, kernel),
+        "vmunmap" => cmd_vmunmap(arg1, page_table, kernel),
         "vmtranslate" => cmd_vmtranslate(arg1, page_table),
         "vminfo" => cmd_vminfo(page_table),
         "echo" => crate::println!("{} {}", arg1, arg2),
@@ -322,6 +599,8 @@ fn dispatch(
 
 fn cmd_help() {
     crate::println!("Commands:");
+    crate::println!("  Line edit: ←/→ move, Home/End, Del, ↑/↓ history ({} cmds)", HISTORY_CAP);
+    crate::println!("             Backspace, Ctrl-A/E home/end, Ctrl-U wipe, Ctrl-C abort");
     crate::println!("  help              Show this message");
     crate::println!("  status            Kernel overview (includes preemption info)");
     crate::println!("  clear             Clear serial screen");
@@ -329,9 +608,13 @@ fn cmd_help() {
     crate::println!("                    Create a compute object (intents: low_latency,");
     crate::println!("                    interactive, normal, batch, energy_saving)");
     crate::println!("  list              List registered objects");
-    crate::println!("  schedule <id>     Queue an object for execution");
+    crate::println!("  schedule <ref>    Queue object by id, name (kind), or intent");
+    crate::println!("  complete [apic]   Retire running task (default apic 0)");
+    crate::println!("  yield [apic]      Requeue running task (default apic 0)");
     crate::println!("  run               Manually dispatch next task (ignores preemption)");
     crate::println!("  running           Show the currently running task");
+    crate::println!("  user-smoke        Ring-3 smoke test (syscall exit)");
+    crate::println!("  irq-route <irq> <apic>  Route IOAPIC IRQ affinity");
     crate::println!("  send <id> <text>  Send a text message to an object");
     crate::println!("  recv <id>         Receive next message from an object");
     crate::println!("  delete <id>       Delete an object");
@@ -362,15 +645,29 @@ fn cmd_help() {
     crate::println!("                    Bridge one object message out as packet bytes");
     crate::println!("  cpus              Show multi-core topology and telemetry");
     crate::println!("  cpu-add-ap <id>   Register application core by APIC id");
-    crate::println!("  cpu-start-ap <id> Start AP startup state-machine for APIC id");
+    crate::println!("  cpu-start-ap <id> [force]");
+    crate::println!("                    Launch AP (wait for trampoline status; force=BSP ack)");
     crate::println!("  cpu-ack-ap <id> <seq>");
     crate::println!("                    Mark AP startup sequence as entry-reached/online");
+    crate::println!("  cpu-arm-timer     Arm this CPU's local APIC timer (vector 0xF0)");
+    crate::println!("  cpu-calibrate [hz]");
+    crate::println!("                    Calibrate this CPU's LAPIC timer against PIT ticks");
+    crate::println!("  cpu-ipi-resched <id>");
+    crate::println!("                    Send Fixed reschedule IPI to APIC id");
+    crate::println!("  cpu-ipi-tlb <id|all> [page|#]");
+    crate::println!("                    Send Fixed TLB shootdown IPI (0xF2); # = full flush");
     crate::println!("  cpu-step-ap <id> <n>");
-    crate::println!("                    Simulate N local APIC timer ticks (default 1)");
+    crate::println!("                    Debug: software-inject N local timer ticks");
     crate::println!("  cpu-halt <id>     Mark core halted by APIC id");
     crate::println!("  ticks             Show PIT timer tick count since boot");
     crate::println!("  timeslice         Show the preemptive time-slice length (ticks)");
     crate::println!("  fbinfo            Pixel framebuffer info (resolution, format)");
+    crate::println!("  gpuinfo           GPU backend / resource / flush telemetry");
+    crate::println!("  gpusmoke          Fill+flush test pattern via GPU pipeline");
+    crate::println!("  uminfo            Unified memory regions + IOMMU stub");
+    crate::println!("  umalloc <bytes>   Alloc contiguous CPU/GPU shared region");
+    crate::println!("  umfree <id>       Free a unified memory region");
+    crate::println!("  um-smoke          Alloc+fill+fence(+GPU attach) smoke");
     crate::println!("  capsign <id>      Sign a fresh capability for object <id> and verify it");
     crate::println!("  capverify <id>    Create + sign + verify a capability for object <id>");
     crate::println!("  heapinfo          Kernel heap usage (total / used / free)");
@@ -385,7 +682,7 @@ fn cmd_help() {
     crate::println!("  vmtranslate <virt> Resolve virtual address to physical");
     crate::println!("  echo <text>       Echo text back");
     crate::println!("  panic             Trigger a kernel panic (test)");
-    crate::println!("  (Tip) ↑ recalls previous command, Tab autocompletes command");
+    crate::println!("  (Tip) ↑/↓ scroll command history, Tab autocompletes command");
 }
 
 fn cmd_clear() {
@@ -405,9 +702,14 @@ fn cmd_status(
     crate::println!("  Node:         {}", node.node_id());
     crate::println!("  Objects:      {}", kernel.object_count());
     crate::println!("  Sched queue:  {}", kernel.scheduler_queue_size());
+    crate::println!(
+        "  Running:       count={} mask={:#x}",
+        kernel.scheduler_running_count(),
+        kernel.scheduler_running_mask()
+    );
     match kernel.running_task_id() {
-        Some(id) => crate::println!("  Running task: {}", id),
-        None => crate::println!("  Running task: (idle)"),
+        Some(id) => crate::println!("  BSP task:      {}", id),
+        None => crate::println!("  BSP task:      (idle)"),
     }
     crate::println!(
         "  Time slice:   {} ticks (~{}ms at 1kHz)",
@@ -434,10 +736,11 @@ fn cmd_status(
         ),
     }
     crate::println!(
-        "  CPU telemetry: ticks={} dispatches={} completions={}",
+        "  CPU telemetry: ticks={} dispatches={} completions={} steals={}",
         cores.total_ticks_seen,
         cores.total_dispatches,
-        cores.total_completions
+        cores.total_completions,
+        cores.total_steals
     );
     let net = network.summary();
     crate::println!(
@@ -513,9 +816,128 @@ fn cmd_timeslice() {
 }
 
 fn cmd_running(kernel: &Kernel) {
-    match kernel.running_task_id() {
-        Some(id) => crate::println!("Running: {}", id),
-        None => crate::println!("(idle — no task currently running)"),
+    let mask = kernel.scheduler_running_mask();
+    if mask == 0 {
+        crate::println!("(idle — no task currently running)");
+        return;
+    }
+    crate::println!(
+        "Running slots: count={} mask={:#x}",
+        kernel.scheduler_running_count(),
+        mask
+    );
+    for apic in 0u32..8 {
+        if let Some(id) = kernel.running_task_id_on(apic) {
+            crate::println!("  apic_id={} task={}", apic, id);
+        }
+    }
+}
+
+fn cmd_gpuinfo() {
+    let s = crate::gpu::status();
+    crate::println!("=== GPU ===");
+    crate::println!(
+        "  Ready:     {}  backend={}",
+        s.ready,
+        crate::gpu::backend_name(s.backend)
+    );
+    crate::println!("  Display:   {}x{}", s.width, s.height);
+    crate::println!(
+        "  Resource:  id={} scanout={}",
+        s.resource_id,
+        s.scanout_id
+    );
+    crate::println!("  Flushes:   {}", s.flushes);
+    crate::println!(
+        "  HW probe:  {}  mmio={:#x}",
+        s.hw_probed,
+        s.hw_mmio
+    );
+    if let Some(e) = s.last_error {
+        crate::println!("  Last err:  {}", e);
+    }
+}
+
+fn cmd_gpusmoke() {
+    match crate::gpu::smoke_fill() {
+        Ok(()) => {
+            let s = crate::gpu::status();
+            crate::println!(
+                "GPU smoke OK ({}x{}, flushes={}, backend={})",
+                s.width,
+                s.height,
+                s.flushes,
+                crate::gpu::backend_name(s.backend)
+            );
+        }
+        Err(e) => crate::println!("GPU smoke failed: {}", e),
+    }
+}
+
+fn cmd_uminfo() {
+    let s = crate::um::status();
+    crate::println!("=== Unified Memory ===");
+    crate::println!("  Regions:   {}", s.regions);
+    crate::println!("  Bytes:     {}", s.bytes_total);
+    crate::println!("  Next id:   {}", s.next_id);
+    crate::println!(
+        "  IOMMU:     present={} mode={}",
+        s.iommu.present,
+        s.iommu.mode
+    );
+    crate::um::for_each(|r| {
+        crate::println!(
+            "  - id={} phys={:#x} va={:#x} len={} frames={}",
+            r.id,
+            r.guest_phys,
+            r.cpu_va,
+            r.len,
+            r.frame_count
+        );
+        if let Some(gid) = r.gpu_resource_id {
+            crate::println!("      gpu_resource_id={}", gid);
+        }
+    });
+}
+
+fn cmd_umalloc(bytes_str: &str, frame_alloc: &mut FrameAllocator) {
+    let Some(bytes) = parse_u32(bytes_str) else {
+        crate::println!("Usage: umalloc <bytes>");
+        return;
+    };
+    match crate::um::alloc(frame_alloc, bytes as usize) {
+        Ok(r) => crate::println!(
+            "UM alloc id={} phys={:#x} va={:#x} len={} frames={}",
+            r.id,
+            r.guest_phys,
+            r.cpu_va,
+            r.len,
+            r.frame_count
+        ),
+        Err(e) => crate::println!("UM alloc failed: {:?}", e),
+    }
+}
+
+fn cmd_umfree(id_str: &str, frame_alloc: &mut FrameAllocator) {
+    let Some(id) = parse_u32(id_str) else {
+        crate::println!("Usage: umfree <id>");
+        return;
+    };
+    match crate::um::free(frame_alloc, id) {
+        Ok(()) => crate::println!("UM freed id={}", id),
+        Err(e) => crate::println!("UM free failed: {:?}", e),
+    }
+}
+
+fn cmd_um_smoke(frame_alloc: &mut FrameAllocator) {
+    match crate::um::smoke(frame_alloc) {
+        Ok(r) => crate::println!(
+            "UM smoke done id={} phys={:#x} gpu_res={:?}",
+            r.id,
+            r.guest_phys,
+            r.gpu_resource_id
+        ),
+        Err(e) => crate::println!("UM smoke failed: {:?}", e),
     }
 }
 
@@ -628,12 +1050,53 @@ fn cmd_list(kernel: &Kernel) {
 
 fn cmd_schedule(id: &str, kernel: &mut Kernel) {
     if id.is_empty() {
-        crate::println!("Usage: schedule <id>");
+        crate::println!("Usage: schedule <id|name|intent>");
         return;
     }
     match kernel.schedule_by_id(id) {
         Ok(()) => {}
+        Err(crate::kernel::KernelError::ObjectAmbiguous) => crate::println!(
+            "Error: ObjectAmbiguous — more than one object matches '{}'; use obj-N id",
+            id
+        ),
         Err(e) => crate::println!("Error: {:?}", e),
+    }
+}
+
+fn cmd_complete(apic_str: &str, kernel: &mut Kernel) {
+    let apic = if apic_str.is_empty() {
+        0
+    } else {
+        match parse_u32(apic_str) {
+            Some(v) => v,
+            None => {
+                crate::println!("Usage: complete [apic-id]");
+                return;
+            }
+        }
+    };
+    if kernel.running_task_id_on(apic).is_none() {
+        crate::println!("(no running task on apic_id={})", apic);
+        return;
+    }
+    kernel.complete_running_on_core(apic);
+}
+
+fn cmd_yield(apic_str: &str, kernel: &mut Kernel) {
+    let apic = if apic_str.is_empty() {
+        0
+    } else {
+        match parse_u32(apic_str) {
+            Some(v) => v,
+            None => {
+                crate::println!("Usage: yield [apic-id]");
+                return;
+            }
+        }
+    };
+    match kernel.yield_running_on_core(apic) {
+        Some(id) => crate::println!("Yielded {} on apic_id={}", id, apic),
+        None => crate::println!("(no running task on apic_id={})", apic),
     }
 }
 
@@ -729,10 +1192,11 @@ fn cmd_cpus(kernel: &Kernel) {
         None => crate::println!("  BSP apic_id : (not registered)"),
     }
     crate::println!(
-        "  Telemetry   : ticks={} dispatches={} completions={}",
+        "  Telemetry   : ticks={} dispatches={} completions={} steals={}",
         summary.total_ticks_seen,
         summary.total_dispatches,
-        summary.total_completions
+        summary.total_completions,
+        summary.total_steals
     );
     let mailbox = kernel.startup_mailbox();
     let layout = kernel.trampoline_layout();
@@ -763,11 +1227,12 @@ fn cmd_cpus(kernel: &Kernel) {
         layout.stack_size_bytes
     );
     crate::println!(
-        "  AP handoff  : sig={:#x} apic={} kernel_entry={:#x} pt_root={:#x}",
+        "  AP handoff  : sig={:#x} apic={} kernel_entry={:#x} pt_root={:#x} tramp_status={}",
         mailbox.handoff.signature,
         mailbox.handoff.target_apic_id,
         mailbox.handoff.kernel_entry_phys,
-        mailbox.handoff.page_table_root_phys
+        mailbox.handoff.page_table_root_phys,
+        kernel.read_trampoline_status()
     );
     kernel.for_each_core(|core| {
         let role = match core.role {
@@ -785,17 +1250,75 @@ fn cmd_cpus(kernel: &Kernel) {
             RuntimeDriveMode::LocalApic => "lapic-local",
         };
         crate::println!(
-            "  - apic_id={} role={} state={} drive={} rq={} starts={} ticks={} dispatches={} completions={} rtick={}",
+            "  - apic_id={} role={} state={} drive={} rq={} steals={} run={} starts={} ticks={} dispatches={} completions={} rtick={} tcal={} tss={} rsp0={:#x} ipi={} idle={} wake={} tlb={}",
             core.apic_id,
             role,
             state,
             drive,
             core.run_queue_depth,
+            core.steals,
+            if kernel.running_task_id_on(core.apic_id).is_some() {
+                "busy"
+            } else {
+                "-"
+            },
             core.startup_attempts,
             core.ticks_seen,
             core.dispatches,
             core.completions,
-            kernel.runtime_tick_cursor(core.apic_id)
+            kernel.runtime_tick_cursor(core.apic_id),
+            kernel
+                .timer_calibration(core.apic_id)
+                .map(|c| c.initial_count)
+                .unwrap_or(0),
+            {
+                #[cfg(target_os = "none")]
+                {
+                    if core.apic_id == 0 {
+                        "bsp"
+                    } else if crate::gdt::ap_tss_ready(core.apic_id) {
+                        "private"
+                    } else if crate::gdt::ap_tss_supported(core.apic_id) {
+                        "pending"
+                    } else {
+                        "none"
+                    }
+                }
+                #[cfg(not(target_os = "none"))]
+                {
+                    if core.apic_id == 0 {
+                        "bsp"
+                    } else {
+                        "host"
+                    }
+                }
+            },
+            {
+                #[cfg(target_os = "none")]
+                {
+                    crate::gdt::kernel_stack_top(core.apic_id).unwrap_or(0)
+                }
+                #[cfg(not(target_os = "none"))]
+                {
+                    0u64
+                }
+            },
+            if crate::multicore::reschedule_pending(core.apic_id) {
+                "pend"
+            } else {
+                "-"
+            },
+            if crate::multicore::is_idle(core.apic_id) {
+                "hlt"
+            } else {
+                "-"
+            },
+            crate::multicore::wake_count(core.apic_id),
+            if crate::multicore::tlb_shootdown_pending(core.apic_id) {
+                "pend"
+            } else {
+                "-"
+            }
         );
     });
 }
@@ -811,40 +1334,86 @@ fn cmd_cpu_add_ap(apic_id_str: &str, kernel: &mut Kernel) {
     }
 }
 
-fn cmd_cpu_start_ap(apic_id_str: &str, kernel: &mut Kernel) {
+fn cmd_cpu_start_ap(apic_id_str: &str, mode_str: &str, kernel: &mut Kernel) {
     let Some(id) = parse_u32(apic_id_str) else {
-        crate::println!("Usage: cpu-start-ap <apic-id>");
+        crate::println!("Usage: cpu-start-ap <apic-id> [force]");
         return;
     };
+    let force = mode_str == "force";
     match kernel.plan_ap_startup(id) {
         Ok(plan) => {
             let mut apic = XApicController::new();
-            if apic.bringup_ap(plan.apic_id, plan.sipi_vector) {
-                match kernel.ap_trampoline_entry_hook(plan.apic_id, plan.startup_seq) {
-                    Ok(()) => {
-                        kernel.activate_ap_local_timer(plan.apic_id);
-                        crate::println!(
-                            "AP startup completed via trampoline hook: apic_id={} vector={:#x} entry={:#x} handoff={:#x} blob={}B seq={} drive=lapic-local",
-                            plan.apic_id,
-                            plan.sipi_vector,
-                            plan.entry_phys,
-                            plan.handoff.handoff_phys,
-                            plan.trampoline.code_len_bytes,
-                            plan.startup_seq
-                        )
-                    }
-                    Err(e) => crate::println!(
-                        "AP startup launched but hook ack failed (apic_id={} seq={}): {:?}; use cpu-ack-ap as fallback",
-                        plan.apic_id,
-                        plan.startup_seq,
-                        e
-                    ),
-                }
-            } else {
+            if !apic.bringup_ap(plan.apic_id, plan.sipi_vector) {
                 crate::println!(
                     "AP startup plan issued but INIT/SIPI not acknowledged: apic_id={} vector={:#x}",
                     plan.apic_id,
                     plan.sipi_vector
+                );
+                return;
+            }
+
+            crate::println!(
+                "AP INIT/SIPI issued: apic_id={} vector={:#x} seq={} entry={:#x} (waiting for trampoline status)",
+                plan.apic_id,
+                plan.sipi_vector,
+                plan.startup_seq,
+                plan.entry_phys
+            );
+
+            if force {
+                match kernel.ap_trampoline_entry_hook(plan.apic_id, plan.startup_seq) {
+                    Ok(()) => {
+                        kernel.activate_ap_local_timer(plan.apic_id);
+                        crate::println!(
+                            "AP force-acked on BSP: apic_id={} seq={} drive=lapic-local (debug path)",
+                            plan.apic_id,
+                            plan.startup_seq
+                        );
+                    }
+                    Err(e) => crate::println!("Error force-acking AP: {:?}", e),
+                }
+                return;
+            }
+
+            // Phase 14: wait for the AP to publish trampoline status instead of
+            // immediately soft-acking on the BSP.
+            let mut status = 0u32;
+            for _ in 0..500_000u32 {
+                status = kernel.read_trampoline_status();
+                if Kernel::trampoline_status_entered(status)
+                    || status == crate::multicore::AP_STATUS_BAD_SIGNATURE
+                {
+                    break;
+                }
+                crate::local_apic::spin_delay(50);
+            }
+
+            if crate::multicore::MultiCoreManager::trampoline_status_handoff(status) {
+                crate::println!(
+                    "AP trampoline long-mode handoff: apic_id={} status={}",
+                    plan.apic_id,
+                    status
+                );
+            } else if Kernel::trampoline_status_entered(status) {
+                crate::println!(
+                    "AP trampoline executed: apic_id={} status={} (use cpu-ack-ap {} {} if AP did not self-online)",
+                    plan.apic_id,
+                    status,
+                    plan.apic_id,
+                    plan.startup_seq
+                );
+            } else if status == crate::multicore::AP_STATUS_BAD_SIGNATURE {
+                crate::println!(
+                    "AP trampoline reported bad handoff signature (status={:#x})",
+                    status
+                );
+            } else {
+                crate::println!(
+                    "AP trampoline status timeout (status={}); INIT/SIPI may have failed — try cpu-start-ap {} force or cpu-ack-ap {} {}",
+                    status,
+                    plan.apic_id,
+                    plan.apic_id,
+                    plan.startup_seq
                 );
             }
         }
@@ -865,13 +1434,138 @@ fn cmd_cpu_ack_ap(apic_id_str: &str, seq_str: &str, kernel: &mut Kernel) {
         Ok(()) => {
             kernel.activate_ap_local_timer(id);
             crate::println!(
-                "AP online acknowledged: apic_id={} seq={} drive=lapic-local",
+                "AP online acknowledged: apic_id={} seq={} drive=lapic-local tramp_status={}",
                 id,
-                seq
-            )
+                seq,
+                kernel.read_trampoline_status()
+            );
+            crate::println!(
+                "  note: arm hardware with cpu-arm-timer / cpu-calibrate on that core; cpu-step-ap remains debug inject"
+            );
         }
         Err(e) => crate::println!("Error: {:?}", e),
     }
+}
+
+fn cmd_cpu_arm_timer(kernel: &mut Kernel) {
+    let apic = XApicController::new();
+    let local_id = apic.local_apic_id();
+    let config = if local_id == 0 {
+        kernel.timer_config_for_core(local_id)
+    } else {
+        kernel.ensure_ap_timer_calibration(local_id)
+    };
+    if !apic.arm_ap_runtime_timer_with(config) {
+        crate::println!("Error: failed to program local APIC timer");
+        return;
+    }
+    kernel.activate_ap_local_timer(local_id);
+    crate::println!(
+        "LAPIC timer armed: local_apic={} vector={:#x} divide=16 count={} drive=lapic-local",
+        local_id,
+        crate::local_apic::LOCAL_APIC_TIMER_VECTOR,
+        config.initial_count
+    );
+}
+
+fn cmd_cpu_calibrate(hz_str: &str, kernel: &mut Kernel) {
+    let target_hz = if hz_str.is_empty() {
+        crate::local_apic::TARGET_RUNTIME_TIMER_HZ
+    } else {
+        let Some(v) = parse_u32(hz_str) else {
+            crate::println!("Usage: cpu-calibrate [hz]");
+            return;
+        };
+        if v == 0 {
+            crate::println!("Usage: cpu-calibrate [hz]");
+            return;
+        }
+        v
+    };
+
+    let apic = XApicController::new();
+    let local_id = apic.local_apic_id();
+    #[cfg(target_os = "none")]
+    let config = apic.calibrate_periodic_timer(target_hz, crate::interrupts::ticks);
+    #[cfg(not(target_os = "none"))]
+    let config = apic.calibrate_periodic_timer(target_hz, || 0);
+
+    kernel.set_timer_calibration(local_id, config);
+    if !apic.arm_ap_runtime_timer_with(config) {
+        crate::println!(
+            "Calibrated count={} but failed to arm timer (apic={})",
+            config.initial_count,
+            local_id
+        );
+        return;
+    }
+    kernel.activate_ap_local_timer(local_id);
+    crate::println!(
+        "LAPIC timer calibrated: local_apic={} target_hz={} count={} vector={:#x} drive=lapic-local",
+        local_id,
+        target_hz,
+        config.initial_count,
+        crate::local_apic::LOCAL_APIC_TIMER_VECTOR
+    );
+}
+
+fn cmd_cpu_ipi_resched(apic_id_str: &str, kernel: &mut Kernel) {
+    let Some(id) = parse_u32(apic_id_str) else {
+        crate::println!("Usage: cpu-ipi-resched <apic-id>");
+        return;
+    };
+    kernel.request_reschedule_ipi(id);
+    crate::println!(
+        "Reschedule IPI queued: apic_id={} vector={:#x} pending={} idle={} wake={} mask={:#x}",
+        id,
+        crate::local_apic::RESCHEDULE_IPI_VECTOR,
+        crate::multicore::reschedule_pending(id),
+        crate::multicore::is_idle(id),
+        crate::multicore::wake_count(id),
+        crate::multicore::reschedule_pending_mask()
+    );
+}
+
+fn cmd_cpu_ipi_tlb(target_str: &str, page_str: &str, kernel: &mut Kernel) {
+    if target_str.is_empty() {
+        crate::println!("Usage: cpu-ipi-tlb <apic-id|all> [page|#]");
+        crate::println!("  page=# or omitted → full TLB flush; else invalidate that VA");
+        return;
+    }
+    let page = if page_str.is_empty() || page_str == "#" {
+        0u64
+    } else {
+        match parse_hex(page_str) {
+            Some(v) => v,
+            None => {
+                crate::println!("Usage: cpu-ipi-tlb <apic-id|all> [page|#]");
+                return;
+            }
+        }
+    };
+    if target_str == "all" {
+        let sent = kernel.broadcast_tlb_shootdown(page, 0);
+        crate::println!(
+            "TLB shootdown broadcast: page={:#x} vector={:#x} targets={} pending_mask={:#x}",
+            page,
+            crate::local_apic::TLB_SHOOTDOWN_IPI_VECTOR,
+            sent,
+            crate::multicore::tlb_shootdown_pending_mask()
+        );
+        return;
+    }
+    let Some(id) = parse_u32(target_str) else {
+        crate::println!("Usage: cpu-ipi-tlb <apic-id|all> [page|#]");
+        return;
+    };
+    kernel.request_tlb_shootdown_ipi(id, page);
+    crate::println!(
+        "TLB shootdown IPI queued: apic_id={} page={:#x} vector={:#x} pending={}",
+        id,
+        page,
+        crate::local_apic::TLB_SHOOTDOWN_IPI_VECTOR,
+        crate::multicore::tlb_shootdown_pending(id)
+    );
 }
 
 fn cmd_cpu_step_ap(apic_id_str: &str, steps_str: &str, kernel: &mut Kernel) {
@@ -895,6 +1589,8 @@ fn cmd_cpu_step_ap(apic_id_str: &str, steps_str: &str, kernel: &mut Kernel) {
 
     let mut dispatched = 0u32;
     for _ in 0..steps {
+        // Direct kernel step (console already holds KERNEL); preferred
+        // production path is hardware LAPIC IRQ after cpu-arm-timer / AP entry.
         if kernel.on_local_apic_timer_tick(id).is_some() {
             dispatched = dispatched.saturating_add(1);
         }
@@ -904,7 +1600,7 @@ fn cmd_cpu_step_ap(apic_id_str: &str, steps_str: &str, kernel: &mut Kernel) {
         RuntimeDriveMode::LocalApic => "lapic-local",
     };
     crate::println!(
-        "AP runtime stepped: apic_id={} steps={} drive={} local_tick={} dispatched={}",
+        "AP runtime software-stepped: apic_id={} steps={} drive={} local_tick={} dispatched={} (prefer hardware LAPIC timer)",
         id,
         steps,
         drive,
@@ -1289,6 +1985,7 @@ fn cmd_vmmap(
     flags_str: &str,
     page_table: &mut Option<PageTableManager>,
     frame_alloc: &mut FrameAllocator,
+    kernel: &Kernel,
 ) {
     if virt_str.is_empty() || phys_str.is_empty() {
         crate::println!("Usage: vmmap <virt_hex> <phys_hex> [flags: krx|krw|urw]");
@@ -1315,14 +2012,22 @@ fn cmd_vmmap(
     };
     match page_table {
         Some(pt) => match pt.map(virt, phys, flags, frame_alloc) {
-            Ok(()) => crate::println!("Mapped {:#x} -> {:#x}", virt, phys),
+            Ok(()) => {
+                let sent = kernel.broadcast_tlb_shootdown(virt, 0);
+                crate::println!(
+                    "Mapped {:#x} -> {:#x} (TLB shootdown targets={})",
+                    virt,
+                    phys,
+                    sent
+                );
+            }
             Err(e) => crate::println!("Error: {:?}", e),
         },
         None => crate::println!("Page table not initialised."),
     }
 }
 
-fn cmd_vmunmap(virt_str: &str, page_table: &mut Option<PageTableManager>) {
+fn cmd_vmunmap(virt_str: &str, page_table: &mut Option<PageTableManager>, kernel: &Kernel) {
     if virt_str.is_empty() {
         crate::println!("Usage: vmunmap <virt_hex>");
         return;
@@ -1336,7 +2041,10 @@ fn cmd_vmunmap(virt_str: &str, page_table: &mut Option<PageTableManager>) {
     };
     match page_table {
         Some(pt) => match pt.unmap(virt) {
-            Ok(()) => crate::println!("Unmapped {:#x}", virt),
+            Ok(()) => {
+                let sent = kernel.broadcast_tlb_shootdown(virt, 0);
+                crate::println!("Unmapped {:#x} (TLB shootdown targets={})", virt, sent);
+            }
             Err(e) => crate::println!("Error: {:?}", e),
         },
         None => crate::println!("Page table not initialised."),
@@ -1361,6 +2069,34 @@ fn cmd_vmtranslate(virt_str: &str, page_table: &Option<PageTableManager>) {
             Err(e) => crate::println!("Error: {:?}", e),
         },
         None => crate::println!("Page table not initialised."),
+    }
+}
+
+fn cmd_user_smoke(
+    page_table: &mut Option<PageTableManager>,
+    frame_alloc: &mut FrameAllocator,
+) {
+    match page_table {
+        Some(pt) => match crate::syscall::run_user_smoke(pt, frame_alloc) {
+            Ok(()) => {}
+            Err(e) => crate::println!("user-smoke failed: {}", e),
+        },
+        None => crate::println!("Page table not initialised."),
+    }
+}
+
+fn cmd_irq_route(irq_str: &str, apic_str: &str) {
+    let Some(irq) = parse_u32(irq_str).map(|v| v as u8) else {
+        crate::println!("Usage: irq-route <irq> <apic-id>");
+        return;
+    };
+    let Some(apic) = parse_u32(apic_str) else {
+        crate::println!("Usage: irq-route <irq> <apic-id>");
+        return;
+    };
+    match crate::ioapic::set_irq_affinity(irq, apic) {
+        Ok(()) => crate::println!("IOAPIC: IRQ {} → apic_id={}", irq, apic),
+        Err(e) => crate::println!("IOAPIC route error: {:?}", e),
     }
 }
 

@@ -1,6 +1,9 @@
 use core::str::FromStr;
 use heapless::{Deque, FnvIndexMap, String, Vec};
 
+mod transport;
+use self::transport::ExternalTransport;
+
 const MAX_INTERFACES: usize = 4;
 const MAX_IFACE_NAME: usize = 16;
 const MAX_PACKET_BYTES: usize = 256;
@@ -29,6 +32,7 @@ pub struct InterfaceStats {
     pub rx_dropped: u64,
     pub tx_high_watermark: usize,
     pub rx_high_watermark: usize,
+    pub backend_polls: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,22 +42,66 @@ pub enum NetError {
     InvalidInterfaceName,
     QueueFull,
     PayloadTooLarge,
+    InvalidBackend,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExternalBackendKind {
+    VirtioNet,
+    StubTap,
+}
+
+impl ExternalBackendKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::VirtioNet => "virtio-net",
+            Self::StubTap => "stub-tap",
+        }
+    }
+
+    pub fn parse(input: &str) -> Option<Self> {
+        match input {
+            "virtio-net" | "virtio" => Some(Self::VirtioNet),
+            "stub-tap" | "stub" | "tap" => Some(Self::StubTap),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InterfaceKind {
+    Loopback,
+    External(ExternalBackendKind),
+}
+
+impl InterfaceKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Loopback => "loopback",
+            Self::External(kind) => kind.as_str(),
+        }
+    }
 }
 
 pub struct NetworkInterface {
     name: String<MAX_IFACE_NAME>,
-    loopback: bool,
+    kind: InterfaceKind,
+    backend: Option<ExternalTransport>,
     tx_queue: Deque<NetPacket, MAX_QUEUE_DEPTH>,
     rx_queue: Deque<NetPacket, MAX_QUEUE_DEPTH>,
     stats: InterfaceStats,
 }
 
 impl NetworkInterface {
-    fn loopback(name: &str) -> Result<Self, NetError> {
+    fn new(name: &str, kind: InterfaceKind) -> Result<Self, NetError> {
         let name = String::from_str(name).map_err(|_| NetError::InvalidInterfaceName)?;
         Ok(Self {
             name,
-            loopback: true,
+            kind,
+            backend: match kind {
+                InterfaceKind::Loopback => None,
+                InterfaceKind::External(backend) => Some(ExternalTransport::from_kind(backend)),
+            },
             tx_queue: Deque::new(),
             rx_queue: Deque::new(),
             stats: InterfaceStats::default(),
@@ -75,16 +123,28 @@ impl NetworkInterface {
     }
 
     fn service_io(&mut self) {
-        if !self.loopback {
-            return;
-        }
-        while let Some(packet) = self.tx_queue.pop_front() {
-            if self.rx_queue.push_back(packet).is_err() {
-                self.stats.rx_dropped = self.stats.rx_dropped.saturating_add(1);
-            } else {
-                self.stats.rx_high_watermark =
-                    self.stats.rx_high_watermark.max(self.rx_queue.len());
-                self.stats.rx_packets = self.stats.rx_packets.saturating_add(1);
+        match self.kind {
+            InterfaceKind::Loopback => {
+                while let Some(packet) = self.tx_queue.pop_front() {
+                    if self.rx_queue.push_back(packet).is_err() {
+                        self.stats.rx_dropped = self.stats.rx_dropped.saturating_add(1);
+                    } else {
+                        self.stats.rx_high_watermark =
+                            self.stats.rx_high_watermark.max(self.rx_queue.len());
+                        self.stats.rx_packets = self.stats.rx_packets.saturating_add(1);
+                    }
+                }
+            }
+            InterfaceKind::External(_) => {
+                self.stats.backend_polls = self.stats.backend_polls.saturating_add(1);
+                if let Some(backend) = self.backend.as_mut() {
+                    let result = backend.poll(&mut self.tx_queue, &mut self.rx_queue);
+                    self.stats.rx_packets =
+                        self.stats.rx_packets.saturating_add(result.rx_received);
+                    self.stats.rx_dropped = self.stats.rx_dropped.saturating_add(result.rx_dropped);
+                    self.stats.rx_high_watermark =
+                        self.stats.rx_high_watermark.max(self.rx_queue.len());
+                }
             }
         }
     }
@@ -93,6 +153,7 @@ impl NetworkInterface {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NetworkSummary {
     pub interfaces: usize,
+    pub external_interfaces: usize,
     pub service_ticks: u64,
     pub total_tx_packets: u64,
     pub total_rx_packets: u64,
@@ -116,11 +177,23 @@ impl NetworkStack {
     }
 
     pub fn add_loopback_interface(&mut self, name: &str) -> Result<(), NetError> {
+        self.add_interface(name, InterfaceKind::Loopback)
+    }
+
+    pub fn add_external_interface(
+        &mut self,
+        name: &str,
+        backend: ExternalBackendKind,
+    ) -> Result<(), NetError> {
+        self.add_interface(name, InterfaceKind::External(backend))
+    }
+
+    fn add_interface(&mut self, name: &str, kind: InterfaceKind) -> Result<(), NetError> {
         let key = String::from_str(name).map_err(|_| NetError::InvalidInterfaceName)?;
         if self.interfaces.contains_key(&key) {
             return Err(NetError::InterfaceExists);
         }
-        let iface = NetworkInterface::loopback(name)?;
+        let iface = NetworkInterface::new(name, kind)?;
         self.interfaces
             .insert(key, iface)
             .map_err(|_| NetError::QueueFull)?;
@@ -160,6 +233,9 @@ impl NetworkStack {
             ..NetworkSummary::default()
         };
         for iface in self.interfaces.values() {
+            if matches!(iface.kind, InterfaceKind::External(_)) {
+                out.external_interfaces = out.external_interfaces.saturating_add(1);
+            }
             out.total_tx_packets = out.total_tx_packets.saturating_add(iface.stats.tx_packets);
             out.total_rx_packets = out.total_rx_packets.saturating_add(iface.stats.rx_packets);
             out.total_tx_dropped = out.total_tx_dropped.saturating_add(iface.stats.tx_dropped);
@@ -174,10 +250,14 @@ impl NetworkStack {
         out
     }
 
-    pub fn for_each_interface(&self, mut f: impl FnMut(&str, InterfaceStats, usize, usize)) {
+    pub fn for_each_interface(
+        &self,
+        mut f: impl FnMut(&str, InterfaceKind, InterfaceStats, usize, usize),
+    ) {
         for iface in self.interfaces.values() {
             f(
                 iface.name.as_str(),
+                iface.kind,
                 iface.stats,
                 iface.tx_queue.len(),
                 iface.rx_queue.len(),
@@ -195,6 +275,17 @@ mod tests {
         let mut stack = NetworkStack::new();
         stack.add_loopback_interface("lo").unwrap();
         assert_eq!(stack.summary().interfaces, 1);
+    }
+
+    #[test]
+    fn add_external_registers_interface() {
+        let mut stack = NetworkStack::new();
+        stack
+            .add_external_interface("eth0", ExternalBackendKind::VirtioNet)
+            .unwrap();
+        let summary = stack.summary();
+        assert_eq!(summary.interfaces, 1);
+        assert_eq!(summary.external_interfaces, 1);
     }
 
     #[test]
@@ -245,9 +336,65 @@ mod tests {
             stack.send_bytes("lo", b"x").unwrap();
         }
         let mut tx_high = 0usize;
-        stack.for_each_interface(|_, stats, _, _| {
+        stack.for_each_interface(|_, _, stats, _, _| {
             tx_high = stats.tx_high_watermark;
         });
         assert_eq!(tx_high, 4);
+    }
+
+    #[test]
+    fn external_interfaces_record_backend_polls() {
+        let mut stack = NetworkStack::new();
+        stack
+            .add_external_interface("eth0", ExternalBackendKind::StubTap)
+            .unwrap();
+        stack.service();
+        stack.service();
+        let mut polls = 0u64;
+        stack.for_each_interface(|name, _, stats, _, _| {
+            if name == "eth0" {
+                polls = stats.backend_polls;
+            }
+        });
+        assert_eq!(polls, 2);
+    }
+
+    #[test]
+    fn stub_tap_moves_tx_into_rx() {
+        let mut stack = NetworkStack::new();
+        stack
+            .add_external_interface("eth0", ExternalBackendKind::StubTap)
+            .unwrap();
+        stack.send_bytes("eth0", b"ping-ext").unwrap();
+        stack.service();
+        let pkt = stack.recv_packet("eth0").unwrap().unwrap();
+        assert_eq!(pkt.payload.as_slice(), b"ping-ext");
+    }
+
+    #[cfg(not(feature = "virtio-hw"))]
+    #[test]
+    fn virtio_stub_injects_periodic_rx_packet() {
+        let mut stack = NetworkStack::new();
+        stack
+            .add_external_interface("eth1", ExternalBackendKind::VirtioNet)
+            .unwrap();
+        for _ in 0..4 {
+            stack.service();
+        }
+        let pkt = stack.recv_packet("eth1").unwrap().unwrap();
+        assert_eq!(pkt.payload.as_slice(), b"virtio-stub-rx");
+    }
+
+    #[cfg(feature = "virtio-hw")]
+    #[test]
+    fn virtio_hw_host_poll_keeps_rx_empty_without_mmio() {
+        let mut stack = NetworkStack::new();
+        stack
+            .add_external_interface("eth1", ExternalBackendKind::VirtioNet)
+            .unwrap();
+        for _ in 0..32 {
+            stack.service();
+        }
+        assert!(stack.recv_packet("eth1").unwrap().is_none());
     }
 }

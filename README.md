@@ -50,6 +50,30 @@ A **bare-metal operating system kernel** written in Rust, designed around capabi
 
 **Multi-Core LAPIC Timer IRQ Hook (Phase 12)** — Interrupt layer now exposes a dedicated local APIC timer callback path carrying APIC ID, and kernel integrates AP-local timer tick handling for mode-gated runtime servicing.
 
+**Multi-Core LAPIC Timer Delivery (Phase 13)** — AP entry arms the current core's local APIC periodic timer (vector `0xF0`, SVR enable + LVT/DCR/init-count programming) so hardware IRQs drive AP runtime; `cpu-step-ap` remains a debug software inject fallback.
+
+**Multi-Core Trampoline Execution + Timer Calibration (Phase 14)** — SIPI trampoline now loads handoff stack, verifies the `"CDKA"` signature, and publishes AP status for BSP polling (no immediate BSP soft-ack); INIT/SIPI includes ICR idle waits + settle delays; `cpu-calibrate` measures LAPIC countdown against PIT ticks and stores per-core timer rates.
+
+**Multi-Core Long-Mode Handoff (Phase 15)** — Trampoline performs real→protected→long mode with an embedded GDT, identity-maps `0x8000`, and calls `ap_kernel_entry`; boot re-enables the heap, adopts bootloader CR3, and issues live INIT/SIPI for AP online.
+
+**Multi-Core Per-AP TSS + Calibrated Timer (Phase 16)** — Each AP loads a private GDT/TSS with its own double-fault IST stack; BSP calibrates the LAPIC rate against PIT ticks at boot and APs inherit that calibration when arming vector `0xF0` after handoff.
+
+**Multi-Core RSP0 + Reschedule IPI (Phase 17)** — Per-core TSS RSP0 kernel stacks (16 KiB) plus Fixed IPI vector `0xF1` to nudge LocalApic cores when work is queued (`cpu-ipi-resched`).
+
+**Multi-Core Idle Wake + TLB Shootdown (Phase 18)** — AP idle loop tracks `sti; hlt` park/wake; Fixed IPI `0xF2` invalidates remote TLBs (`cpu-ipi-tlb`); `vmmap`/`vmunmap` broadcast shootdowns to online APs.
+
+**Multi-Core Run Queues + Work Stealing (Phase 19)** — Per-core object-id run queues with fair lightest-core dispatch (tie-break by fewest dispatches); idle cores steal from the busiest victim; `cpus` reports `steals=`.
+
+**Multi-Core Parallel Running Slots (Phase 20)** — Scheduler keeps a fine-grained ready-queue lock plus private per-core running slots so multiple APIC ids can hold dispatched tasks at once (`running` / `cpus` show `run=`).
+
+**SMP Roadmap Reset (M1–M6)** — Unblocked 2-vCPU bring-up (`-smp 2`, Kernel lock released before INIT/SIPI, lock-free AP ready mailbox); ACPI MADT CPU discovery with fallback topology; slot-based `percpu` maps; contexts stay running until completed; global scheduler usable without Kernel lock; TLB shootdown ACK wait.
+
+**CPU Hardening + Ring-3 Foundation (M7–M14)** — Quiet LAPIC/IPI logging with cooperative `yield`/`complete`; contiguous-frame heap; GS-base `PerCpu`; kernel `CpuContext` switch; BSP `lapic-local`; x2APIC (xAPIC fallback); MADT IOAPIC + `irq-route`; user GDT + SCE/`user-smoke` (no ELF loader yet).
+
+**GPU Foundation** — Virtio-gpu 2D command packing, soft scanout/resource/flush into the boot framebuffer, modern virtio-pci capability parse + control virtqueue under `virtio-hw`, console `gpuinfo` / `gpusmoke`.
+
+**Unified Memory Foundation** — Contiguous shared CPU/GPU regions (`umalloc` / `umfree` / `um-smoke`), coherency fence before device attach, IOMMU identity stub; page migration not yet implemented.
+
 **Interactive Serial Console** — A `cdk>` prompt over COM1 for creating objects, sending messages, inspecting state, and controlling the scheduler at runtime.
 
 ## Quick Start
@@ -69,7 +93,7 @@ sudo apt install qemu-system-x86
 ./run_qemu.sh
 ```
 
-This builds the kernel, creates a BIOS-bootable disk image, and launches QEMU with the serial console connected to your terminal. Type `help` at the `cdk>` prompt.
+This builds the kernel, creates a BIOS-bootable disk image, and launches QEMU with **2 vCPUs** (`-smp 2`) and the serial console connected to your terminal. Override with `CDK_QEMU_SMP=4 ./run_qemu.sh`. Type `help` at the `cdk>` prompt.
 
 For a graphical QEMU window instead:
 
@@ -77,11 +101,14 @@ For a graphical QEMU window instead:
 CDK_QEMU_GUI=1 ./run_qemu.sh
 ```
 
-To compile the virtio-net hardware backend path:
+To compile virtio-net / virtio-gpu hardware probe paths:
 
 ```bash
 cargo check --features virtio-hw
+# or: CDK_VIRTIO_HW=1 ./run_qemu.sh
 ```
+
+`./run_qemu.sh` attaches `-device virtio-gpu-pci`. Soft GPU (`gpuinfo` / `gpusmoke`) works without `virtio-hw`. With `CDK_VIRTIO_HW=1`, modern virtio-pci caps are parsed and `gpusmoke` submits create/attach/scanout/transfer/flush on the device.
 
 ## Architecture
 
@@ -101,6 +128,9 @@ cargo check --features virtio-hw
   heap.rs          Kernel heap (#[global_allocator], linked-list, 2 MiB)
   rng.rs           RDRAND RNG (bare-metal) / OsRng (host tests)
   framebuffer.rs   Pixel framebuffer renderer (8×16 font, scroll, RGB/BGR)
+  gpu.rs           Soft/virtio-gpu 2D command pipeline, scanout flush
+  um.rs            Unified memory regions (CPU/GPU shared phys + fence)
+  pci.rs           Minimal PCI config access (virtio-gpu discovery)
   serial.rs        COM1 UART driver (init, read, write)
   vga_buffer.rs    print!/println! macros → serial + framebuffer
   console.rs       Interactive serial console and command dispatch
@@ -142,9 +172,13 @@ cargo check --features virtio-hw
 | `obj2net <obj> <if>` | Bridge one object message out as packet bytes |
 | `cpus` | Show registered CPU cores, runtime drive mode, and per-core telemetry |
 | `cpu-add-ap <id>` | Register an application core by APIC id |
-| `cpu-start-ap <id>` | Launch AP startup and complete online transition via trampoline entry hook |
+| `cpu-start-ap <id> [force]` | Launch AP via INIT/SIPI and wait for trampoline status (`force` = BSP soft-ack debug path) |
 | `cpu-ack-ap <id> <seq>` | Acknowledge AP entry for startup sequence and mark AP online |
-| `cpu-step-ap <id> <n>` | Simulate `n` local APIC timer ticks and service AP-assigned work |
+| `cpu-arm-timer` | Arm this CPU's local APIC periodic timer (vector `0xF0`) and switch it to `lapic-local` drive mode |
+| `cpu-calibrate [hz]` | Calibrate this CPU's LAPIC timer against PIT ticks and arm it (default target 20 Hz) |
+| `cpu-ipi-resched <id>` | Send a Fixed reschedule IPI (vector `0xF1`) to wake/service a LocalApic core |
+| `cpu-ipi-tlb <id\|all> [page\|#]` | Send Fixed TLB shootdown IPI (vector `0xF2`); `#`/omit = full flush |
+| `cpu-step-ap <id> <n>` | Debug: software-inject `n` local timer ticks (prefer hardware after `cpu-arm-timer` / AP entry) |
 | `cpu-halt <id>` | Mark a core as halted |
 | `netbind-in <if> <obj>` | Bind interface ingress for automated bridge pumping |
 | `netbind-out <obj> <if>` | Bind object egress for automated bridge pumping |
@@ -209,9 +243,11 @@ Deployment:
 - [x] Framebuffer text rendering (8×16 bitmap font, RGB/BGR/U8 pixel formats, auto-scroll)
 - [x] Network stack integration (loopback interfaces, capability-gated send/recv, object bridge routing, bindings, pump telemetry)
 - [x] External network transport (virtio-net MMIO bring-up path + non-loopback external interfaces via `eth0` default external backend and adapter-based transports)
-- [ ] Multi-core support (Phase 12 complete: local APIC timer IRQ hook path integrated to AP runtime service API; next: route real AP local timer vector delivery on AP cores and replace console stepping with hardware interrupts)
-- [ ] GPU support (PCI/virtio-gpu discovery, mode setting, command submission pipeline)
-- [ ] Unified memory support (shared CPU/GPU VA model, page migration/coherency, IOMMU integration)
+- [x] Multi-core foundation (trampoline, LAPIC, TSS, IPIs, MADT discovery, AP ready mailbox, percpu slots, TLB ACK)
+- [x] Multi-core hardening (quiet SMP lifecycle, contiguous heap, GS-base PerCpu, kernel context switch, BSP lapic-local, x2APIC with xAPIC fallback, IOAPIC IRQ0/1 + optional `irq-route`)
+- [x] User-mode / ring-3 foundation (user GDT segments, SCE/LSTAR syscall + `user-smoke`; no ELF loader / multi-process yet)
+- [x] GPU support (soft 2D command pipeline + FB flush; PCI/MMIO virtio-gpu probe under `virtio-hw`; `gpuinfo` / `gpusmoke`)
+- [x] Unified memory foundation (contiguous shared regions, CPU fill + fence, virtio-gpu attach; IOMMU identity stub — no migration yet)
 
 ## Open Source Guidelines
 
