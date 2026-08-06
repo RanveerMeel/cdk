@@ -42,8 +42,9 @@ pub fn init() {
 pub extern "C" fn syscall_dispatch(nr: u64, arg0: u64, _arg1: u64) -> u64 {
     match nr {
         SYS_EXIT => {
-            crate::println!("Syscall: SYS_exit code={} (user-smoke complete)", arg0);
-            // Do not SYSRET — park in kernel.
+            crate::process::mark_exit(arg0);
+            crate::println!("Syscall: SYS_exit code={} (process → Zombie)", arg0);
+            // Do not SYSRET — park in kernel (console blocked until reboot).
             #[cfg(target_os = "none")]
             loop {
                 unsafe {
@@ -184,6 +185,15 @@ pub fn run_user_smoke(
             enter_user(user_rip, user_rsp, ucode.0 as u64, udata.0 as u64);
         }
     }
+}
+
+/// Public entry used by [`crate::process`] (never returns on bare metal).
+///
+/// # Safety
+/// `rip`/`rsp` must be valid user mappings; selectors must be ring-3.
+#[cfg(target_os = "none")]
+pub unsafe fn enter_user_public(rip: u64, rsp: u64, user_cs: u64, user_ss: u64) -> ! {
+    enter_user(rip, rsp, user_cs, user_ss)
 }
 
 #[cfg(target_os = "none")]

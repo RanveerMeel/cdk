@@ -7,6 +7,7 @@ pub mod capability;
 pub mod console;
 pub mod context;
 pub mod cpu;
+pub mod elf;
 pub mod framebuffer;
 pub mod gpu;
 #[cfg(target_os = "none")]
@@ -28,6 +29,7 @@ pub mod object;
 pub mod paging;
 pub mod percpu;
 pub mod phys_mem;
+pub mod process;
 pub mod rng;
 pub mod scheduler;
 pub mod serial;
