@@ -276,6 +276,13 @@ impl Kernel {
         }
     }
 
+    /// Bridge one network packet into an object's message queue.
+    ///
+    /// The bridging capability acts with delegated authority over bound
+    /// objects: ingress requires it to hold `ReceiveMessage` (checked inside
+    /// `network_receive`) **and** `SendMessage` (checked by `send_message`
+    /// on delivery), so network-sourced traffic cannot be injected with a
+    /// receive-only capability.
     pub fn bridge_network_to_object(
         &mut self,
         cap: &Capability,
@@ -293,10 +300,15 @@ impl Kernel {
             .map_err(|_| KernelError::PayloadTooLarge)?;
         let msg = Message::new("net-bridge", target_object_id, MessagePayload::Data(data))
             .map_err(|_| KernelError::PayloadTooLarge)?;
-        self.send_message_direct(target_object_id, msg)?;
+        self.send_message(cap, target_object_id, msg)?;
         Ok(true)
     }
 
+    /// Bridge one queued object message out to the network.
+    ///
+    /// Draining the source object is a receive on its queue performed with
+    /// the bridging capability's delegated authority, so `ReceiveMessage`
+    /// is required up front (`network_send` then enforces `SendMessage`).
     pub fn bridge_object_to_network(
         &mut self,
         cap: &Capability,
@@ -304,6 +316,10 @@ impl Kernel {
         source_object_id: &str,
         iface: &str,
     ) -> KernelResult<bool> {
+        Self::check_signature(cap)?;
+        if !cap.has_permission(&Permission::ReceiveMessage) {
+            return Err(KernelError::PermissionDenied);
+        }
         let maybe_msg = self.receive_message_direct(source_object_id)?;
         let Some(msg) = maybe_msg else {
             return Ok(false);
@@ -1312,6 +1328,40 @@ mod tests {
             MessagePayload::Data(bytes) => assert_eq!(bytes.as_slice(), b"abc"),
             _ => panic!("expected Data payload"),
         }
+    }
+
+    #[test]
+    fn bridge_requires_send_and_receive_permissions() {
+        let mut k = Kernel::new();
+        let net_obj = make_obj("net-service", "interactive");
+        // Receive-only: enough to poll the network, not to inject into objects.
+        let recv_only = Capability::with_permissions(&net_obj, &[Permission::ReceiveMessage]);
+        let send_only = Capability::with_permissions(&net_obj, &[Permission::SendMessage]);
+        let full = Capability::with_permissions(
+            &net_obj,
+            &[Permission::SendMessage, Permission::ReceiveMessage],
+        );
+        let _ = k.register_object(net_obj);
+
+        let inbox_cap = k.register_object(make_obj("inbox", "normal"));
+        let inbox_id = inbox_cap.object_id.as_str().to_owned();
+
+        let mut net = NetworkStack::new();
+        net.add_loopback_interface("lo").unwrap();
+        k.network_send(&full, &mut net, "lo", b"abc").unwrap();
+        net.service();
+
+        // Ingress with a receive-only cap must not deliver into the object.
+        let denied = k.bridge_network_to_object(&recv_only, &mut net, "lo", &inbox_id);
+        assert!(matches!(denied, Err(KernelError::PermissionDenied)));
+        assert!(k.receive_message_direct(&inbox_id).unwrap().is_none());
+
+        // Egress with a send-only cap must not drain the source object.
+        let msg = Message::text("src", &inbox_id, "out").unwrap();
+        k.send_message_direct(&inbox_id, msg).unwrap();
+        let denied = k.bridge_object_to_network(&send_only, &mut net, &inbox_id, "lo");
+        assert!(matches!(denied, Err(KernelError::PermissionDenied)));
+        assert!(k.receive_message_direct(&inbox_id).unwrap().is_some());
     }
 
     #[test]

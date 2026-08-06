@@ -141,8 +141,21 @@ pub fn parse_madt(madt_phys: u64) -> AcpiResult<CpuTopology> {
     if topo.cpus.is_empty() {
         return Err(AcpiError::NoMadt);
     }
-    // Prefer marking the CPU whose APIC id matches the running core as BSP when known.
+    // MADT entry order is not guaranteed to start with the boot CPU; re-mark
+    // the BSP from the APIC id of the core actually running this code. When
+    // no entry matches (or on host), the first-enabled marking above stands.
+    mark_bsp_by_apic_id(&mut topo, crate::cpu::cpuid_apic_id());
     Ok(topo)
+}
+
+/// Mark the CPU with `boot_apic_id` as BSP (clearing others) if present.
+fn mark_bsp_by_apic_id(topo: &mut CpuTopology, boot_apic_id: u32) {
+    if !topo.cpus.iter().any(|c| c.apic_id == boot_apic_id) {
+        return;
+    }
+    for cpu in topo.cpus.iter_mut() {
+        cpu.is_bsp = cpu.apic_id == boot_apic_id;
+    }
 }
 
 /// Fallback topology when MADT is unavailable (BSP 0 + AP 1).
@@ -352,5 +365,18 @@ mod tests {
         let t = fallback_topology();
         assert_eq!(t.cpus.len(), 2);
         assert!(t.cpus[0].is_bsp);
+    }
+
+    #[test]
+    fn bsp_remark_matches_boot_apic_id() {
+        let buf = madt_with_two_cpus();
+        let mut topo = parse_madt_bytes(&buf).unwrap();
+        // Boot CPU is apic 1, not the first MADT entry.
+        mark_bsp_by_apic_id(&mut topo, 1);
+        assert!(!topo.cpus[0].is_bsp);
+        assert!(topo.cpus[1].is_bsp);
+        // Unknown boot id leaves the existing marking untouched.
+        mark_bsp_by_apic_id(&mut topo, 99);
+        assert!(topo.cpus[1].is_bsp);
     }
 }

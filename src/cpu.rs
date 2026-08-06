@@ -73,6 +73,34 @@ pub fn wrmsr(msr: u32, value: u64) {
     }
 }
 
+/// CPUID leaf 1: EBX bits 31:24 = initial local APIC id of the executing CPU.
+///
+/// Safe to call before any LAPIC MMIO mapping exists (unlike reading
+/// `0xFEE0_0020`), so boot topology code can identify the BSP early.
+pub fn cpuid_apic_id() -> u32 {
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    unsafe {
+        let ebx_out: u32;
+        core::arch::asm!(
+            "push rbx",
+            "mov eax, 1",
+            "cpuid",
+            "mov {out:e}, ebx",
+            "pop rbx",
+            out = out(reg) ebx_out,
+            out("eax") _,
+            out("ecx") _,
+            out("edx") _,
+            options(nostack, preserves_flags),
+        );
+        ebx_out >> 24
+    }
+    #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+    {
+        0
+    }
+}
+
 /// CPUID leaf 1: ECX bit 21 = x2APIC.
 pub fn cpuid_has_x2apic() -> bool {
     #[cfg(all(target_os = "none", target_arch = "x86_64"))]

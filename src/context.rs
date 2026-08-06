@@ -158,6 +158,22 @@ pub fn mark_done(thread_id: u16) {
     }
 }
 
+/// Raw pointer to the idle context for `slot`, or `None` if out of range.
+///
+/// The guard is dropped before returning: holding the `IDLE_CTX` spinlock
+/// across `cdk_switch_context` would deadlock, because the switched-to thread
+/// re-enters this module (via `switch_to_idle`) on the same CPU before the
+/// original stack ever resumes to release the lock. Each topology slot is
+/// only touched by its own core, so the pointer stays valid and unaliased.
+#[cfg(target_os = "none")]
+fn idle_ctx_ptr(slot: usize) -> Option<*mut CpuContext> {
+    let mut idles = IDLE_CTX.lock();
+    if slot >= idles.len() {
+        return None;
+    }
+    Some(&mut idles[slot] as *mut CpuContext)
+}
+
 /// Switch from the idle context of topology `slot` into `thread_id`.
 pub fn switch_to_thread(slot: usize, thread_id: u16) {
     #[cfg(target_os = "none")]
@@ -174,11 +190,9 @@ pub fn switch_to_thread(slot: usize, thread_id: u16) {
         thread.state = ThreadState::Running;
         let new_ctx = &mut thread.context as *mut CpuContext;
         drop(table);
-        let mut idles = IDLE_CTX.lock();
-        if slot >= idles.len() {
+        let Some(old) = idle_ctx_ptr(slot) else {
             return;
-        }
-        let old = &mut idles[slot] as *mut CpuContext;
+        };
         unsafe {
             cdk_switch_context(old, new_ctx);
         }
@@ -205,11 +219,9 @@ pub fn switch_to_idle(slot: usize, thread_id: u16) {
         };
         let old = &mut thread.context as *mut CpuContext;
         drop(table);
-        let mut idles = IDLE_CTX.lock();
-        if slot >= idles.len() {
+        let Some(new_ctx) = idle_ctx_ptr(slot) else {
             return;
-        }
-        let new_ctx = &mut idles[slot] as *mut CpuContext;
+        };
         unsafe {
             cdk_switch_context(old, new_ctx);
         }

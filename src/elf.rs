@@ -130,16 +130,43 @@ pub fn program_header(img: &ElfImage<'_>, index: usize) -> Result<ProgramHeader,
     })
 }
 
-fn flags_to_map(flags: u32) -> MapFlags {
-    let exec = (flags & PF_X) != 0;
-    let write = (flags & PF_W) != 0;
-    if write {
-        MapFlags::user_rw()
-    } else if exec {
-        MapFlags::user_rx()
-    } else {
-        MapFlags::user_rw() // read-only: use RW without exec; no dedicated RO helper
+/// Page-aligned span `[start, end)` covered by a segment's memory image.
+fn segment_page_span(ph: &ProgramHeader) -> Result<(u64, u64), ElfError> {
+    let start = ph.p_vaddr & !(FRAME_SIZE - 1);
+    let end = ph
+        .p_vaddr
+        .checked_add(ph.p_memsz)
+        .ok_or(ElfError::SegmentOverflow)?
+        .wrapping_add(FRAME_SIZE - 1)
+        & !(FRAME_SIZE - 1);
+    Ok((start, end))
+}
+
+/// Union of W/X permissions across every `PT_LOAD` segment covering `page`.
+///
+/// Segments may share a page at their boundaries; mapping with the combined
+/// flags up front means a page reused by a later segment never carries stale
+/// (too-weak or too-strong) permissions from whichever segment mapped it first.
+fn page_union_flags(img: &ElfImage<'_>, page: u64) -> Result<MapFlags, ElfError> {
+    let mut writable = false;
+    let mut exec = false;
+    for i in 0..img.phnum as usize {
+        let ph = program_header(img, i)?;
+        if ph.p_type != PT_LOAD {
+            continue;
+        }
+        let (start, end) = segment_page_span(&ph)?;
+        if page >= start && page < end {
+            writable |= (ph.p_flags & PF_W) != 0;
+            exec |= (ph.p_flags & PF_X) != 0;
+        }
     }
+    Ok(MapFlags {
+        writable,
+        user: true,
+        no_exec: !exec,
+        no_cache: false,
+    })
 }
 
 fn map_zeroed_page(
@@ -174,19 +201,15 @@ pub fn load_into(
         if ph.p_memsz < ph.p_filesz {
             return Err(ElfError::SegmentOverflow);
         }
-        let flags = flags_to_map(ph.p_flags);
-        let start = ph.p_vaddr & !(FRAME_SIZE - 1);
-        let end = ph
-            .p_vaddr
-            .checked_add(ph.p_memsz)
-            .ok_or(ElfError::SegmentOverflow)?
-            .wrapping_add(FRAME_SIZE - 1)
-            & !(FRAME_SIZE - 1);
+        let (start, end) = segment_page_span(&ph)?;
         let mut page = start;
         while page < end {
             let phys = match aspace.tables().translate(page) {
                 Ok(p) => p,
-                Err(_) => map_zeroed_page(aspace, fa, page, flags)?,
+                Err(_) => {
+                    let flags = page_union_flags(img, page)?;
+                    map_zeroed_page(aspace, fa, page, flags)?
+                }
             };
             // Copy file bytes that land in this page.
             let seg_off = page.saturating_sub(ph.p_vaddr);
