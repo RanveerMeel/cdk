@@ -132,6 +132,11 @@ const COMMANDS: &[&str] = &[
     "umalloc",
     "umfree",
     "um-smoke",
+    "ummigrate",
+    "iommu",
+    "dma-translate",
+    "gpudisp",
+    "umscanout",
     "capsign",
     "capverify",
     "vmmap",
@@ -593,6 +598,11 @@ fn dispatch(
         "umalloc" => cmd_umalloc(arg1, frame_alloc),
         "umfree" => cmd_umfree(arg1, frame_alloc),
         "um-smoke" => cmd_um_smoke(frame_alloc),
+        "ummigrate" => cmd_ummigrate(arg1, frame_alloc),
+        "iommu" => cmd_iommu(),
+        "dma-translate" => cmd_dma_translate(arg1),
+        "gpudisp" => cmd_gpudisp(),
+        "umscanout" => cmd_umscanout(arg1),
         "capsign" => cmd_capsign(arg1, kernel),
         "capverify" => cmd_capverify(arg1, kernel),
         "vmmap" => cmd_vmmap(arg1, arg2, arg3, page_table, frame_alloc, kernel),
@@ -676,10 +686,15 @@ fn cmd_help() {
     crate::println!("  fbinfo            Pixel framebuffer info (resolution, format)");
     crate::println!("  gpuinfo           GPU backend / resource / flush telemetry");
     crate::println!("  gpusmoke          Fill+flush test pattern via GPU pipeline");
-    crate::println!("  uminfo            Unified memory regions + IOMMU stub");
+    crate::println!("  uminfo            Unified memory regions + IOMMU status");
     crate::println!("  umalloc <bytes>   Alloc contiguous CPU/GPU shared region");
     crate::println!("  umfree <id>       Free a unified memory region");
     crate::println!("  um-smoke          Alloc+fill+fence(+GPU attach) smoke");
+    crate::println!("  ummigrate <id>    Migrate UM region to new phys + remap IOMMU");
+    crate::println!("  iommu             Show software-identity DMA windows");
+    crate::println!("  dma-translate <phys>  Translate IOVA via IOMMU windows");
+    crate::println!("  gpudisp           Show GPU display info");
+    crate::println!("  umscanout <id>    Fence + soft-scanout UM region to FB");
     crate::println!("  capsign <id>      Sign a fresh capability for object <id> and verify it");
     crate::println!("  capverify <id>    Create + sign + verify a capability for object <id>");
     crate::println!("  heapinfo          Kernel heap usage (total / used / free)");
@@ -893,23 +908,94 @@ fn cmd_uminfo() {
     crate::println!("  Bytes:     {}", s.bytes_total);
     crate::println!("  Next id:   {}", s.next_id);
     crate::println!(
-        "  IOMMU:     present={} mode={}",
+        "  IOMMU:     present={} mode={} windows={} translates={}",
         s.iommu.present,
-        s.iommu.mode
+        s.iommu.mode,
+        s.iommu.windows,
+        s.iommu.translates
     );
     crate::um::for_each(|r| {
+        let dma = crate::um::dma_addr(r.guest_phys);
         crate::println!(
-            "  - id={} phys={:#x} va={:#x} len={} frames={}",
+            "  - id={} phys={:#x} va={:#x} len={} frames={} dma={:?}",
             r.id,
             r.guest_phys,
             r.cpu_va,
             r.len,
-            r.frame_count
+            r.frame_count,
+            dma
         );
         if let Some(gid) = r.gpu_resource_id {
             crate::println!("      gpu_resource_id={}", gid);
         }
     });
+}
+
+fn cmd_ummigrate(id_str: &str, frame_alloc: &mut FrameAllocator) {
+    let Some(id) = parse_u32(id_str) else {
+        crate::println!("Usage: ummigrate <id>");
+        return;
+    };
+    match crate::um::migrate(frame_alloc, id) {
+        Ok(r) => crate::println!(
+            "UM migrate ok id={} phys={:#x} va={:#x}",
+            r.id,
+            r.guest_phys,
+            r.cpu_va
+        ),
+        Err(e) => crate::println!("UM migrate failed: {:?}", e),
+    }
+}
+
+fn cmd_iommu() {
+    let i = crate::iommu::info();
+    crate::println!("=== IOMMU (software identity) ===");
+    crate::println!("  hw_present={} mode={}", i.hw_present, i.mode);
+    crate::println!("  windows={} translates={}", i.windows, i.translates);
+    crate::iommu::for_each_window(|w| {
+        crate::println!(
+            "  - guest={:#x} len={:#x} device={:#x}",
+            w.guest_phys,
+            w.len,
+            w.device_phys
+        );
+    });
+}
+
+fn cmd_dma_translate(phys_str: &str) {
+    let Some(iova) = parse_hex(phys_str).or_else(|| parse_u32(phys_str).map(|v| v as u64)) else {
+        crate::println!("Usage: dma-translate <phys>");
+        return;
+    };
+    match crate::iommu::translate_dma(iova) {
+        Some(p) => crate::println!("dma {:#x} -> {:#x}", iova, p),
+        None => crate::println!("dma {:#x}: unmapped", iova),
+    }
+}
+
+fn cmd_gpudisp() {
+    match crate::gpu::display_info() {
+        Ok(d) => crate::println!(
+            "GPU display: {}x{} enabled={} refresh_hz={} backend={}",
+            d.width,
+            d.height,
+            d.enabled,
+            d.refresh_hz,
+            crate::gpu::backend_name(d.backend)
+        ),
+        Err(e) => crate::println!("gpudisp failed: {}", e),
+    }
+}
+
+fn cmd_umscanout(id_str: &str) {
+    let Some(id) = parse_u32(id_str) else {
+        crate::println!("Usage: umscanout <id>");
+        return;
+    };
+    match crate::gpu::um_scanout(id) {
+        Ok(()) => crate::println!("umscanout ok id={}", id),
+        Err(e) => crate::println!("umscanout failed: {}", e),
+    }
 }
 
 fn cmd_umalloc(bytes_str: &str, frame_alloc: &mut FrameAllocator) {

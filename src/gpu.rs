@@ -208,6 +208,16 @@ pub struct GpuStatus {
     pub hw_mmio: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DisplayInfo {
+    pub width: u32,
+    pub height: u32,
+    pub enabled: bool,
+    pub refresh_hz: u32,
+    pub backend: GpuBackendKind,
+    pub scanout_id: u32,
+}
+
 /// Soft surface max (BGRA8). Page-aligned static for virtio-gpu backing DMA.
 const MAX_SOFT_W: usize = 640;
 const MAX_SOFT_H: usize = 480;
@@ -335,6 +345,48 @@ impl SoftGpu {
         }
         drop(guard);
         self.flushes = self.flushes.saturating_add(1);
+        Ok(())
+    }
+
+    /// Copy BGRA8 from a CPU-mapped UM buffer into the soft surface (top-left).
+    fn blit_bgra(
+        &mut self,
+        src_va: u64,
+        src_len: usize,
+        src_w: u32,
+        src_h: u32,
+    ) -> Result<(), &'static str> {
+        if !self.ready {
+            return Err("gpu not ready");
+        }
+        let need = (src_w as usize)
+            .saturating_mul(src_h as usize)
+            .saturating_mul(SOFT_BPP);
+        if need == 0 || need > src_len {
+            return Err("um buffer too small");
+        }
+        let copy_w = src_w.min(self.width);
+        let copy_h = src_h.min(self.height);
+        let _g = SOFT_LOCK.lock();
+        let pix = soft_pixels_ptr();
+        #[cfg(target_os = "none")]
+        unsafe {
+            let src = src_va as *const u8;
+            for y in 0..copy_h {
+                for x in 0..copy_w {
+                    let s_off = (y * src_w + x) as usize * SOFT_BPP;
+                    let d_off = (y * self.width + x) as usize * SOFT_BPP;
+                    *pix.add(d_off) = *src.add(s_off);
+                    *pix.add(d_off + 1) = *src.add(s_off + 1);
+                    *pix.add(d_off + 2) = *src.add(s_off + 2);
+                    *pix.add(d_off + 3) = *src.add(s_off + 3);
+                }
+            }
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            let _ = (src_va, copy_w, copy_h, pix);
+        }
         Ok(())
     }
 }
@@ -806,6 +858,81 @@ pub fn status() -> GpuStatus {
         hw_probed: g.hw_probed,
         hw_mmio: g.hw_mmio,
     }
+}
+
+/// Report the active scanout geometry (soft dims; HW may refine later).
+pub fn display_info() -> Result<DisplayInfo, &'static str> {
+    let g = GPU.lock();
+    if !g.soft.ready {
+        return Err("gpu not ready");
+    }
+    // Protocol coverage: packing GET_DISPLAY_INFO is always available.
+    let mut cmd = [0u8; 24];
+    let _ = protocol::pack_get_display_info(&mut cmd);
+    Ok(DisplayInfo {
+        width: g.soft.width,
+        height: g.soft.height,
+        enabled: true,
+        refresh_hz: 60,
+        backend: g.backend,
+        scanout_id: g.soft.scanout_id,
+    })
+}
+
+/// Fence a UM region and soft-scanout it into the framebuffer (and HW when attached).
+pub fn um_scanout(um_id: u32) -> Result<(), &'static str> {
+    let region = crate::um::get(um_id).ok_or("um region not found")?;
+    crate::um::fence(region.cpu_va, region.len);
+    let dma = crate::iommu::translate_dma(region.guest_phys).ok_or("iommu: um not mapped")?;
+
+    // Infer a square-ish tile from byte length when no explicit dims stored.
+    let pixels = region.len / SOFT_BPP;
+    let side = isqrt_u32(pixels as u32).max(1);
+    let src_w = side;
+    let src_h = (pixels as u32 / src_w).max(1);
+
+    let mut g = GPU.lock();
+    if !g.soft.ready {
+        return Err("gpu not ready");
+    }
+    g.soft
+        .blit_bgra(region.cpu_va, region.len, src_w, src_h)?;
+
+    #[cfg(feature = "virtio-hw")]
+    if g.hw.ready {
+        let rid = region
+            .gpu_resource_id
+            .unwrap_or_else(|| RESOURCE_ID.fetch_add(1, Ordering::Relaxed).saturating_add(2));
+        let backing_len = src_w
+            .saturating_mul(src_h)
+            .saturating_mul(SOFT_BPP as u32)
+            .min(region.len as u32);
+        match g.hw.smoke_2d(rid, src_w, src_h, dma, backing_len) {
+            Ok(_) => g.backend = GpuBackendKind::VirtioPci,
+            Err(e) => crate::println!("GPU: um HW scanout: {} (soft fallback)", e),
+        }
+    }
+    #[cfg(not(feature = "virtio-hw"))]
+    {
+        let _ = dma;
+    }
+
+    g.soft.flush_to_framebuffer()?;
+    FLUSH_COUNT.store(g.soft.flushes, Ordering::Relaxed);
+    Ok(())
+}
+
+fn isqrt_u32(n: u32) -> u32 {
+    if n == 0 {
+        return 0;
+    }
+    let mut x = n;
+    let mut y = (x + 1) / 2;
+    while y < x {
+        x = y;
+        y = (x + n / x) / 2;
+    }
+    x
 }
 
 /// Whether the virtio-gpu control queue is live (`virtio-hw` + successful probe).

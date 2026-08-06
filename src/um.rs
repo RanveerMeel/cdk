@@ -47,6 +47,8 @@ pub struct IommuStatus {
     pub present: bool,
     /// Translation mode description.
     pub mode: &'static str,
+    pub windows: usize,
+    pub translates: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,10 +76,13 @@ impl UmState {
 static UM: Mutex<UmState> = Mutex::new(UmState::new());
 static NEXT_GPU_RES: AtomicU32 = AtomicU32::new(100);
 
-fn iommu_stub() -> IommuStatus {
+fn iommu_view() -> IommuStatus {
+    let i = crate::iommu::info();
     IommuStatus {
-        present: false,
-        mode: "identity-stub",
+        present: i.hw_present,
+        mode: i.mode,
+        windows: i.windows,
+        translates: i.translates,
     }
 }
 
@@ -132,6 +137,13 @@ pub fn alloc(fa: &mut FrameAllocator, bytes: usize) -> Result<UmRegion, UmError>
         frame_count: n,
         gpu_resource_id: None,
     };
+    // Explicit DMA identity window for device attach paths.
+    if crate::iommu::map_identity(phys, len as u64).is_err() {
+        for i in 0..n {
+            let _ = fa.free(PhysFrame(phys + (i as u64) * FRAME_SIZE));
+        }
+        return Err(UmError::Full);
+    }
     let _ = st.regions.push(region);
     Ok(region)
 }
@@ -146,6 +158,7 @@ pub fn free(fa: &mut FrameAllocator, id: u32) -> Result<(), UmError> {
         .ok_or(UmError::NotFound)?;
     let region = st.regions.swap_remove(idx);
     drop(st);
+    let _ = crate::iommu::unmap(region.guest_phys);
     for i in 0..region.frame_count {
         let _ = fa.free(PhysFrame(
             region.guest_phys + (i as u64) * FRAME_SIZE,
@@ -172,12 +185,17 @@ pub fn status() -> UmStatus {
         regions: st.regions.len(),
         bytes_total,
         next_id: st.next_id,
-        iommu: iommu_stub(),
+        iommu: iommu_view(),
     }
 }
 
 pub fn iommu_status() -> IommuStatus {
-    iommu_stub()
+    iommu_view()
+}
+
+/// Resolve device DMA address for a UM guest-physical (strict window map).
+pub fn dma_addr(guest_phys: u64) -> Option<u64> {
+    crate::iommu::translate_dma(guest_phys)
 }
 
 /// CPU→device coherency point before the GPU reads a region.
@@ -245,8 +263,10 @@ pub fn attach_gpu(id: u32, width: u32, height: u32) -> Result<u32, UmError> {
         return Err(UmError::TooLarge);
     }
     fence(region.cpu_va, need);
+    let dma = crate::iommu::translate_dma(region.guest_phys)
+        .ok_or(UmError::GpuAttach("iommu: um region not mapped"))?;
     let res_id = NEXT_GPU_RES.fetch_add(1, Ordering::Relaxed);
-    crate::gpu::um_attach_resource(res_id, width, height, region.guest_phys, need as u32)
+    crate::gpu::um_attach_resource(res_id, width, height, dma, need as u32)
         .map_err(UmError::GpuAttach)?;
     let mut st = UM.lock();
     if let Some(r) = st.regions.iter_mut().find(|r| r.id == id) {
@@ -286,6 +306,65 @@ pub fn smoke(fa: &mut FrameAllocator) -> Result<UmRegion, UmError> {
     get(region.id).ok_or(UmError::NotFound)
 }
 
+/// Migrate a UM region to a fresh contiguous physical span (coherency hook).
+///
+/// Copies CPU-visible contents, remaps the IOMMU identity window, and updates
+/// the region record. GPU resource ids are cleared (device must re-attach).
+pub fn migrate(fa: &mut FrameAllocator, id: u32) -> Result<UmRegion, UmError> {
+    let old = get(id).ok_or(UmError::NotFound)?;
+    fence(old.cpu_va, old.len);
+
+    let first = fa.alloc_contiguous(old.frame_count).map_err(|_| UmError::OutOfMemory)?;
+    let new_phys = first.base_addr();
+    let new_va = crate::phys_mem::phys_to_virt_addr(new_phys);
+
+    #[cfg(target_os = "none")]
+    unsafe {
+        let src = old.cpu_va as *const u8;
+        let dst = crate::phys_mem::phys_to_mut_ptr::<u8>(new_phys);
+        core::ptr::copy_nonoverlapping(src, dst, old.len);
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = new_va;
+    }
+
+    fence(new_va, old.len);
+
+    // Swap IOMMU window: drop old, map new (rollback frames on failure).
+    let _ = crate::iommu::unmap(old.guest_phys);
+    if crate::iommu::map_identity(new_phys, old.len as u64).is_err() {
+        let _ = crate::iommu::map_identity(old.guest_phys, old.len as u64);
+        for i in 0..old.frame_count {
+            let _ = fa.free(PhysFrame(new_phys + (i as u64) * FRAME_SIZE));
+        }
+        return Err(UmError::Full);
+    }
+
+    {
+        let mut st = UM.lock();
+        if let Some(r) = st.regions.iter_mut().find(|r| r.id == id) {
+            r.guest_phys = new_phys;
+            r.cpu_va = new_va;
+            r.gpu_resource_id = None;
+        }
+    }
+
+    for i in 0..old.frame_count {
+        let _ = fa.free(PhysFrame(old.guest_phys + (i as u64) * FRAME_SIZE));
+    }
+
+    let updated = get(id).ok_or(UmError::NotFound)?;
+    crate::println!(
+        "UM: migrated id={} {:#x} -> {:#x} ({} bytes)",
+        id,
+        old.guest_phys,
+        updated.guest_phys,
+        updated.len
+    );
+    Ok(updated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,15 +386,41 @@ mod tests {
 
     #[test]
     fn alloc_free_roundtrip() {
+        crate::iommu::reset_for_test();
         let mut fa = fa_with(64);
         let before = fa.free_frames();
         let r = alloc(&mut fa, 8192).unwrap();
         assert_eq!(r.frame_count, 2);
         assert_eq!(r.guest_phys % FRAME_SIZE, 0);
         assert_eq!(fa.free_frames(), before - 2);
+        assert_eq!(dma_addr(r.guest_phys), Some(r.guest_phys));
         free(&mut fa, r.id).unwrap();
         assert_eq!(fa.free_frames(), before);
         assert!(get(r.id).is_none());
+        assert_eq!(dma_addr(r.guest_phys), None);
+    }
+
+    #[test]
+    fn migrate_moves_phys_and_iommu() {
+        crate::iommu::reset_for_test();
+        let mut fa = fa_with(64);
+        let leftover: heapless::Vec<u32, MAX_REGIONS> = {
+            let mut ids = heapless::Vec::new();
+            for_each(|r| {
+                let _ = ids.push(r.id);
+            });
+            ids
+        };
+        for id in leftover {
+            let _ = free(&mut fa, id);
+        }
+        let r = alloc(&mut fa, 4096).unwrap();
+        let old = r.guest_phys;
+        let m = migrate(&mut fa, r.id).unwrap();
+        assert_ne!(m.guest_phys, old);
+        assert_eq!(dma_addr(m.guest_phys), Some(m.guest_phys));
+        assert_eq!(dma_addr(old), None);
+        free(&mut fa, m.id).unwrap();
     }
 
     #[test]
@@ -330,6 +435,7 @@ mod tests {
 
     #[test]
     fn status_tracks_bytes() {
+        crate::iommu::reset_for_test();
         let mut fa = fa_with(32);
         // Drain any leftover regions from earlier tests in this process.
         let leftover: heapless::Vec<u32, MAX_REGIONS> = {
@@ -347,7 +453,8 @@ mod tests {
         assert_eq!(s.regions, 1);
         assert_eq!(s.bytes_total, 4096);
         assert!(!s.iommu.present);
-        assert_eq!(s.iommu.mode, "identity-stub");
+        assert_eq!(s.iommu.mode, "software-identity");
+        assert_eq!(s.iommu.windows, 1);
         free(&mut fa, r.id).unwrap();
     }
 }

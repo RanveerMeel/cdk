@@ -2,6 +2,8 @@ use heapless::Deque;
 
 use super::{ExternalBackendKind, NetPacket, MAX_QUEUE_DEPTH};
 
+const RING_DEPTH: usize = 8;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct BackendPollResult {
     pub(super) rx_received: u64,
@@ -26,40 +28,98 @@ trait VirtioTransportIo {
     fn poll_rx_descriptor(&mut self) -> Option<NetPacket>;
 }
 
+/// Software virtqueue pair: TX submissions land in a ring and complete into
+/// the RX used-ring (loopback), modeling descriptor publish/complete.
+#[derive(Clone, Debug)]
+struct SoftVirtqPair {
+    tx_ring: Deque<NetPacket, RING_DEPTH>,
+    rx_ring: Deque<NetPacket, RING_DEPTH>,
+    tx_submitted: u64,
+    tx_completed: u64,
+    rx_delivered: u64,
+}
+
+impl PartialEq for SoftVirtqPair {
+    fn eq(&self, other: &Self) -> bool {
+        self.tx_submitted == other.tx_submitted
+            && self.tx_completed == other.tx_completed
+            && self.rx_delivered == other.rx_delivered
+            && self.tx_ring.len() == other.tx_ring.len()
+            && self.rx_ring.len() == other.rx_ring.len()
+    }
+}
+
+impl Eq for SoftVirtqPair {}
+
+impl SoftVirtqPair {
+    const fn new() -> Self {
+        Self {
+            tx_ring: Deque::new(),
+            rx_ring: Deque::new(),
+            tx_submitted: 0,
+            tx_completed: 0,
+            rx_delivered: 0,
+        }
+    }
+
+    fn submit_tx(&mut self, packet: &NetPacket) -> bool {
+        if self.tx_ring.push_back(packet.clone()).is_err() {
+            return false;
+        }
+        self.tx_submitted = self.tx_submitted.saturating_add(1);
+        true
+    }
+
+    fn complete_tx(&mut self) -> bool {
+        let Some(packet) = self.tx_ring.pop_front() else {
+            return false;
+        };
+        self.tx_completed = self.tx_completed.saturating_add(1);
+        // Device "transmits" then posts an RX used buffer (loopback model).
+        let _ = self.rx_ring.push_back(packet);
+        true
+    }
+
+    fn poll_rx(&mut self) -> Option<NetPacket> {
+        let pkt = self.rx_ring.pop_front()?;
+        self.rx_delivered = self.rx_delivered.saturating_add(1);
+        Some(pkt)
+    }
+}
+
 #[cfg(not(feature = "virtio-hw"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct VirtioStubQueueIo {
+    rings: SoftVirtqPair,
     polls: u64,
-    pending_tx_desc: u32,
 }
 
 #[cfg(not(feature = "virtio-hw"))]
 impl VirtioStubQueueIo {
     const fn new() -> Self {
         Self {
+            rings: SoftVirtqPair::new(),
             polls: 0,
-            pending_tx_desc: 0,
         }
     }
 }
 
 #[cfg(not(feature = "virtio-hw"))]
 impl VirtioTransportIo for VirtioStubQueueIo {
-    fn submit_tx_descriptor(&mut self, _packet: &NetPacket) -> bool {
-        self.pending_tx_desc = self.pending_tx_desc.saturating_add(1);
-        true
+    fn submit_tx_descriptor(&mut self, packet: &NetPacket) -> bool {
+        self.rings.submit_tx(packet)
     }
 
     fn complete_tx_descriptor(&mut self) -> bool {
-        if self.pending_tx_desc == 0 {
-            return false;
-        }
-        self.pending_tx_desc -= 1;
-        true
+        self.rings.complete_tx()
     }
 
     fn poll_rx_descriptor(&mut self) -> Option<NetPacket> {
         self.polls = self.polls.saturating_add(1);
+        if let Some(pkt) = self.rings.poll_rx() {
+            return Some(pkt);
+        }
+        // Keep a slow synthetic probe when the ring is idle (smoke telemetry).
         if self.polls % 4 == 0 {
             NetPacket::from_bytes(b"virtio-stub-rx").ok()
         } else {
@@ -76,6 +136,8 @@ struct VirtioHardwareIo {
     rx_ring_size: u16,
     initialized: bool,
     polls: u64,
+    /// Guest-side descriptor rings until MMIO queue DMA tables are wired.
+    rings: SoftVirtqPair,
 }
 
 #[cfg(feature = "virtio-hw")]
@@ -87,6 +149,7 @@ impl VirtioHardwareIo {
             rx_ring_size: 256,
             initialized: false,
             polls: 0,
+            rings: SoftVirtqPair::new(),
         }
     }
 
@@ -183,25 +246,25 @@ impl VirtioHardwareIo {
 
 #[cfg(feature = "virtio-hw")]
 impl VirtioTransportIo for VirtioHardwareIo {
-    fn submit_tx_descriptor(&mut self, _packet: &NetPacket) -> bool {
+    fn submit_tx_descriptor(&mut self, packet: &NetPacket) -> bool {
         if !self.init_hw_if_needed() {
-            return false;
+            // Host / pre-init: still exercise software rings.
+            return self.rings.submit_tx(packet);
         }
-        // Descriptor ring publication is pending; successful init allows
-        // controlled TX dequeue progress until that lands.
-        true
+        self.rings.submit_tx(packet)
     }
 
     fn complete_tx_descriptor(&mut self) -> bool {
-        self.initialized
+        self.rings.complete_tx()
     }
 
     fn poll_rx_descriptor(&mut self) -> Option<NetPacket> {
-        if !self.init_hw_if_needed() {
-            return None;
-        }
+        let _ = self.init_hw_if_needed();
         self.polls = self.polls.saturating_add(1);
-        if self.polls % 16 == 0 {
+        if let Some(pkt) = self.rings.poll_rx() {
+            return Some(pkt);
+        }
+        if self.initialized && self.polls % 16 == 0 {
             NetPacket::from_bytes(b"virtio-hw-rx-probe").ok()
         } else {
             None

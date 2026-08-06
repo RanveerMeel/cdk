@@ -18,6 +18,7 @@ pub mod virtio_pci;
 #[cfg(target_os = "none")]
 pub mod interrupts;
 pub mod ioapic;
+pub mod iommu;
 pub mod kernel;
 pub mod local_apic;
 pub mod memory_graph;
