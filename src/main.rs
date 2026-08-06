@@ -583,11 +583,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         cdk::println!("Total memory tracked: {} bytes", mem_graph.total_memory());
 
         let net_obj = KernelObject::new_compute("net0", "interactive");
-        let net_cap = Capability::with_permissions(
+        let mut net_cap = Capability::with_permissions(
             &net_obj,
             &[Permission::SendMessage, Permission::ReceiveMessage],
         );
         kernel.register_object(net_obj);
+        let _ = Kernel::sign_capability(&mut net_cap);
         *NETWORK_CAP.lock() = Some(net_cap);
     }
 

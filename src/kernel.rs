@@ -119,7 +119,10 @@ impl Kernel {
     }
 
     pub fn register_object(&mut self, obj: KernelObject) -> Capability {
-        let cap = Capability::new(&obj);
+        let mut cap = Capability::new(&obj);
+        // Kernel-issued tokens are always signed; unsigned caps are rejected
+        // by check_signature on privileged paths.
+        let _ = Self::sign_capability(&mut cap);
         let id = obj.id.clone();
         let _ = self.objects.insert(id, obj);
         let _ = self
@@ -838,15 +841,12 @@ impl Kernel {
         Ok(obj.pop_message())
     }
 
-    /// If the capability carries a signature, verify it.
+    /// Require a valid Ed25519 signature on `cap`.
     ///
-    /// Returns `Err(InvalidSignature)` when the signature is present but
-    /// invalid; returns `Ok(())` when unsigned or when the signature checks
-    /// out.
+    /// Unsigned tokens and tokens whose signature does not verify both map to
+    /// [`KernelError::InvalidSignature`]. Privileged kernel entry points call
+    /// this before checking permissions or looking up objects.
     fn check_signature(cap: &Capability) -> KernelResult<()> {
-        if cap.signature.is_none() {
-            return Ok(());
-        }
         match cap.verify() {
             Ok(true) => Ok(()),
             Ok(false) => Err(KernelError::InvalidSignature),
@@ -1101,6 +1101,39 @@ mod tests {
         KernelObject::new_compute(name, intent)
     }
 
+    /// Build a signed capability with an explicit permission set (tests only).
+    fn signed_perms(obj: &KernelObject, perms: &[Permission]) -> Capability {
+        let mut cap = Capability::with_permissions(obj, perms);
+        cap.sign_ephemeral().unwrap();
+        cap
+    }
+
+    #[test]
+    fn register_object_returns_signed_capability() {
+        let mut k = Kernel::new();
+        let cap = k.register_object(make_obj("signed", "normal"));
+        assert!(cap.is_signed());
+        assert_eq!(cap.verify().unwrap(), true);
+        assert!(k.validate_capability(&cap).is_ok());
+    }
+
+    #[test]
+    fn unsigned_capability_is_rejected() {
+        let mut k = Kernel::new();
+        let obj = make_obj("u", "normal");
+        let unsigned = Capability::new(&obj);
+        let _ = k.register_object(obj);
+        assert!(!unsigned.is_signed());
+        assert!(matches!(
+            k.execute(&unsigned),
+            Err(KernelError::InvalidSignature)
+        ));
+        assert!(matches!(
+            k.validate_capability(&unsigned),
+            Err(KernelError::InvalidSignature)
+        ));
+    }
+
     #[test]
     fn register_object_increments_count() {
         let mut k = Kernel::new();
@@ -1126,8 +1159,8 @@ mod tests {
     fn execute_requires_execute_permission() {
         let mut k = Kernel::new();
         let obj = make_obj("x", "normal");
-        // Build a read-only capability manually.
-        let cap = Capability::with_permissions(&obj, &[Permission::Read]);
+        // Build a read-only capability manually (must still be signed).
+        let cap = signed_perms(&obj, &[Permission::Read]);
         let _ = k.register_object(obj);
         let result = k.execute(&cap);
         assert!(matches!(result, Err(KernelError::PermissionDenied)));
@@ -1136,9 +1169,10 @@ mod tests {
     #[test]
     fn execute_returns_error_for_unknown_object() {
         let mut k = Kernel::new();
-        // Create a capability for an object that was never registered.
+        // Create a signed capability for an object that was never registered.
         let obj = make_obj("ghost", "normal");
-        let cap = Capability::new(&obj);
+        let mut cap = Capability::new(&obj);
+        cap.sign_ephemeral().unwrap();
         let result = k.execute(&cap);
         assert!(matches!(result, Err(KernelError::ObjectNotFound)));
     }
@@ -1248,7 +1282,8 @@ mod tests {
     fn validate_capability_fails_for_unknown_object() {
         let k = Kernel::new();
         let obj = make_obj("ghost", "normal");
-        let cap = Capability::new(&obj);
+        let mut cap = Capability::new(&obj);
+        cap.sign_ephemeral().unwrap();
         assert!(matches!(
             k.validate_capability(&cap),
             Err(KernelError::InvalidCapability)
@@ -1259,7 +1294,7 @@ mod tests {
     fn network_send_and_receive_with_capability_permissions() {
         let mut k = Kernel::new();
         let obj = make_obj("net-service", "interactive");
-        let mut cap = Capability::with_permissions(
+        let mut cap = signed_perms(
             &obj,
             &[Permission::SendMessage, Permission::ReceiveMessage],
         );
@@ -1273,6 +1308,8 @@ mod tests {
         assert_eq!(pkt.payload.as_slice(), b"hello");
 
         cap.remove_permission(&Permission::ReceiveMessage);
+        // Mutation clears the signature — re-sign so permission denial is tested.
+        cap.sign_ephemeral().unwrap();
         let denied = k.network_receive(&cap, &mut net, "lo");
         assert!(matches!(denied, Err(KernelError::PermissionDenied)));
 
@@ -1287,7 +1324,7 @@ mod tests {
     fn network_receive_empty_updates_telemetry() {
         let mut k = Kernel::new();
         let obj = make_obj("net-empty", "interactive");
-        let cap = Capability::with_permissions(
+        let cap = signed_perms(
             &obj,
             &[Permission::SendMessage, Permission::ReceiveMessage],
         );
@@ -1304,7 +1341,7 @@ mod tests {
     fn bridge_network_to_object_delivers_data_message() {
         let mut k = Kernel::new();
         let net_obj = make_obj("net-service", "interactive");
-        let net_cap = Capability::with_permissions(
+        let net_cap = signed_perms(
             &net_obj,
             &[Permission::SendMessage, Permission::ReceiveMessage],
         );
@@ -1335,9 +1372,9 @@ mod tests {
         let mut k = Kernel::new();
         let net_obj = make_obj("net-service", "interactive");
         // Receive-only: enough to poll the network, not to inject into objects.
-        let recv_only = Capability::with_permissions(&net_obj, &[Permission::ReceiveMessage]);
-        let send_only = Capability::with_permissions(&net_obj, &[Permission::SendMessage]);
-        let full = Capability::with_permissions(
+        let recv_only = signed_perms(&net_obj, &[Permission::ReceiveMessage]);
+        let send_only = signed_perms(&net_obj, &[Permission::SendMessage]);
+        let full = signed_perms(
             &net_obj,
             &[Permission::SendMessage, Permission::ReceiveMessage],
         );
@@ -1368,7 +1405,7 @@ mod tests {
     fn bridge_object_to_network_sends_text_payload() {
         let mut k = Kernel::new();
         let net_obj = make_obj("net-service", "interactive");
-        let net_cap = Capability::with_permissions(
+        let net_cap = signed_perms(
             &net_obj,
             &[Permission::SendMessage, Permission::ReceiveMessage],
         );
@@ -1399,7 +1436,7 @@ mod tests {
     fn bridge_tick_moves_bound_ingress_and_egress() {
         let mut k = Kernel::new();
         let net_obj = make_obj("net-service", "interactive");
-        let net_cap = Capability::with_permissions(
+        let net_cap = signed_perms(
             &net_obj,
             &[Permission::SendMessage, Permission::ReceiveMessage],
         );

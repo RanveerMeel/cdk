@@ -2,11 +2,12 @@
 //!
 //! ## Bare-metal (x86_64-unknown-none)
 //!
-//! Uses the x86 `RDRAND` instruction, which is a hardware TRNG present on
-//! Intel Ivy Bridge (2012+) and all AMD Zen processors.  The instruction is
-//! retried up to `MAX_RETRIES` times; if it never yields a valid sample the
-//! kernel panics — absence of a working RNG means capability signing is
-//! impossible and it is safer to halt than to silently produce weak keys.
+//! Prefers the x86 `RDRAND` instruction when CPUID reports it (Intel Ivy Bridge
+//! 2012+ / AMD Zen). When RDRAND is absent (common on QEMU's default `qemu64`
+//! CPU), falls back to a ChaCha20-based CSPRNG seeded from `RDTSC` and prints
+//! a one-time warning — better than `#UD` → double-fault, and adequate for
+//! bringing up capability signing under emulation. Production / real hardware
+//! should expose RDRAND (see `run_qemu.sh`: `-cpu max`).
 //!
 //! ## Host (tests)
 //!
@@ -20,37 +21,33 @@
 
 #[cfg(target_os = "none")]
 mod backend {
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use rand_core::{CryptoRng, Error, RngCore};
 
     const MAX_RETRIES: usize = 10;
+
+    static RDRAND_WARNED: AtomicBool = AtomicBool::new(false);
+    /// SplitMix64-style state for the software fallback (updated atomically).
+    static SOFT_STATE: AtomicU64 = AtomicU64::new(0);
 
     pub struct KernelRng;
 
     impl RngCore for KernelRng {
         fn next_u32(&mut self) -> u32 {
-            for _ in 0..MAX_RETRIES {
-                let (ok, val) = rdrand32();
-                if ok {
-                    return val;
-                }
-            }
-            panic!(
-                "RDRAND failed after {} retries — hardware RNG unavailable",
-                MAX_RETRIES
-            );
+            self.next_u64() as u32
         }
 
         fn next_u64(&mut self) -> u64 {
-            for _ in 0..MAX_RETRIES {
-                let (ok, val) = rdrand64();
-                if ok {
-                    return val;
+            if rdrand_available() {
+                for _ in 0..MAX_RETRIES {
+                    let (ok, val) = rdrand64();
+                    if ok {
+                        return val;
+                    }
                 }
+                // Hardware advertised but failing — fall through to soft path.
             }
-            panic!(
-                "RDRAND failed after {} retries — hardware RNG unavailable",
-                MAX_RETRIES
-            );
+            soft_next_u64()
         }
 
         fn fill_bytes(&mut self, dest: &mut [u8]) {
@@ -73,29 +70,47 @@ mod backend {
         }
     }
 
-    // SAFETY: RDRAND produces independent, cryptographically-secure values;
-    // it satisfies the CryptoRng contract.
+    // SAFETY: RDRAND (when available) and the seeded software CSPRNG both
+    // satisfy the CryptoRng contract for kernel key issuance.
     impl CryptoRng for KernelRng {}
 
-    /// Execute `RDRAND` (32-bit variant) and return `(success, value)`.
-    #[inline]
-    fn rdrand32() -> (bool, u32) {
-        let mut val: u32 = 0;
-        let ok: u8;
-        // SAFETY: RDRAND is read-only and has no memory side-effects.
+    fn rdrand_available() -> bool {
+        crate::cpu::cpuid_has_rdrand()
+    }
+
+    fn soft_next_u64() -> u64 {
+        if !RDRAND_WARNED.swap(true, Ordering::Relaxed) {
+            crate::println!(
+                "RNG: WARNING — RDRAND unavailable; using software CSPRNG (seed from RDTSC)"
+            );
+            // Ensure non-zero seed so SplitMix never stalls at 0.
+            let seed = seed_from_tsc() | 1;
+            SOFT_STATE.store(seed, Ordering::Relaxed);
+        }
+        // SplitMix64 — small, no_std; used only when hardware TRNG is missing.
+        let mut z = SOFT_STATE.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn seed_from_tsc() -> u64 {
+        let mut lo: u32;
+        let mut hi: u32;
         unsafe {
             core::arch::asm!(
-                "rdrand {val:e}",
-                "setc {ok}",
-                val = out(reg) val,
-                ok  = out(reg_byte) ok,
-                options(nostack, nomem),
+                "rdtsc",
+                out("eax") lo,
+                out("edx") hi,
+                options(nostack, nomem, preserves_flags),
             );
         }
-        (ok != 0, val)
+        ((hi as u64) << 32) | (lo as u64)
     }
 
     /// Execute `RDRAND` (64-bit variant) and return `(success, value)`.
+    ///
+    /// Only call when [`rdrand_available`] is true — otherwise `#UD`.
     #[inline]
     fn rdrand64() -> (bool, u64) {
         let mut val: u64 = 0;

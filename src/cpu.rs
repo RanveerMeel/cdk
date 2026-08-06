@@ -101,6 +101,29 @@ pub fn cpuid_apic_id() -> u32 {
     }
 }
 
+/// CPUID leaf 1: ECX bit 30 = RDRAND.
+pub fn cpuid_has_rdrand() -> bool {
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    unsafe {
+        let mut ecx: u32;
+        core::arch::asm!(
+            "push rbx",
+            "mov eax, 1",
+            "cpuid",
+            "pop rbx",
+            out("eax") _,
+            out("ecx") ecx,
+            out("edx") _,
+            options(nostack, preserves_flags),
+        );
+        (ecx & (1 << 30)) != 0
+    }
+    #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+    {
+        false
+    }
+}
+
 /// CPUID leaf 1: ECX bit 21 = x2APIC.
 pub fn cpuid_has_x2apic() -> bool {
     #[cfg(all(target_os = "none", target_arch = "x86_64"))]

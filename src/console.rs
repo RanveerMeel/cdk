@@ -1101,11 +1101,14 @@ fn cmd_capverify(id: &str, kernel: &mut Kernel) {
             return;
         }
     };
-    // Unsigned capability: verify returns false (not an error).
+    // Unsigned capability: verify returns false (kernel gates reject unsigned).
     let cap = Capability::new(obj_ref);
     match Kernel::verify_capability(&cap) {
         Ok(true) => crate::println!("Capability for '{}': signature valid", id),
-        Ok(false) => crate::println!("Capability for '{}': unsigned (no signature)", id),
+        Ok(false) => crate::println!(
+            "Capability for '{}': unsigned (kernel ops would reject)",
+            id
+        ),
         Err(e) => crate::println!("Capability for '{}': error: {:?}", id, e),
     }
 }

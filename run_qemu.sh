@@ -70,6 +70,7 @@ SMP_ARGS=(-smp "${CDK_QEMU_SMP:-2}")
 GPU_ARGS=(-device virtio-gpu-pci)
 
 qemu-system-x86_64 \
+    -cpu max \
     -drive format=raw,file="$RUN_IMG",snapshot=on \
     -serial stdio \
     "${SMP_ARGS[@]}" \
