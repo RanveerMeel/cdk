@@ -1,5 +1,5 @@
 use core::str::FromStr;
-use heapless::{Deque, FnvIndexMap, String, Vec};
+use heapless::{Deque, String, Vec};
 
 mod transport;
 use self::transport::ExternalTransport;
@@ -164,14 +164,17 @@ pub struct NetworkSummary {
 }
 
 pub struct NetworkStack {
-    interfaces: FnvIndexMap<String<MAX_IFACE_NAME>, NetworkInterface, MAX_INTERFACES>,
+    /// Flat table instead of `FnvIndexMap`: inserting a large `NetworkInterface`
+    /// through heapless' hash map stack-probes ~36 KiB and double-faults on the
+    /// bootloader kernel stack under stack-clash protection.
+    interfaces: Vec<NetworkInterface, MAX_INTERFACES>,
     service_ticks: u64,
 }
 
 impl NetworkStack {
     pub const fn new() -> Self {
         Self {
-            interfaces: FnvIndexMap::new(),
+            interfaces: Vec::new(),
             service_ticks: 0,
         }
     }
@@ -188,40 +191,42 @@ impl NetworkStack {
         self.add_interface(name, InterfaceKind::External(backend))
     }
 
+    fn find_index(&self, name: &str) -> Option<usize> {
+        self.interfaces
+            .iter()
+            .position(|iface| iface.name.as_str() == name)
+    }
+
     fn add_interface(&mut self, name: &str, kind: InterfaceKind) -> Result<(), NetError> {
-        let key = String::from_str(name).map_err(|_| NetError::InvalidInterfaceName)?;
-        if self.interfaces.contains_key(&key) {
+        let _ = String::<MAX_IFACE_NAME>::from_str(name)
+            .map_err(|_| NetError::InvalidInterfaceName)?;
+        if self.find_index(name).is_some() {
             return Err(NetError::InterfaceExists);
+        }
+        if self.interfaces.is_full() {
+            return Err(NetError::QueueFull);
         }
         let iface = NetworkInterface::new(name, kind)?;
         self.interfaces
-            .insert(key, iface)
+            .push(iface)
             .map_err(|_| NetError::QueueFull)?;
         Ok(())
     }
 
     pub fn send_bytes(&mut self, iface: &str, bytes: &[u8]) -> Result<(), NetError> {
-        let key = String::from_str(iface).map_err(|_| NetError::InvalidInterfaceName)?;
         let packet = NetPacket::from_bytes(bytes)?;
-        let iface = self
-            .interfaces
-            .get_mut(&key)
-            .ok_or(NetError::InterfaceNotFound)?;
-        iface.enqueue_tx(packet)
+        let idx = self.find_index(iface).ok_or(NetError::InterfaceNotFound)?;
+        self.interfaces[idx].enqueue_tx(packet)
     }
 
     pub fn recv_packet(&mut self, iface: &str) -> Result<Option<NetPacket>, NetError> {
-        let key = String::from_str(iface).map_err(|_| NetError::InvalidInterfaceName)?;
-        let iface = self
-            .interfaces
-            .get_mut(&key)
-            .ok_or(NetError::InterfaceNotFound)?;
-        Ok(iface.dequeue_rx())
+        let idx = self.find_index(iface).ok_or(NetError::InterfaceNotFound)?;
+        Ok(self.interfaces[idx].dequeue_rx())
     }
 
     pub fn service(&mut self) {
         self.service_ticks = self.service_ticks.saturating_add(1);
-        for iface in self.interfaces.values_mut() {
+        for iface in self.interfaces.iter_mut() {
             iface.service_io();
         }
     }
@@ -232,7 +237,7 @@ impl NetworkStack {
             service_ticks: self.service_ticks,
             ..NetworkSummary::default()
         };
-        for iface in self.interfaces.values() {
+        for iface in self.interfaces.iter() {
             if matches!(iface.kind, InterfaceKind::External(_)) {
                 out.external_interfaces = out.external_interfaces.saturating_add(1);
             }
@@ -254,7 +259,7 @@ impl NetworkStack {
         &self,
         mut f: impl FnMut(&str, InterfaceKind, InterfaceStats, usize, usize),
     ) {
-        for iface in self.interfaces.values() {
+        for iface in self.interfaces.iter() {
             f(
                 iface.name.as_str(),
                 iface.kind,

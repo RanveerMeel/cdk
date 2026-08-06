@@ -595,7 +595,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     cdk::println!("System ready.");
 
     {
-        let node = NODE.lock();
+        let mut node = NODE.lock();
+        node.ensure_identity();
         cdk::println!("Node ID: {}", node.node_id());
     }
     {

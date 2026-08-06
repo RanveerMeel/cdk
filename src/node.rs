@@ -50,6 +50,13 @@ impl KernelNode {
         }
     }
 
+    /// Fill in a generated id when constructed via [`new_const`].
+    pub fn ensure_identity(&mut self) {
+        if self.node_id.is_empty() {
+            self.node_id = Self::generate_node_id(self.node_counter);
+        }
+    }
+
     pub fn node_id(&self) -> &str {
         &self.node_id
     }
