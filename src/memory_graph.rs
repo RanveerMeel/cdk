@@ -1,7 +1,7 @@
 // Memory object graph - tracks memory objects and their relationships
+use core::str::FromStr;
 use heapless::FnvIndexMap;
 use heapless::String;
-use core::str::FromStr;
 
 const MAX_OBJECTS: usize = 16;
 const MAX_ID_LEN: usize = 64;
@@ -32,7 +32,7 @@ impl MemoryGraph {
             size,
             references: 0,
         };
-        
+
         if self.objects.insert(id, obj).is_ok() {
             self.total_memory += size;
         }
@@ -122,10 +122,16 @@ mod tests {
         g.register_object("ref-obj", 64);
         g.add_reference("ref-obj");
         g.add_reference("ref-obj");
-        let obj = g.objects.get(&heapless::String::from_str("ref-obj").unwrap()).unwrap();
+        let obj = g
+            .objects
+            .get(&heapless::String::from_str("ref-obj").unwrap())
+            .unwrap();
         assert_eq!(obj.references, 2);
         g.remove_reference("ref-obj");
-        let obj = g.objects.get(&heapless::String::from_str("ref-obj").unwrap()).unwrap();
+        let obj = g
+            .objects
+            .get(&heapless::String::from_str("ref-obj").unwrap())
+            .unwrap();
         assert_eq!(obj.references, 1);
     }
 
@@ -134,7 +140,10 @@ mod tests {
         let mut g = MemoryGraph::new();
         g.register_object("r", 0);
         g.remove_reference("r"); // already 0, must not panic or wrap
-        let obj = g.objects.get(&heapless::String::from_str("r").unwrap()).unwrap();
+        let obj = g
+            .objects
+            .get(&heapless::String::from_str("r").unwrap())
+            .unwrap();
         assert_eq!(obj.references, 0);
     }
 
@@ -149,7 +158,9 @@ mod tests {
         // If insert replaces, the new size is added; if it errors, nothing changes.
         // The important thing: no double-counting of the original entry.
         let after = g.total_memory();
-        assert!(after >= before, "total memory must not decrease on re-register");
+        assert!(
+            after >= before,
+            "total memory must not decrease on re-register"
+        );
     }
 }
-

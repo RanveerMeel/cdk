@@ -1,15 +1,24 @@
 #![cfg_attr(target_os = "none", no_std)]
 #![cfg_attr(target_os = "none", feature(abi_x86_interrupt))]
 
+pub mod acpi;
 pub mod allocator;
 pub mod capability;
 pub mod console;
+pub mod context;
+pub mod cpu;
+pub mod elf;
 pub mod framebuffer;
+pub mod gpu;
 #[cfg(target_os = "none")]
 pub mod gdt;
 pub mod heap;
+pub mod pci;
+pub mod virtio_pci;
 #[cfg(target_os = "none")]
 pub mod interrupts;
+pub mod ioapic;
+pub mod iommu;
 pub mod kernel;
 pub mod local_apic;
 pub mod memory_graph;
@@ -19,8 +28,12 @@ pub mod network;
 pub mod node;
 pub mod object;
 pub mod paging;
+pub mod percpu;
 pub mod phys_mem;
+pub mod process;
 pub mod rng;
 pub mod scheduler;
 pub mod serial;
+pub mod syscall;
+pub mod um;
 pub mod vga_buffer;

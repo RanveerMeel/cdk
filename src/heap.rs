@@ -95,20 +95,10 @@ impl KernelHeap {
             return Err(HeapError::ZeroSize);
         }
 
-        // Allocate the first frame to anchor the base address.
-        let first: PhysFrame = fa.alloc().map_err(|_| HeapError::OutOfFrames)?;
+        let first: PhysFrame = fa
+            .alloc_contiguous(frame_count)
+            .map_err(|_| HeapError::OutOfFrames)?;
         let base = first.base_addr();
-        let mut prev_end = base + FRAME_SIZE;
-
-        // Allocate remaining frames; they must be contiguous.
-        for _ in 1..frame_count {
-            let frame: PhysFrame = fa.alloc().map_err(|_| HeapError::OutOfFrames)?;
-            if frame.base_addr() != prev_end {
-                return Err(HeapError::NonContiguous);
-            }
-            prev_end = frame.base_addr() + FRAME_SIZE;
-        }
-
         let size = frame_count as u64 * FRAME_SIZE;
         let base_virt = crate::phys_mem::phys_to_virt_addr(base);
 

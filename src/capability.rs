@@ -1,8 +1,10 @@
 //! Capability tokens for kernel objects.
 //!
 //! Each token records which [`Permission`]s the holder has on a given object
-//! and can optionally carry an Ed25519 signature over a SHA-256 digest of the
-//! token contents.
+//! and carries an Ed25519 signature over a SHA-256 digest of the token
+//! contents. Privileged kernel entry points reject unsigned tokens — a
+//! capability must be signed before it can authorize execute / IPC / network /
+//! delete operations.
 //!
 //! ## Signing model
 //!
@@ -18,15 +20,17 @@
 //! ## Key generation
 //!
 //! `Capability::generate_key()` draws entropy from [`crate::rng::KernelRng`]
-//! (RDRAND on bare-metal, OS entropy on host).
+//! (RDRAND on bare-metal, OS entropy on host). [`Capability::sign_ephemeral`]
+//! and [`crate::kernel::Kernel::register_object`] use that path so newly
+//! issued tokens are signed at creation.
 
+use core::str::FromStr;
 use heapless::FnvIndexSet;
 use heapless::String;
-use core::str::FromStr;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use sha2::{Digest, Sha256};
 use rand_core::RngCore;
+use sha2::{Digest, Sha256};
 
 use crate::rng::KernelRng;
 
@@ -51,12 +55,12 @@ impl Permission {
     /// Stable byte tag used in the signable message digest.
     fn tag(&self) -> u8 {
         match self {
-            Permission::Read           => 0x01,
-            Permission::Write          => 0x02,
-            Permission::Execute        => 0x03,
-            Permission::SendMessage    => 0x04,
+            Permission::Read => 0x01,
+            Permission::Write => 0x02,
+            Permission::Execute => 0x03,
+            Permission::SendMessage => 0x04,
             Permission::ReceiveMessage => 0x05,
-            Permission::Delete         => 0x06,
+            Permission::Delete => 0x06,
         }
     }
 }
@@ -90,10 +94,7 @@ impl Capability {
     }
 
     /// Create a new unsigned capability with a caller-supplied permission set.
-    pub fn with_permissions(
-        obj: &crate::object::KernelObject,
-        permissions: &[Permission],
-    ) -> Self {
+    pub fn with_permissions(obj: &crate::object::KernelObject, permissions: &[Permission]) -> Self {
         let mut perms = FnvIndexSet::new();
         for perm in permissions {
             let _ = perms.insert(perm.clone());
@@ -134,9 +135,23 @@ impl Capability {
         let signing_key = SigningKey::from_bytes(signing_key_bytes);
         let msg = self.signable_message();
         let sig: Signature = signing_key.sign(&msg);
-        self.signature  = Some(sig.to_bytes());
+        self.signature = Some(sig.to_bytes());
         self.signer_key = Some(signing_key.verifying_key().to_bytes());
         Ok(())
+    }
+
+    /// Sign this capability with a freshly generated ephemeral Ed25519 key.
+    ///
+    /// Convenience for kernel-issued tokens where the signing key is not
+    /// retained beyond issuance (the verifying key is stored in the token).
+    pub fn sign_ephemeral(&mut self) -> Result<(), CapabilityError> {
+        let (sk, _) = Self::generate_key();
+        self.sign(&sk)
+    }
+
+    /// Whether this token currently carries a signature blob.
+    pub fn is_signed(&self) -> bool {
+        self.signature.is_some() && self.signer_key.is_some()
     }
 
     /// Verify the token's signature.
@@ -145,11 +160,17 @@ impl Capability {
     /// `Ok(false)` when no signature has been set, and `Err` when the
     /// stored key or signature bytes are malformed.
     pub fn verify(&self) -> Result<bool, CapabilityError> {
-        let sig_bytes  = match self.signature  { Some(s) => s, None => return Ok(false) };
-        let key_bytes  = match self.signer_key { Some(k) => k, None => return Ok(false) };
+        let sig_bytes = match self.signature {
+            Some(s) => s,
+            None => return Ok(false),
+        };
+        let key_bytes = match self.signer_key {
+            Some(k) => k,
+            None => return Ok(false),
+        };
 
-        let verifying_key = VerifyingKey::from_bytes(&key_bytes)
-            .map_err(|_| CapabilityError::InvalidKey)?;
+        let verifying_key =
+            VerifyingKey::from_bytes(&key_bytes).map_err(|_| CapabilityError::InvalidKey)?;
         let signature = Signature::from_bytes(&sig_bytes);
         let msg = self.signable_message();
 
@@ -168,11 +189,19 @@ impl Capability {
         if self.permissions.insert(perm).is_err() {
             return Err(CapabilityError::PermissionSetFull);
         }
+        // Permission set changed — any prior signature no longer covers the token.
+        self.clear_signature();
         Ok(())
     }
 
     pub fn remove_permission(&mut self, perm: &Permission) {
         self.permissions.remove(perm);
+        self.clear_signature();
+    }
+
+    fn clear_signature(&mut self) {
+        self.signature = None;
+        self.signer_key = None;
     }
 
     // -----------------------------------------------------------------------
@@ -267,6 +296,25 @@ mod tests {
     fn verify_returns_false_without_signature() {
         let cap = Capability::new(&dummy_obj("x"));
         assert_eq!(cap.verify().unwrap(), false);
+        assert!(!cap.is_signed());
+    }
+
+    #[test]
+    fn sign_ephemeral_marks_token_signed() {
+        let mut cap = Capability::new(&dummy_obj("eph"));
+        cap.sign_ephemeral().unwrap();
+        assert!(cap.is_signed());
+        assert_eq!(cap.verify().unwrap(), true);
+    }
+
+    #[test]
+    fn permission_mutation_clears_signature() {
+        let mut cap = Capability::new(&dummy_obj("mut"));
+        cap.sign_ephemeral().unwrap();
+        assert!(cap.is_signed());
+        cap.add_permission(Permission::Delete).unwrap();
+        assert!(!cap.is_signed());
+        assert_eq!(cap.verify().unwrap(), false);
     }
 
     #[test]
@@ -294,8 +342,9 @@ mod tests {
         cap.sign(&sk).unwrap();
         assert_eq!(cap.verify().unwrap(), true);
 
-        // Add a permission post-signing — the message digest changes.
+        // Add a permission post-signing — signature is cleared (must re-sign).
         cap.add_permission(Permission::Delete).unwrap();
+        assert!(!cap.is_signed());
         assert_eq!(cap.verify().unwrap(), false);
     }
 

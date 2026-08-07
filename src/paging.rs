@@ -66,6 +66,7 @@ mod host_stubs {
         pub const PRESENT: X86Flags = X86Flags(1 << 0);
         pub const WRITABLE: X86Flags = X86Flags(1 << 1);
         pub const USER_ACCESSIBLE: X86Flags = X86Flags(1 << 2);
+        pub const NO_CACHE: X86Flags = X86Flags(1 << 4);
         pub const NO_EXECUTE: X86Flags = X86Flags(1 << 63);
 
         pub fn bits(self) -> u64 {
@@ -123,6 +124,10 @@ mod host_stubs {
         pub fn set_addr(&mut self, addr: PhysAddr, flags: X86Flags) {
             self.bits = addr.as_u64() | flags.bits();
         }
+        pub fn set_flags(&mut self, flags: X86Flags) {
+            let addr = self.bits & 0x000f_ffff_ffff_f000;
+            self.bits = addr | flags.bits();
+        }
     }
 
     /// 512-entry page table (one per level, 4 KiB total).
@@ -170,6 +175,8 @@ pub struct MapFlags {
     pub writable: bool,
     pub user: bool,
     pub no_exec: bool,
+    /// Page Cache Disable (PCD) — required for MMIO such as the local APIC.
+    pub no_cache: bool,
 }
 
 impl MapFlags {
@@ -178,6 +185,7 @@ impl MapFlags {
             writable: false,
             user: false,
             no_exec: false,
+            no_cache: false,
         }
     }
     pub const fn kernel_rw() -> Self {
@@ -185,6 +193,25 @@ impl MapFlags {
             writable: true,
             user: false,
             no_exec: true,
+            no_cache: false,
+        }
+    }
+    /// Writable + executable (AP trampoline page: code + stack in one frame).
+    pub const fn kernel_rwx() -> Self {
+        Self {
+            writable: true,
+            user: false,
+            no_exec: false,
+            no_cache: false,
+        }
+    }
+    /// Kernel MMIO (writable, NX, uncached) — local APIC / device registers.
+    pub const fn kernel_mmio() -> Self {
+        Self {
+            writable: true,
+            user: false,
+            no_exec: true,
+            no_cache: true,
         }
     }
     pub const fn user_rw() -> Self {
@@ -192,6 +219,15 @@ impl MapFlags {
             writable: true,
             user: true,
             no_exec: true,
+            no_cache: false,
+        }
+    }
+    pub const fn user_rx() -> Self {
+        Self {
+            writable: false,
+            user: true,
+            no_exec: false,
+            no_cache: false,
         }
     }
 
@@ -202,6 +238,9 @@ impl MapFlags {
         }
         if self.user {
             f |= X86Flags::USER_ACCESSIBLE;
+        }
+        if self.no_cache {
+            f |= X86Flags::NO_CACHE;
         }
         if self.no_exec {
             f |= X86Flags::NO_EXECUTE;
@@ -341,6 +380,14 @@ impl PageTableManager {
         })
     }
 
+    /// Adopt an existing PML4 (e.g. the bootloader / current `CR3`) without allocating.
+    pub fn from_pml4_phys(pml4_phys: u64) -> Self {
+        Self {
+            pml4_phys: pml4_phys & !0xfff,
+            mapped_pages: 0,
+        }
+    }
+
     /// Physical address of the PML4 root (load into `CR3` to activate).
     pub fn pml4_phys(&self) -> u64 {
         self.pml4_phys
@@ -374,11 +421,16 @@ impl PageTableManager {
         }
 
         let idx = VirtIndices::from_u64(virt);
+        let interior = if flags.user {
+            MapFlags::interior() | X86Flags::USER_ACCESSIBLE
+        } else {
+            MapFlags::interior()
+        };
 
         // Walk PML4 → PDPT → PD → PT, creating tables on demand.
-        let pdpt_phys = self.get_or_create(self.pml4_phys, idx.pml4, alloc)?;
-        let pd_phys = self.get_or_create(pdpt_phys, idx.pdpt, alloc)?;
-        let pt_phys = self.get_or_create(pd_phys, idx.pd, alloc)?;
+        let pdpt_phys = self.get_or_create(self.pml4_phys, idx.pml4, alloc, interior)?;
+        let pd_phys = self.get_or_create(pdpt_phys, idx.pdpt, alloc, interior)?;
+        let pt_phys = self.get_or_create(pd_phys, idx.pd, alloc, interior)?;
 
         // Write the leaf PTE.  We take the mutable reference only here,
         // after all interior tables are fully resolved, so no two `&mut`
@@ -394,6 +446,34 @@ impl PageTableManager {
         entry.set_addr(PhysAddr::new(phys), flags.to_x86_leaf());
         self.mapped_pages += 1;
         Ok(())
+    }
+
+    /// Identity-map `page_phys` at virtual address `page_phys` (needed for AP trampoline).
+    ///
+    /// Ignores [`PagingError::AlreadyMapped`] so repeated calls are safe.
+    pub fn identity_map_page<A: FrameSource>(
+        &mut self,
+        page_phys: u64,
+        alloc: &mut A,
+    ) -> PagingResult<()> {
+        match self.map(page_phys, page_phys, MapFlags::kernel_rwx(), alloc) {
+            Ok(()) => Ok(()),
+            Err(PagingError::AlreadyMapped) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Identity-map an MMIO page (uncached, writable, NX).
+    pub fn identity_map_mmio_page<A: FrameSource>(
+        &mut self,
+        page_phys: u64,
+        alloc: &mut A,
+    ) -> PagingResult<()> {
+        match self.map(page_phys, page_phys, MapFlags::kernel_mmio(), alloc) {
+            Ok(()) => Ok(()),
+            Err(PagingError::AlreadyMapped) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     /// Remove the mapping for `virt`, zeroing the leaf PTE.
@@ -457,15 +537,21 @@ impl PageTableManager {
         parent_phys: u64,
         child_idx: usize,
         alloc: &mut A,
+        flags: X86Flags,
     ) -> PagingResult<u64> {
         // SAFETY: parent_phys is a valid, aligned, identity-mapped frame;
         //         child_idx is always in 0..512.
         let entry = unsafe { &mut *Self::entry_ptr_mut(parent_phys, child_idx) };
         if entry.is_unused() {
             let child_phys = alloc.alloc_zeroed().ok_or(PagingError::OutOfMemory)?;
-            entry.set_addr(PhysAddr::new(child_phys), MapFlags::interior());
+            entry.set_addr(PhysAddr::new(child_phys), flags);
             Ok(child_phys)
         } else {
+            if flags.contains(X86Flags::USER_ACCESSIBLE) {
+                let mut f = entry.flags();
+                f |= X86Flags::USER_ACCESSIBLE;
+                entry.set_flags(f);
+            }
             Ok(entry.addr().as_u64())
         }
     }
@@ -503,6 +589,102 @@ impl PageTableManager {
     /// Same as `entry_ptr_mut` but returns a shared pointer.
     unsafe fn entry_ptr(phys: u64, idx: usize) -> *const PageTableEntry {
         crate::phys_mem::phys_to_ptr::<PageTableEntry>(phys).add(idx)
+    }
+}
+
+/// Per-task address space: private PML4 that shares kernel mappings (M14).
+///
+/// Kernel PML4 entries (indices 256..512, plus any already-present lower
+/// entries from the bootloader/kernel) are copied by reference so kernel
+/// code/data stay mapped after `activate()`.
+pub struct AddressSpace {
+    tables: PageTableManager,
+}
+
+impl AddressSpace {
+    /// Allocate a new PML4 and share the kernel's present top-level entries.
+    pub fn from_kernel<A: FrameSource>(
+        kernel: &PageTableManager,
+        alloc: &mut A,
+    ) -> Result<Self, PagingError> {
+        let tables = PageTableManager::new(alloc).ok_or(PagingError::OutOfMemory)?;
+        for idx in 0..512usize {
+            // SAFETY: both PML4s are valid frames owned/adopted by the managers.
+            let src = unsafe { &*PageTableManager::entry_ptr(kernel.pml4_phys(), idx) };
+            if src.is_unused() {
+                continue;
+            }
+            let dst = unsafe { &mut *PageTableManager::entry_ptr_mut(tables.pml4_phys(), idx) };
+            *dst = src.clone();
+        }
+        Ok(Self { tables })
+    }
+
+    pub fn tables(&mut self) -> &mut PageTableManager {
+        &mut self.tables
+    }
+
+    pub fn pml4_phys(&self) -> u64 {
+        self.tables.pml4_phys()
+    }
+
+    /// Load this address space into `CR3`.
+    pub fn activate(&self) {
+        let root = self.tables.pml4_phys();
+        #[cfg(target_os = "none")]
+        unsafe {
+            core::arch::asm!(
+                "mov cr3, {}",
+                in(reg) root,
+                options(nostack, preserves_flags)
+            );
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            let _ = root;
+        }
+    }
+}
+
+/// Invalidate a single page in the local TLB (`invlpg`).
+///
+/// No-op on host unit-test targets.
+#[inline]
+pub fn flush_tlb_page(virt: u64) {
+    #[cfg(target_os = "none")]
+    unsafe {
+        core::arch::asm!(
+            "invlpg [{}]",
+            in(reg) virt,
+            options(nostack, preserves_flags)
+        );
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = virt;
+    }
+}
+
+/// Flush the entire local TLB by reloading `CR3`.
+///
+/// No-op on host unit-test targets.
+#[inline]
+pub fn flush_tlb_all() {
+    #[cfg(target_os = "none")]
+    unsafe {
+        let cr3: u64;
+        core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, preserves_flags));
+        core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
+    }
+}
+
+/// Apply a shootdown request: `page_virt == 0` → full flush, else one page.
+#[inline]
+pub fn apply_tlb_shootdown(page_virt: u64) {
+    if page_virt == 0 {
+        flush_tlb_all();
+    } else {
+        flush_tlb_page(page_virt);
     }
 }
 

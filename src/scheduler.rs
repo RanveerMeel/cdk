@@ -1,8 +1,12 @@
 use crate::object::KernelObject;
 use core::cmp::Ordering;
 use heapless::Vec;
+use spin::Mutex;
 
 const MAX_QUEUE_SIZE: usize = 32;
+
+/// Maximum APIC ids with a private running slot (matches multicore table).
+pub const MAX_RUNNING_CORES: usize = 8;
 
 /// Number of timer ticks a task is allowed to run before being preempted.
 /// At the default PIT frequency (~1 000 Hz) this gives a 50 ms time slice.
@@ -36,21 +40,52 @@ pub struct RunningTask {
     pub started_at_tick: u64,
 }
 
+struct ReadyQueue {
+    tasks: Vec<ScheduledTask, MAX_QUEUE_SIZE>,
+}
+
+/// Priority ready queue + per-core running slots (Phase 20).
+///
+/// The ready queue has its own lock; each core's running slot has a private
+/// lock so cores can hold dispatched work in parallel without serializing on
+/// a single global `running` field.
 pub struct Scheduler {
-    queue: Vec<ScheduledTask, MAX_QUEUE_SIZE>,
-    /// The task currently occupying the CPU (if any).
-    running: Option<RunningTask>,
+    ready: Mutex<ReadyQueue>,
+    running: [Mutex<Option<RunningTask>>; MAX_RUNNING_CORES],
+}
+
+/// Process-wide scheduler (fine-grained internal locks — roadmap reset M5).
+///
+/// Hot paths (preempt / dispatch) can use this without holding the global
+/// `Kernel` object-map mutex.
+static GLOBAL_SCHEDULER: Scheduler = Scheduler::new();
+
+/// Access the global scheduler (IRQ-safe via internal spinlocks).
+pub fn global() -> &'static Scheduler {
+    &GLOBAL_SCHEDULER
 }
 
 impl Scheduler {
     pub const fn new() -> Self {
         Self {
-            queue: Vec::new(),
-            running: None,
+            ready: Mutex::new(ReadyQueue {
+                tasks: Vec::new(),
+            }),
+            running: [const { Mutex::new(None) }; MAX_RUNNING_CORES],
         }
     }
 
-    pub fn schedule(&mut self, obj: &KernelObject) {
+    #[inline]
+    fn slot(apic_id: u32) -> Option<usize> {
+        // Prefer dense topology slots (sparse APIC ids); fall back to apic_id.
+        if let Some(idx) = crate::percpu::slot_for_apic(apic_id) {
+            return (idx < MAX_RUNNING_CORES).then_some(idx);
+        }
+        let idx = apic_id as usize;
+        (idx < MAX_RUNNING_CORES).then_some(idx)
+    }
+
+    pub fn schedule(&self, obj: &KernelObject) {
         let priority = Self::intent_to_priority(&obj.intent);
         let task = ScheduledTask {
             object_id: obj.id.clone(),
@@ -58,95 +93,203 @@ impl Scheduler {
             intent: obj.intent.clone(),
         };
 
-        if self.queue.push(task).is_ok() {
-            // Sort by priority (highest first)
-            self.queue.sort_unstable();
+        {
+            let mut ready = self.ready.lock();
+            if ready.tasks.push(task).is_ok() {
+                ready.tasks.sort_unstable();
+            }
         }
 
         crate::println!("Scheduled: {} (priority: {})", obj.kind, priority);
     }
 
-    /// Dispatch the highest-priority queued task, marking it as running.
-    ///
-    /// Returns `None` and leaves the scheduler unchanged if a task is already
-    /// running — callers must let preemption evict it first.  This prevents
-    /// silently overwriting the `running` slot and losing the current task.
-    pub fn execute_next(&mut self) -> Option<heapless::String<64>> {
-        if self.running.is_some() {
-            return None;
-        }
-        self.execute_next_at(0)
+    /// Dispatch the highest-priority queued task onto BSP slot 0.
+    pub fn execute_next(&self) -> Option<heapless::String<64>> {
+        self.execute_next_on(0)
     }
 
-    /// Like `execute_next` but records the current tick for slice accounting.
-    pub fn execute_next_at(&mut self, current_tick: u64) -> Option<heapless::String<64>> {
-        if self.queue.is_empty() {
-            return None;
+    /// Like [`execute_next`] but records the current tick for slice accounting (BSP).
+    pub fn execute_next_at(&self, current_tick: u64) -> Option<heapless::String<64>> {
+        self.execute_next_on_at(0, current_tick)
+    }
+
+    /// Dispatch onto `apic_id`'s private running slot.
+    pub fn execute_next_on(&self, apic_id: u32) -> Option<heapless::String<64>> {
+        self.execute_next_on_at(apic_id, 0)
+    }
+
+    pub fn execute_next_on_at(
+        &self,
+        apic_id: u32,
+        current_tick: u64,
+    ) -> Option<heapless::String<64>> {
+        let idx = Self::slot(apic_id)?;
+        {
+            let running = self.running[idx].lock();
+            if running.is_some() {
+                return None;
+            }
         }
-        // sort_unstable keeps highest-priority at index 0; swap_remove(0) pops it.
-        let task = self.queue.swap_remove(0);
+
+        let task = {
+            let mut ready = self.ready.lock();
+            if ready.tasks.is_empty() {
+                return None;
+            }
+            ready.tasks.swap_remove(0)
+        };
         let id = task.object_id.clone();
-        self.running = Some(RunningTask {
+        *self.running[idx].lock() = Some(RunningTask {
             task,
             started_at_tick: current_tick,
         });
         Some(id)
     }
 
-    /// Called on every timer tick.  If the running task has consumed its full
-    /// time slice, evict it and dispatch the next queued task.
-    ///
-    /// Returns `Some(id)` when a context switch occurred (new task dispatched),
-    /// `None` when no switch was needed.
-    pub fn preempt_if_expired(&mut self, current_tick: u64) -> Option<heapless::String<64>> {
-        let expired = match &self.running {
-            Some(rt) => current_tick.wrapping_sub(rt.started_at_tick) >= TICKS_PER_SLICE,
-            None => false,
-        };
-
-        if expired {
-            // If no alternative work is queued, keep running the same task and
-            // just reset its slice start. This avoids pointless evict/requeue
-            // churn and serial-console spam.
-            if self.queue.is_empty() {
-                if let Some(rt) = self.running.as_mut() {
-                    rt.started_at_tick = current_tick;
-                }
-                return None;
-            }
-
-            // Evict the current task.  Re-queue it at the back so it gets
-            // another turn (round-robin within the same priority band).
-            if let Some(rt) = self.running.take() {
-                if self.queue.push(rt.task).is_err() {
-                    // Queue is at capacity — task is dropped.  This should
-                    // not happen in normal operation (MAX_QUEUE_SIZE = 32).
-                    crate::println!("[preempt] WARNING: queue full, task dropped");
-                } else {
-                    self.queue.sort_unstable();
-                }
-            }
-            // Dispatch the next task (if any).
-            self.execute_next_at(current_tick)
-        } else {
-            None
-        }
+    /// Preempt BSP slot 0 if its slice expired.
+    pub fn preempt_if_expired(&self, current_tick: u64) -> Option<heapless::String<64>> {
+        self.preempt_if_expired_on(0, current_tick)
     }
 
-    /// Complete (retire) the currently running task without re-queuing it.
-    pub fn complete_running(&mut self) {
-        if let Some(rt) = self.running.take() {
+    /// Preempt `apic_id`'s running task if its slice expired.
+    pub fn preempt_if_expired_on(
+        &self,
+        apic_id: u32,
+        current_tick: u64,
+    ) -> Option<heapless::String<64>> {
+        let idx = Self::slot(apic_id)?;
+        let expired = {
+            let running = self.running[idx].lock();
+            match &*running {
+                Some(rt) => current_tick.wrapping_sub(rt.started_at_tick) >= TICKS_PER_SLICE,
+                None => false,
+            }
+        };
+        if !expired {
+            return None;
+        }
+
+        let queue_empty = self.ready.lock().tasks.is_empty();
+        if queue_empty {
+            if let Some(rt) = self.running[idx].lock().as_mut() {
+                rt.started_at_tick = current_tick;
+            }
+            return None;
+        }
+
+        if let Some(rt) = self.running[idx].lock().take() {
+            let mut ready = self.ready.lock();
+            if ready.tasks.push(rt.task).is_err() {
+                crate::println!("[preempt] WARNING: queue full, task dropped");
+            } else {
+                ready.tasks.sort_unstable();
+            }
+        }
+        self.execute_next_on_at(apic_id, current_tick)
+    }
+
+    /// Complete (retire) the BSP running task without re-queuing it.
+    pub fn complete_running(&self) {
+        self.complete_running_on(0);
+    }
+
+    /// Complete the task in `apic_id`'s running slot.
+    pub fn complete_running_on(&self, apic_id: u32) {
+        let Some(idx) = Self::slot(apic_id) else {
+            return;
+        };
+        if let Some(rt) = self.running[idx].lock().take() {
             crate::println!("Completed: {}", rt.task.object_id);
         }
     }
 
-    /// Read-only view of the currently running task (if any).
-    pub fn running_task(&self) -> Option<&RunningTask> {
-        self.running.as_ref()
+    /// Yield the running task on `apic_id` back onto the ready queue.
+    ///
+    /// Returns the yielded object id when a task was running.
+    pub fn yield_running_on(&self, apic_id: u32) -> Option<heapless::String<64>> {
+        let idx = Self::slot(apic_id)?;
+        let rt = self.running[idx].lock().take()?;
+        let id = rt.task.object_id.clone();
+        {
+            let mut ready = self.ready.lock();
+            if ready.tasks.push(rt.task).is_err() {
+                crate::println!("[yield] WARNING: queue full, task dropped");
+            } else {
+                ready.tasks.sort_unstable();
+            }
+        }
+        crate::println!("Yielded: {}", id);
+        Some(id)
+    }
+
+    /// Remove a specific queued task by object id and mark it running on `apic_id`.
+    pub fn take_queued_by_id(
+        &self,
+        object_id: &str,
+        current_tick: u64,
+        apic_id: u32,
+    ) -> Option<heapless::String<64>> {
+        let idx = Self::slot(apic_id)?;
+        {
+            let running = self.running[idx].lock();
+            if running.is_some() {
+                return None;
+            }
+        }
+
+        let task = {
+            let mut ready = self.ready.lock();
+            let pos = ready
+                .tasks
+                .iter()
+                .position(|t| t.object_id.as_str() == object_id)?;
+            ready.tasks.remove(pos)
+        };
+        let id = task.object_id.clone();
+        *self.running[idx].lock() = Some(RunningTask {
+            task,
+            started_at_tick: current_tick,
+        });
+        Some(id)
+    }
+
+    /// BSP running task (slot 0), for console / legacy callers.
+    pub fn running_task(&self) -> Option<RunningTask> {
+        self.running_task_on(0)
+    }
+
+    /// Snapshot of the task running on `apic_id`, if any.
+    pub fn running_task_on(&self, apic_id: u32) -> Option<RunningTask> {
+        let idx = Self::slot(apic_id)?;
+        self.running[idx].lock().clone()
+    }
+
+    /// Bitmask of cores that currently hold a running task.
+    pub fn running_mask(&self) -> u64 {
+        let mut mask = 0u64;
+        for (i, slot) in self.running.iter().enumerate() {
+            if slot.lock().is_some() {
+                mask |= 1u64 << i;
+            }
+        }
+        mask
+    }
+
+    /// How many cores currently hold a running task.
+    pub fn running_count(&self) -> usize {
+        self.running_mask().count_ones() as usize
     }
 
     pub fn queue_size(&self) -> usize {
-        self.queue.len()
+        self.ready.lock().tasks.len()
+    }
+
+    /// Reset ready queue and all running slots (host tests / Kernel::new).
+    pub fn clear(&self) {
+        self.ready.lock().tasks.clear();
+        for slot in self.running.iter() {
+            *slot.lock() = None;
+        }
     }
 
     fn intent_to_priority(intent: &str) -> u8 {
@@ -176,7 +319,7 @@ mod tests {
 
     #[test]
     fn schedule_single_task_and_execute() {
-        let mut sched = Scheduler::new();
+        let sched = Scheduler::new();
         sched.schedule(&make_obj("worker", "normal"));
         assert_eq!(sched.queue_size(), 1);
         let id = sched.execute_next();
@@ -186,19 +329,17 @@ mod tests {
 
     #[test]
     fn execute_next_on_empty_queue_returns_none() {
-        let mut sched = Scheduler::new();
+        let sched = Scheduler::new();
         assert!(sched.execute_next().is_none());
     }
 
     #[test]
     fn high_priority_task_executes_before_low_priority() {
-        let mut sched = Scheduler::new();
+        let sched = Scheduler::new();
         sched.schedule(&make_obj("slow", "energy_saving")); // priority 2
         sched.schedule(&make_obj("fast", "low_latency")); // priority 10
         sched.schedule(&make_obj("mid", "normal")); // priority 5
 
-        // complete_running() clears the running slot so execute_next()
-        // can dispatch the next task without overwriting the previous one.
         let first = sched.execute_next().unwrap();
         sched.complete_running();
         let second = sched.execute_next().unwrap();
@@ -229,7 +370,7 @@ mod tests {
 
     #[test]
     fn queue_size_reflects_scheduled_tasks() {
-        let mut sched = Scheduler::new();
+        let sched = Scheduler::new();
         assert_eq!(sched.queue_size(), 0);
         sched.schedule(&make_obj("a", "batch"));
         assert_eq!(sched.queue_size(), 1);
@@ -243,44 +384,37 @@ mod tests {
     // Preemptive scheduling tests
     // -----------------------------------------------------------------------
 
-    /// After dispatch, `running_task` is populated and the queue shrinks.
     #[test]
     fn execute_next_at_sets_running_task() {
-        let mut sched = Scheduler::new();
+        let sched = Scheduler::new();
         sched.schedule(&make_obj("worker", "normal"));
 
         let id = sched.execute_next_at(0).unwrap();
         assert!(!id.is_empty());
-        // Queue is now empty — task moved to running slot.
         assert_eq!(sched.queue_size(), 0);
-        // running_task reflects the dispatched task.
         let rt = sched.running_task().unwrap();
         assert_eq!(rt.task.object_id.as_str(), id.as_str());
         assert_eq!(rt.started_at_tick, 0);
     }
 
-    /// Ticks before the slice expires must NOT trigger a preemption.
     #[test]
     fn preempt_does_not_fire_before_slice_expires() {
-        let mut sched = Scheduler::new();
+        let sched = Scheduler::new();
         sched.schedule(&make_obj("a", "normal"));
         sched.schedule(&make_obj("b", "normal"));
         let first_id = sched.execute_next_at(0).unwrap();
 
-        // Tick just before the boundary — no switch expected.
         let switched = sched.preempt_if_expired(TICKS_PER_SLICE - 1);
         assert!(switched.is_none(), "preemption fired too early");
-        // Same task still running.
         assert_eq!(
             sched.running_task().unwrap().task.object_id.as_str(),
             first_id.as_str()
         );
     }
 
-    /// Exactly at the slice boundary the running task must be evicted.
     #[test]
     fn preempt_fires_exactly_at_slice_boundary() {
-        let mut sched = Scheduler::new();
+        let sched = Scheduler::new();
         sched.schedule(&make_obj("a", "normal"));
         sched.schedule(&make_obj("b", "normal"));
         let first_id = sched.execute_next_at(0).unwrap();
@@ -295,47 +429,36 @@ mod tests {
         );
     }
 
-    /// After eviction the old task is re-queued (not lost).
     #[test]
     fn preempted_task_is_requeued() {
-        let mut sched = Scheduler::new();
+        let sched = Scheduler::new();
         sched.schedule(&make_obj("a", "normal"));
         sched.schedule(&make_obj("b", "normal"));
         let first_id = sched.execute_next_at(0).unwrap();
 
-        // Trigger preemption — "a" should be re-queued, "b" dispatched.
         sched.preempt_if_expired(TICKS_PER_SLICE);
 
-        // The scheduler now has "a" back in the queue (b is running).
-        // Trigger another preemption — "b" evicted, "a" dispatched again.
         let second_switch = sched.preempt_if_expired(TICKS_PER_SLICE * 2);
         assert!(second_switch.is_some());
-        // The newly running task should be "a" again (round-robin).
         let rt = sched.running_task().unwrap();
         assert_eq!(rt.task.object_id.as_str(), first_id.as_str());
     }
 
-    /// No running task → `preempt_if_expired` must be a no-op.
     #[test]
     fn preempt_with_no_running_task_is_noop() {
-        let mut sched = Scheduler::new();
-        // Queue a task but don't dispatch it.
+        let sched = Scheduler::new();
         sched.schedule(&make_obj("idle", "batch"));
         let result = sched.preempt_if_expired(TICKS_PER_SLICE + 1);
         assert!(result.is_none());
-        // Task still sits in the queue untouched.
         assert_eq!(sched.queue_size(), 1);
     }
 
-    /// If the queue is empty when preemption fires, the sole task is
-    /// kept running and its slice boundary is refreshed.
     #[test]
     fn preempt_with_single_task_refreshes_slice_without_switch() {
-        let mut sched = Scheduler::new();
+        let sched = Scheduler::new();
         sched.schedule(&make_obj("solo", "normal"));
         let first_id = sched.execute_next_at(0).unwrap();
 
-        // Only one task exists — no context switch should occur.
         let switched = sched.preempt_if_expired(TICKS_PER_SLICE);
         assert!(switched.is_none(), "sole task should keep running");
         assert!(sched.running_task().is_some());
@@ -346,68 +469,79 @@ mod tests {
         assert_eq!(sched.queue_size(), 0);
     }
 
-    /// `complete_running` retires the task without re-queuing it.
     #[test]
     fn complete_running_clears_running_slot() {
-        let mut sched = Scheduler::new();
+        let sched = Scheduler::new();
         sched.schedule(&make_obj("done", "normal"));
         sched.execute_next_at(100);
         assert!(sched.running_task().is_some());
 
         sched.complete_running();
         assert!(sched.running_task().is_none());
-        // Task must NOT be re-queued.
         assert_eq!(sched.queue_size(), 0);
     }
 
-    /// `complete_running` on an idle scheduler is a safe no-op.
     #[test]
     fn complete_running_when_idle_is_noop() {
-        let mut sched = Scheduler::new();
-        sched.complete_running(); // must not panic
+        let sched = Scheduler::new();
+        sched.complete_running();
         assert!(sched.running_task().is_none());
     }
 
-    /// Preemption uses wrapping subtraction — tick counter rollover is safe.
     #[test]
     fn preempt_handles_tick_counter_wraparound() {
-        let mut sched = Scheduler::new();
+        let sched = Scheduler::new();
         sched.schedule(&make_obj("wrap-a", "normal"));
         sched.schedule(&make_obj("wrap-b", "normal"));
 
-        // Dispatch at a tick very close to u64::MAX.
         let start = u64::MAX - (TICKS_PER_SLICE / 2);
         sched.execute_next_at(start);
 
-        // A tick just before the (wrapped) boundary — no preemption.
         let before = start.wrapping_add(TICKS_PER_SLICE - 1);
         assert!(sched.preempt_if_expired(before).is_none());
 
-        // A tick at the wrapped boundary — preemption fires.
         let at_boundary = start.wrapping_add(TICKS_PER_SLICE);
         assert!(sched.preempt_if_expired(at_boundary).is_some());
     }
 
-    /// Higher-priority task in the queue takes over when a lower-priority
-    /// task is preempted (priority order is preserved after re-queue).
     #[test]
     fn preempt_dispatches_highest_priority_next() {
-        let mut sched = Scheduler::new();
-        // Schedule a low-priority task first so it gets dispatched.
+        let sched = Scheduler::new();
         sched.schedule(&make_obj("low", "energy_saving")); // priority 2
-                                                           // Then add a high-priority one to the queue.
         sched.schedule(&make_obj("high", "low_latency")); // priority 10
 
-        // Dispatch — "high" has higher priority, gets the CPU first.
         let first = sched.execute_next_at(0).unwrap();
-        // "low" is waiting in the queue.
         assert_eq!(sched.queue_size(), 1);
 
-        // Preempt "high" → it is re-queued; "low" is next but "high"
-        // re-queues at priority 10, so "high" should win again.
         let switched = sched.preempt_if_expired(TICKS_PER_SLICE).unwrap();
-        // The newly running task must still be the high-priority one
-        // (it was re-queued at its original priority 10 > 2).
         assert_eq!(switched.as_str(), first.as_str());
+    }
+
+    #[test]
+    fn two_cores_can_run_tasks_in_parallel_slots() {
+        let sched = Scheduler::new();
+        let a = make_obj("a", "normal");
+        let b = make_obj("b", "normal");
+        let id_a = a.id.clone();
+        let id_b = b.id.clone();
+        sched.schedule(&a);
+        sched.schedule(&b);
+
+        let got0 = sched
+            .take_queued_by_id(id_a.as_str(), 0, 0)
+            .expect("core 0 should take a");
+        let got1 = sched
+            .take_queued_by_id(id_b.as_str(), 0, 1)
+            .expect("core 1 should take b while 0 still running");
+        assert_eq!(got0.as_str(), id_a.as_str());
+        assert_eq!(got1.as_str(), id_b.as_str());
+        assert_eq!(sched.running_count(), 2);
+        assert_eq!(sched.running_mask() & 0b11, 0b11);
+        assert!(sched.running_task_on(0).is_some());
+        assert!(sched.running_task_on(1).is_some());
+
+        sched.complete_running_on(0);
+        sched.complete_running_on(1);
+        assert_eq!(sched.running_count(), 0);
     }
 }

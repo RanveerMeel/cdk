@@ -1,5 +1,5 @@
-use heapless::String;
 use core::str::FromStr;
+use heapless::String;
 
 const MAX_PAYLOAD_LEN: usize = 64;
 const MAX_ID_LEN: usize = 64;
@@ -17,21 +17,17 @@ pub enum MessagePayload {
     Data(heapless::Vec<u8, MAX_PAYLOAD_LEN>),
     Text(String<MAX_TEXT_LEN>),
     Command(String<MAX_TEXT_LEN>),
-    Request { 
-        method: String<MAX_TEXT_LEN>, 
-        params: heapless::Vec<String<MAX_TEXT_LEN>, 8> 
+    Request {
+        method: String<MAX_TEXT_LEN>,
+        params: heapless::Vec<String<MAX_TEXT_LEN>, 8>,
     },
-    Response { 
-        result: String<MAX_TEXT_LEN> 
+    Response {
+        result: String<MAX_TEXT_LEN>,
     },
 }
 
 impl Message {
-    pub fn new(
-        from: &str,
-        to: &str,
-        payload: MessagePayload,
-    ) -> Result<Self, ()> {
+    pub fn new(from: &str, to: &str, payload: MessagePayload) -> Result<Self, ()> {
         Ok(Self {
             from: String::from_str(from).map_err(|_| ())?,
             to: String::from_str(to).map_err(|_| ())?,
@@ -105,7 +101,9 @@ mod tests {
         let msg = Message::new(
             "srv",
             "cli",
-            MessagePayload::Response { result: String::from_str("ok").unwrap() },
+            MessagePayload::Response {
+                result: String::from_str("ok").unwrap(),
+            },
         )
         .unwrap();
         match &msg.payload {
