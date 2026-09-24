@@ -141,6 +141,10 @@ const COMMANDS: &[&str] = &[
     "capsign",
     "capverify",
     "issuer",
+    "audit",
+    "audit-verify",
+    "audit-checkpoint",
+    "audit-demo-tamper",
     "vmmap",
     "vmunmap",
     "vmtranslate",
@@ -609,6 +613,10 @@ fn dispatch(
         "capsign" => cmd_capsign(arg1, kernel),
         "capverify" => cmd_capverify(arg1, kernel),
         "issuer" => cmd_issuer(),
+        "audit" => cmd_audit(arg1),
+        "audit-verify" => cmd_audit_verify(),
+        "audit-checkpoint" => cmd_audit_checkpoint(),
+        "audit-demo-tamper" => cmd_audit_demo_tamper(arg1),
         "vmmap" => cmd_vmmap(arg1, arg2, arg3, page_table, frame_alloc, kernel),
         "vmunmap" => cmd_vmunmap(arg1, page_table, kernel),
         "vmtranslate" => cmd_vmtranslate(arg1, page_table),
@@ -703,6 +711,10 @@ fn cmd_help() {
     crate::println!("  capsign <id>      Issue a hybrid PQ-signed capability for <id> and verify it");
     crate::println!("  capverify <id>    Show that unsigned, forged, and tampered tokens are rejected");
     crate::println!("  issuer            Show the kernel capability issuer (Ed25519+ML-DSA-65)");
+    crate::println!("  audit [n]         Show the last n audit records (default 12)");
+    crate::println!("  audit-verify      Verify the audit hash chain and signed checkpoints");
+    crate::println!("  audit-checkpoint  Sign a checkpoint over the audit log now");
+    crate::println!("  audit-demo-tamper <seq>  DEMO: corrupt one record to show detection");
     crate::println!("  heapinfo          Kernel heap usage (total / used / free)");
     crate::println!("  frames            Physical frame allocator summary");
     crate::println!("  palloc            Allocate one physical frame, print address");
@@ -1161,6 +1173,98 @@ fn cmd_issuer() {
         crate::issuer::crypto_stack::high_water().div_ceil(1024),
         crate::issuer::crypto_stack::SIZE / 1024
     );
+}
+
+fn cmd_audit(n_str: &str) {
+    let n = if n_str.is_empty() {
+        12
+    } else {
+        match parse_u32(n_str) {
+            Some(n) => n as usize,
+            None => {
+                crate::println!("Usage: audit [n]");
+                return;
+            }
+        }
+    };
+    crate::audit::with_log(|log| {
+        crate::println!("SEQ    TSC(M)    EVENT         SUBJECT          DETAIL   HASH");
+        let skip = log.records().len().saturating_sub(n);
+        for r in log.records().skip(skip) {
+            crate::print!(
+                "{:<6} {:<9} {:<13} {:<16} ",
+                r.seq,
+                r.tsc / 1_000_000,
+                r.kind.name(),
+                r.subject.as_str()
+            );
+            if r.kind == crate::audit::EventKind::ProcessSpawned {
+                crate::print!("{:#x} ", r.detail);
+            } else {
+                crate::print!("{:<8} ", r.detail);
+            }
+            print_hex(&r.hash[..6]);
+            crate::println!();
+        }
+        let ckpt = log.checkpoints().last().map(|c| c.seq);
+        match ckpt {
+            Some(seq) => crate::println!(
+                "next_seq={} latest signed checkpoint covers seq {}",
+                log.next_seq(),
+                seq
+            ),
+            None => crate::println!("next_seq={} no signed checkpoint yet", log.next_seq()),
+        }
+    });
+}
+
+fn cmd_audit_verify() {
+    match crate::audit::verify() {
+        Ok(r) => {
+            crate::println!(
+                "audit: OK — {} records (seq {}..{}), {} evicted, {} checkpoint(s) valid",
+                r.records,
+                r.first_seq.unwrap_or(0),
+                r.last_seq.unwrap_or(0),
+                r.evicted,
+                r.checkpoints
+            );
+            match r.latest_checkpoint {
+                Some(seq) => crate::println!(
+                    "       signed through seq {}; {} newer record(s) hash-chained only",
+                    seq,
+                    r.unsigned_tail
+                ),
+                None => crate::println!("       no signed checkpoint yet (run audit-checkpoint)"),
+            }
+        }
+        Err(e) => crate::println!("audit: TAMPERING DETECTED — {:?}", e),
+    }
+}
+
+fn cmd_audit_checkpoint() {
+    match crate::audit::checkpoint_now() {
+        Some(seq) => crate::println!(
+            "audit: checkpoint signed (Ed25519+ML-DSA-65) through seq {}",
+            seq
+        ),
+        None => crate::println!("audit: log is empty"),
+    }
+}
+
+fn cmd_audit_demo_tamper(seq_str: &str) {
+    let Some(seq) = parse_u32(seq_str) else {
+        crate::println!("Usage: audit-demo-tamper <seq>");
+        return;
+    };
+    if crate::audit::demo_tamper(seq as u64) {
+        crate::println!(
+            "audit: DEMO — flipped one bit in record {} (hashes untouched); run audit-verify",
+            seq
+        );
+    } else {
+        crate::println!("audit: record {} is not retained", seq);
+    }
 }
 
 fn print_hex(bytes: &[u8]) {

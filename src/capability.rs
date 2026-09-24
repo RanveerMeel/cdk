@@ -31,7 +31,7 @@ use heapless::String;
 
 use sha2::{Digest, Sha256};
 
-use crate::issuer::{self, HybridSignature, Issuer, IssuerId, IssuerPublic};
+use crate::issuer::{self, HybridSignature, Issuer, IssuerId, IssuerPublic, SigDomain};
 
 const MAX_PERMISSIONS: usize = 16;
 const MAX_ID_LEN: usize = 64;
@@ -131,11 +131,18 @@ impl Capability {
     // Issuance
     // -----------------------------------------------------------------------
 
-    /// Sign this capability with the kernel issuer.
+    /// Sign this capability with the kernel issuer and record it in the
+    /// audit log.
     ///
     /// Calling this again replaces the previous proof.
     pub fn issue(&mut self) -> Result<(), CapabilityError> {
-        self.issue_with(issuer::kernel())
+        self.issue_with(issuer::kernel())?;
+        crate::audit::record(
+            crate::audit::EventKind::CapIssued,
+            &self.object_id,
+            self.permission_mask(),
+        );
+        Ok(())
     }
 
     /// Sign this capability with a specific issuer.
@@ -146,7 +153,7 @@ impl Capability {
             format: TOKEN_FORMAT_V1,
             algorithm,
             issuer_id: *issuer.id(),
-            signature: issuer.sign(&digest),
+            signature: issuer.sign(SigDomain::Capability, &digest),
         });
         Ok(())
     }
@@ -167,12 +174,16 @@ impl Capability {
     /// names another issuer or an unsupported format.
     pub fn verify(&self) -> Result<bool, CapabilityError> {
         let kernel = issuer::kernel();
-        self.verify_by(kernel.id(), |digest, sig| kernel.verify(digest, sig))
+        self.verify_by(kernel.id(), |digest, sig| {
+            kernel.verify(SigDomain::Capability, digest, sig)
+        })
     }
 
     /// Verify the token against an explicitly trusted issuer public key.
     pub fn verify_with(&self, issuer: &IssuerPublic) -> Result<bool, CapabilityError> {
-        self.verify_by(&issuer.id, |digest, sig| issuer.verify(digest, sig))
+        self.verify_by(&issuer.id, |digest, sig| {
+            issuer.verify(SigDomain::Capability, digest, sig)
+        })
     }
 
     fn verify_by(
@@ -196,6 +207,13 @@ impl Capability {
     // -----------------------------------------------------------------------
     // Permission management
     // -----------------------------------------------------------------------
+
+    /// Bitmask of held permissions (bit = permission tag), for audit records.
+    pub fn permission_mask(&self) -> u64 {
+        self.permissions
+            .iter()
+            .fold(0u64, |mask, p| mask | (1u64 << p.tag()))
+    }
 
     pub fn has_permission(&self, perm: &Permission) -> bool {
         self.permissions.contains(perm)

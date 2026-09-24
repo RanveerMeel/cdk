@@ -141,7 +141,9 @@ impl Kernel {
     /// Returns `Ok(true)` when valid, `Ok(false)` when unsigned or the
     /// signature does not verify, `Err` for a foreign issuer or unknown format.
     pub fn verify_capability(cap: &Capability) -> Result<bool, CapabilityError> {
-        cap.verify()
+        let result = cap.verify();
+        Self::audit_verification(cap, &result);
+        result
     }
 
     pub fn execute(&mut self, cap: &Capability) -> KernelResult<()> {
@@ -842,11 +844,32 @@ impl Kernel {
     /// [`KernelError::InvalidSignature`]. Privileged kernel entry points call
     /// this before checking permissions or looking up objects.
     fn check_signature(cap: &Capability) -> KernelResult<()> {
-        match cap.verify() {
+        let result = cap.verify();
+        Self::audit_verification(cap, &result);
+        match result {
             Ok(true) => Ok(()),
             Ok(false) => Err(KernelError::InvalidSignature),
             Err(_) => Err(KernelError::InvalidSignature),
         }
+    }
+
+    /// Record the outcome of a capability check in the audit log.
+    fn audit_verification(cap: &Capability, result: &Result<bool, CapabilityError>) {
+        use crate::audit::{reject_reason, EventKind};
+        let (kind, detail) = match result {
+            Ok(true) => (EventKind::CapAccepted, cap.permission_mask()),
+            Ok(false) => (EventKind::CapRejected, reject_reason::INVALID_SIGNATURE),
+            Err(CapabilityError::UnknownIssuer) => {
+                (EventKind::CapRejected, reject_reason::UNKNOWN_ISSUER)
+            }
+            Err(CapabilityError::UnsupportedFormat) => {
+                (EventKind::CapRejected, reject_reason::UNSUPPORTED_FORMAT)
+            }
+            Err(CapabilityError::PermissionSetFull) => {
+                (EventKind::CapRejected, reject_reason::INVALID_SIGNATURE)
+            }
+        };
+        crate::audit::record(kind, &cap.object_id, detail);
     }
 
     fn map_net_error(_err: NetError) -> KernelError {

@@ -154,6 +154,25 @@ Pixel-level text renderer that displays kernel output directly on the QEMU graph
 
 Boot sequence: serial init → **framebuffer init** → interrupts → frame allocator → heap → page tables → console.
 
+### Audit Log (`src/audit.rs`)
+
+A tamper-evident record of security-relevant events: capability issuance (`cap-issued`), every capability check (`cap-accepted`, or `cap-rejected` with a reason code: 1 invalid signature, 2 unknown issuer, 3 unsupported format), and process `spawned` / `started` / `exited` / `reaped`.
+
+```
+genesis = SHA-256("CDK-AUDIT-GENESIS-v1" ‖ issuer_id)
+hash[n] = SHA-256("CDK-AUDIT-REC-v1" ‖ hash[n-1] ‖ seq ‖ tsc ‖ kind ‖ u8(len) ‖ subject ‖ detail)
+ckpt    = Ed25519 + ML-DSA-65 over SHA-256("CDK-AUDIT-CKPT-v1" ‖ issuer_id ‖ seq ‖ hash[seq])
+```
+
+| Detail | Value |
+|---|---|
+| Storage | Ring of 1,024 records; when full, the oldest is evicted and its hash becomes the verification anchor |
+| Checkpoints | Signed automatically every 64 records (and on `audit-checkpoint`); last 8 kept |
+| Timestamps | CPU TSC (lock-free, monotonic, not wall-clock) |
+| Signing domain | `SigDomain::AuditCheckpoint` (ML-DSA context `CDK-AUDIT-v1`), so capability signatures can't be replayed as checkpoints |
+
+`audit-verify` recomputes the chain and verifies every checkpoint: edited, deleted, reordered, or truncated records are detected, and code that rewrites the whole chain cannot reproduce the signed checkpoints without the issuer's secret keys. Records after the newest checkpoint are hash-chained only (reported as the unsigned tail). The log and checkpoints currently live only in kernel memory; exporting checkpoints off the machine (roadmap Phase 3) is what makes the log verifiable after a full kernel compromise.
+
 ### Serial Console (`src/console.rs`)
 
 Interactive command loop over COM1. Locks the global `Kernel`, `MemoryGraph`, and `KernelNode` mutexes per command, then releases them.

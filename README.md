@@ -6,14 +6,14 @@ CDK (Cognitive Distributed Kernel) is an open-source, bare-metal Rust kernel for
 
 - **Agents are isolated processes.** An agent can only reach an object, tool, model, or network endpoint if it holds a capability for it.
 - **Capabilities are issued and verified by the kernel**, signed with hybrid **Ed25519 + ML-DSA-65 (FIPS 204)**, so they can't be forged by classical or future quantum attackers.
-- **Every consequential action is provable** through a tamper-evident, signed audit log *(planned)*.
+- **Every consequential action is provable** through a tamper-evident, hash-chained audit log with signed checkpoints.
 - **Humans stay in control:** consequential actions require a human-approval capability, enforced by the kernel *(planned)*.
 
 Heavy AI inference (GPUs, CUDA) runs on Linux next to CDK; CDK is the control plane that decides which agent may use which model and records it. See [ROADMAP.md](ROADMAP.md) for the architecture and milestones.
 
 ## Status
 
-**Early development preview — not for production use.** CDK boots on bare metal (QEMU) with SMP, preemptive scheduling, ring-3 processes in isolated address spaces, and an interactive serial console. The quantum-safe trust core (Phase 1 of the [roadmap](ROADMAP.md)) is being built now: hybrid post-quantum capability tokens are done; the signed audit log is next. Interfaces can still change quickly.
+**Early development preview — not for production use.** CDK boots on bare metal (QEMU) with SMP, preemptive scheduling, ring-3 processes in isolated address spaces, and an interactive serial console. The quantum-safe trust core (Phase 1 of the [roadmap](ROADMAP.md)) is being built now: hybrid post-quantum capability tokens and the signed audit log are done; user-fault containment is next. Interfaces can still change quickly.
 
 ### Editions
 
@@ -26,6 +26,8 @@ CDK is **open core**. This repository — the kernel, the capability model, the 
 **Capability-Based Security** — Every operation requires a capability token issued by the kernel. No global root, no ambient authority.
 
 **Quantum-Safe Capability Tokens** — Tokens are signed by a boot-time kernel issuer with hybrid Ed25519 + ML-DSA-65 (FIPS 204); both must verify, and only the pinned issuer is trusted, so self-signed or tampered tokens are rejected. Post-quantum operations run on a dedicated 512 KiB crypto stack. Console: `issuer`, `capsign`, `capverify`.
+
+**Tamper-Evident Audit Log** — Capability issuance, every capability check (accepted or rejected, with reason), and process spawn/start/exit/reap are appended to a SHA-256 hash chain bound to the kernel issuer. Every 64 records the issuer signs the chain head (Ed25519 + ML-DSA-65). Editing, deleting, reordering, or truncating records is detected, and rewriting the whole chain cannot reproduce the signed checkpoints. Console: `audit`, `audit-verify`, `audit-checkpoint`.
 
 **Message-Passing IPC** — Objects communicate via typed messages (Data, Text, Command, Request/Response) through per-object queues.
 
@@ -178,6 +180,13 @@ cargo check --features virtio-hw
 | `ps` | List processes (Ready / Running / Zombie) |
 | `reap <pid>` | Free a `Ready`/`Zombie` process and its address space |
 | `user-smoke` | Minimal ring-3 round trip (enter, `SYS_exit`, return) |
+| `issuer` | Kernel capability issuer: id, algorithms, entropy source, crypto-stack peak |
+| `capsign <id>` | Issue a hybrid post-quantum capability for an object and verify it |
+| `capverify <id>` | Show unsigned, forged, and escalated tokens being rejected |
+| `audit [n]` | Last *n* audit records (default 12) |
+| `audit-verify` | Verify the audit hash chain and every signed checkpoint |
+| `audit-checkpoint` | Sign a checkpoint over the log now |
+| `audit-demo-tamper <seq>` | Demo only: corrupt one record so `audit-verify` can show detection |
 | `send <id> <text>` | Send a text message to an object |
 | `recv <id>` | Pop next message from an object |
 | `delete <id>` | Remove an object |
@@ -264,6 +273,7 @@ The full plan — phases, milestones, and editions — is in [ROADMAP.md](ROADMA
 - [x] Kernel heap allocator (`#[global_allocator]`, linked-list, 2 MiB reserved at boot)
 - [x] Ed25519 capability signing (RDRAND on bare-metal, OsRng on host; SHA-256 message digest)
 - [x] Issuer-bound hybrid post-quantum capability tokens (Ed25519 + ML-DSA-65, format v1) — roadmap milestone 1.1
+- [x] Tamper-evident audit log with hybrid-signed checkpoints — roadmap milestone 1.2
 - [x] Framebuffer text rendering (8×16 bitmap font, RGB/BGR/U8 pixel formats, auto-scroll)
 - [x] Network stack integration (loopback interfaces, capability-gated send/recv, object bridge routing, bindings, pump telemetry)
 - [x] External network transport (virtio-net MMIO bring-up path + non-loopback external interfaces via `eth0` default external backend and adapter-based transports)

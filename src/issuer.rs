@@ -14,8 +14,11 @@
 //! ML-DSA, and an undiscovered flaw in the newer lattice scheme would not
 //! break Ed25519.
 //!
-//! Both signatures are deterministic, and the ML-DSA signature is bound to
-//! CDK capability tokens by the FIPS 204 context string [`MLDSA_CONTEXT`].
+//! Both signatures are deterministic. Every signature is made for one
+//! [`SigDomain`] (capability tokens, audit checkpoints, ...): the ML-DSA half
+//! carries the domain's FIPS 204 context string and callers prefix their
+//! digests per domain, so a signature from one domain never verifies in
+//! another.
 //!
 //! ## Crypto stack
 //!
@@ -44,10 +47,26 @@ pub const MLDSA65_SIG_LEN: usize = 3309;
 pub const MLDSA65_KEY_LEN: usize = 1952;
 pub const ISSUER_ID_LEN: usize = 16;
 
-/// FIPS 204 context string: an ML-DSA signature made for a CDK capability
-/// token can never be replayed as a signature for anything else.
-pub const MLDSA_CONTEXT: &[u8] = b"CDK-CAP-v1";
 const ISSUER_ID_DOMAIN: &[u8] = b"CDK-ISSUER-v1";
+
+/// What a signature is for. Each domain has its own FIPS 204 context string.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SigDomain {
+    /// Capability token proofs.
+    Capability,
+    /// Audit-log checkpoints.
+    AuditCheckpoint,
+}
+
+impl SigDomain {
+    /// FIPS 204 context string for the ML-DSA half.
+    pub const fn mldsa_context(self) -> &'static [u8] {
+        match self {
+            SigDomain::Capability => b"CDK-CAP-v1",
+            SigDomain::AuditCheckpoint => b"CDK-AUDIT-v1",
+        }
+    }
+}
 
 /// Short, stable fingerprint of an issuer's public keys.
 pub type IssuerId = [u8; ISSUER_ID_LEN];
@@ -79,13 +98,13 @@ impl IssuerPublic {
     ///
     /// Decodes the ML-DSA key on every call; the kernel's own issuer uses
     /// [`Issuer::verify`], which reuses a pre-decoded key.
-    pub fn verify(&self, digest: &[u8; 32], sig: &HybridSignature) -> bool {
+    pub fn verify(&self, domain: SigDomain, digest: &[u8; 32], sig: &HybridSignature) -> bool {
         crypto_stack::run(|| {
             let Ok(ml_key) = EncodedVerifyingKey::<MlDsa65>::try_from(&self.mldsa65[..]) else {
                 return false;
             };
             let ml_vk = ml_dsa::VerifyingKey::<MlDsa65>::decode(&ml_key);
-            verify_ed25519(&self.ed25519, digest, sig) && verify_mldsa(&ml_vk, digest, sig)
+            verify_ed25519(&self.ed25519, digest, sig) && verify_mldsa(&ml_vk, domain, digest, sig)
         })
     }
 }
@@ -156,17 +175,17 @@ impl Issuer {
         self.entropy
     }
 
-    /// Hybrid-sign a 32-byte message digest (deterministic).
-    pub fn sign(&self, digest: &[u8; 32]) -> HybridSignature {
-        crypto_stack::run(|| self.sign_inner(digest))
+    /// Hybrid-sign a 32-byte message digest for `domain` (deterministic).
+    pub fn sign(&self, domain: SigDomain, digest: &[u8; 32]) -> HybridSignature {
+        crypto_stack::run(|| self.sign_inner(domain, digest))
     }
 
-    fn sign_inner(&self, digest: &[u8; 32]) -> HybridSignature {
+    fn sign_inner(&self, domain: SigDomain, digest: &[u8; 32]) -> HybridSignature {
         let ed = self.ed.sign(digest).to_bytes();
         let ml = self
             .ml
             .expanded_key()
-            .sign_deterministic(digest, MLDSA_CONTEXT)
+            .sign_deterministic(digest, domain.mldsa_context())
             .expect("context string is under 255 bytes");
         let mut mldsa65 = Box::new([0u8; MLDSA65_SIG_LEN]);
         mldsa65.copy_from_slice(&ml.encode());
@@ -176,11 +195,11 @@ impl Issuer {
         }
     }
 
-    /// Verify a hybrid signature made by this issuer.
-    pub fn verify(&self, digest: &[u8; 32], sig: &HybridSignature) -> bool {
+    /// Verify a hybrid signature made by this issuer for `domain`.
+    pub fn verify(&self, domain: SigDomain, digest: &[u8; 32], sig: &HybridSignature) -> bool {
         crypto_stack::run(|| {
             verify_ed25519(&self.public.ed25519, digest, sig)
-                && verify_mldsa(&self.ml_vk, digest, sig)
+                && verify_mldsa(&self.ml_vk, domain, digest, sig)
         })
     }
 }
@@ -196,6 +215,7 @@ fn verify_ed25519(key: &[u8; ED25519_KEY_LEN], digest: &[u8; 32], sig: &HybridSi
 
 fn verify_mldsa(
     vk: &ml_dsa::VerifyingKey<MlDsa65>,
+    domain: SigDomain,
     digest: &[u8; 32],
     sig: &HybridSignature,
 ) -> bool {
@@ -205,7 +225,7 @@ fn verify_mldsa(
     let Some(sig) = ml_dsa::Signature::<MlDsa65>::decode(&enc) else {
         return false;
     };
-    vk.verify_with_context(digest, MLDSA_CONTEXT, &sig)
+    vk.verify_with_context(digest, domain.mldsa_context(), &sig)
 }
 
 /// `SHA-256("CDK-ISSUER-v1" ‖ ed25519_pub ‖ mldsa65_pub)[..16]`.
@@ -357,59 +377,69 @@ mod tests {
     }
 
     const MSG: [u8; 32] = [0x42; 32];
+    const D: SigDomain = SigDomain::Capability;
+
+    #[test]
+    fn signature_does_not_cross_domains() {
+        let i = issuer(9);
+        let sig = i.sign(SigDomain::Capability, &MSG);
+        assert!(i.verify(SigDomain::Capability, &MSG, &sig));
+        assert!(!i.verify(SigDomain::AuditCheckpoint, &MSG, &sig));
+        assert!(!i.public().verify(SigDomain::AuditCheckpoint, &MSG, &sig));
+    }
 
     #[test]
     fn sign_and_verify_roundtrip() {
         let i = issuer(1);
-        let sig = i.sign(&MSG);
-        assert!(i.verify(&MSG, &sig));
-        assert!(i.public().verify(&MSG, &sig));
+        let sig = i.sign(D, &MSG);
+        assert!(i.verify(D, &MSG, &sig));
+        assert!(i.public().verify(D, &MSG, &sig));
     }
 
     #[test]
     fn signatures_are_deterministic() {
         let i = issuer(2);
-        assert!(i.sign(&MSG) == i.sign(&MSG));
+        assert!(i.sign(D, &MSG) == i.sign(D, &MSG));
     }
 
     #[test]
     fn other_issuer_signature_is_rejected() {
         let a = issuer(3);
         let b = issuer(4);
-        let sig = b.sign(&MSG);
-        assert!(!a.verify(&MSG, &sig));
+        let sig = b.sign(D, &MSG);
+        assert!(!a.verify(D, &MSG, &sig));
         assert_ne!(a.id(), b.id());
     }
 
     #[test]
     fn both_halves_are_required() {
         let i = issuer(5);
-        let good = i.sign(&MSG);
+        let good = i.sign(D, &MSG);
 
         let mut bad_ed = good.clone();
         bad_ed.ed25519[0] ^= 1;
-        assert!(!i.verify(&MSG, &bad_ed));
+        assert!(!i.verify(D, &MSG, &bad_ed));
 
         let mut bad_ml = good.clone();
         bad_ml.mldsa65[100] ^= 1;
-        assert!(!i.verify(&MSG, &bad_ml));
+        assert!(!i.verify(D, &MSG, &bad_ml));
 
         // Splice halves from two different issuers.
-        let other = issuer(6).sign(&MSG);
+        let other = issuer(6).sign(D, &MSG);
         let mixed = HybridSignature {
             ed25519: good.ed25519,
             mldsa65: other.mldsa65,
         };
-        assert!(!i.verify(&MSG, &mixed));
+        assert!(!i.verify(D, &MSG, &mixed));
     }
 
     #[test]
     fn wrong_message_is_rejected() {
         let i = issuer(7);
-        let sig = i.sign(&MSG);
+        let sig = i.sign(D, &MSG);
         let mut other = MSG;
         other[31] ^= 1;
-        assert!(!i.verify(&other, &sig));
+        assert!(!i.verify(D, &other, &sig));
     }
 
     #[test]
@@ -425,7 +455,7 @@ mod tests {
     fn key_and_signature_sizes_match_fips_204() {
         let i = issuer(8);
         assert_eq!(i.public().mldsa65.len(), 1952);
-        assert_eq!(i.sign(&MSG).mldsa65.len(), 3309);
+        assert_eq!(i.sign(D, &MSG).mldsa65.len(), 3309);
     }
 
     #[test]

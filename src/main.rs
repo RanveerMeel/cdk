@@ -307,6 +307,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 "Issuer: WARNING — keys derived from insecure fallback RNG; tokens are forgeable. Use a CPU with RDRAND."
             );
         }
+        // Tamper-evident audit log, bound to this issuer.
+        cdk::audit::init();
     }
 
     // Adopt the bootloader page tables (do not replace CR3) and identity-map

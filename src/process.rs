@@ -10,6 +10,7 @@ use heapless::Vec;
 use spin::Mutex;
 
 use crate::allocator::FrameAllocator;
+use crate::audit::{self, EventKind};
 use crate::elf::{self, ElfError};
 use crate::paging::{AddressSpace, PageTableManager};
 
@@ -119,14 +120,14 @@ impl ProcessTable {
     }
 
     /// Current process → `Zombie` with `code`; clears `current`.
-    fn exit_current(&mut self, code: u64) {
-        let Some(pid) = self.current.take() else {
-            return;
-        };
+    /// Returns the pid that exited.
+    fn exit_current(&mut self, code: u64) -> Option<u32> {
+        let pid = self.current.take()?;
         if let Some(idx) = self.find(pid) {
             self.slots[idx].state = ProcessState::Zombie;
             self.slots[idx].exit_code = code;
         }
+        Some(pid)
     }
 
     /// Remove a `Ready` or `Zombie` process, returning it so the caller can
@@ -157,8 +158,11 @@ pub fn spawn_smoke_elf(
     let inserted = TABLE
         .lock()
         .insert(pid, entry, stack_top, aspace.pml4_phys());
-    if inserted.is_err() {
-        aspace.destroy(fa);
+    match inserted {
+        Ok(_) => audit::record_fmt(EventKind::ProcessSpawned, format_args!("pid-{}", pid), entry),
+        Err(_) => {
+            aspace.destroy(fa);
+        }
     }
     inserted
 }
@@ -168,6 +172,7 @@ pub fn spawn_smoke_elf(
 /// The process stays in the table as a `Zombie` until [`reap`]ed.
 pub fn enter(pid: u32) -> Result<u64, ProcessError> {
     let proc = TABLE.lock().start(pid)?;
+    audit::record_fmt(EventKind::ProcessStarted, format_args!("pid-{}", pid), 0);
     // TABLE must not be held here: SYS_exit takes it from the syscall path.
     match crate::syscall::run_user(proc.entry, proc.stack_top, proc.pml4_phys) {
         Ok(code) => Ok(code),
@@ -189,7 +194,10 @@ pub fn current_pid() -> Option<u32> {
 
 /// Called from `SYS_exit`: mark the current process `Zombie`.
 pub fn mark_exit(code: u64) {
-    TABLE.lock().exit_current(code);
+    let exited = TABLE.lock().exit_current(code);
+    if let Some(pid) = exited {
+        audit::record_fmt(EventKind::ProcessExited, format_args!("pid-{}", pid), code);
+    }
 }
 
 /// Free a `Ready` or `Zombie` process's address space and slot.
@@ -198,6 +206,11 @@ pub fn mark_exit(code: u64) {
 pub fn reap(pid: u32, fa: &mut FrameAllocator) -> Result<(u64, usize), ProcessError> {
     let p = TABLE.lock().take_for_reap(pid)?;
     let freed = AddressSpace::from_pml4_phys(p.pml4_phys).destroy(fa);
+    audit::record_fmt(
+        EventKind::ProcessReaped,
+        format_args!("pid-{}", pid),
+        freed as u64,
+    );
     Ok((p.exit_code, freed))
 }
 

@@ -3,6 +3,7 @@
 
 pub mod acpi;
 pub mod allocator;
+pub mod audit;
 pub mod capability;
 pub mod console;
 pub mod context;

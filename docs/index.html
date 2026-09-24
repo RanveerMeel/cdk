@@ -119,7 +119,7 @@
 │ agents = isolated ring-3 processes         │     │ GPU driver + CUDA/... │
 │ hybrid PQ-signed capability tokens         │     │ inference servers     │
 │ policy + human-approval gates     (planned)│     │ MCP tool servers      │
-│ tamper-evident signed audit log   (planned)│     └───────────▲───────────┘
+│ tamper-evident signed audit log            │     └───────────▲───────────┘
 │ PQ-secure channel X25519+ML-KEM   (planned)│◄── virtio-vsock ┘
 └────────────────────────────────────────────┘</code></pre>
         </div>
@@ -141,12 +141,12 @@
                 <li>Hybrid Ed25519 + ML-DSA-65 capability tokens, verified against the pinned kernel issuer</li>
                 <li>Dedicated crypto stack for post-quantum operations</li>
                 <li>Capability-gated IPC and networking</li>
+                <li>Tamper-evident audit log: SHA-256 hash chain with hybrid-signed checkpoints</li>
               </ul>
             </div>
             <div>
               <h3 class="status-head next">Next on the roadmap</h3>
               <ul class="checklist todo">
-                <li>Tamper-evident, signed audit log</li>
                 <li>User-fault containment (a crashing agent can't take down the kernel)</li>
                 <li>Per-agent capability handles and human-approval gates</li>
                 <li>Hybrid X25519 + ML-KEM-768 channel to Linux; MCP gateway</li>
