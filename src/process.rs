@@ -161,6 +161,8 @@ pub struct UserFault {
     pub rip: u64,
     /// Faulting address (`CR2`) for page faults, otherwise 0.
     pub addr: u64,
+    /// User stack pointer at the fault.
+    pub rsp: u64,
 }
 
 impl UserFault {
@@ -825,6 +827,7 @@ mod tests {
             error_code: 4,
             rip: 0x8000400000,
             addr: 0,
+            rsp: 0,
         };
         assert_eq!(t.crash_current(fault), Some(5));
         assert_eq!(t.current, None);
@@ -855,6 +858,7 @@ mod tests {
             error_code: 0,
             rip: 0,
             addr: 0,
+            rsp: 0,
         };
         assert_eq!(f(0).name(), "#DE divide error");
         assert_eq!(f(6).name(), "#UD invalid opcode");

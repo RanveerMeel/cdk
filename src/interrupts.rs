@@ -318,6 +318,7 @@ fn handle_exception(vector: u8, frame: &InterruptStackFrame, error_code: u64, ad
         error_code,
         rip: frame.instruction_pointer.as_u64(),
         addr,
+        rsp: frame.stack_pointer.as_u64(),
     };
     if frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
         crate::syscall::abort_user(fault);

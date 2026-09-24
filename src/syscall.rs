@@ -97,6 +97,19 @@ pub fn abort_user(fault: crate::process::UserFault) -> ! {
         fault.addr,
         fault.error_code
     );
+    // The word at the user stack pointer is usually the return address of
+    // the call that jumped to a bad `rip`; read it through the checked path.
+    let mut top = [0u8; 8];
+    if crate::paging::PageTableManager::from_pml4_phys(current_cr3())
+        .copy_from_user(fault.rsp, &mut top)
+        .is_ok()
+    {
+        crate::println!(
+            "       rsp={:#x} [rsp]={:#x}",
+            fault.rsp,
+            u64::from_le_bytes(top)
+        );
+    }
     if let Some(slot) = resume::take_armed(current_slot()) {
         unsafe { resume::resume(slot, fault.exit_code()) }
     }
