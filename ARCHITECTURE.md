@@ -101,6 +101,21 @@ Manages a single 4-level x86_64 page-table hierarchy (PML4 → PDPT → PD → P
 
 The `FrameSource` trait decouples the walker from the concrete allocator, enabling lightweight mock allocators in host unit tests.
 
+#### User address spaces
+
+`AddressSpace::from_kernel` allocates a private PML4 and copies every present kernel PML4 entry by reference. Because those lower-level tables are shared, writing a user mapping into any of them would leak it into the kernel and every other process. User pages therefore live only in `USER_PML4_SLOT` (slot 1, `USER_BASE = 0x80_0000_0000` .. `USER_TOP`, 512 GiB), which the address space owns outright:
+
+- `map_user` rejects addresses outside the user region or non-user flags.
+- `from_kernel` fails with `UserSlotInUse` if the kernel ever occupies slot 1.
+- `translate_user` / `copy_from_user` require the USER bit at every level and read through the physical-memory map, so syscalls can validate and copy user buffers without faulting.
+- `destroy` frees the user pages, the slot-1 tables, and the PML4.
+
+### User Processes (`src/process.rs`, `src/syscall.rs`, `src/elf.rs`)
+
+Lifecycle: `elf-spawn` loads an ELF into a new address space → `Ready`; `elf-run` → `Running`; `SYS_exit` → `Zombie`; `reap` frees the address space and slot.
+
+`syscall::run_user` saves the caller's callee-saved registers, `RSP`, `RFLAGS` and `CR3` in a per-CPU slot, loads the process `CR3`, and `iretq`s into ring 3. On `SYS_exit` the syscall path restores that context, so `run_user` simply returns the exit code — the console keeps running. Syscalls: `SYS_exit(code)` (1) and `SYS_write(ptr, len)` (2, up to 1024 bytes, returns the byte count or `-1`).
+
 ### Kernel Heap (`src/heap.rs`)
 
 A `linked_list_allocator::Heap` wrapped in a `spin::Mutex`, registered as `#[global_allocator]` on bare-metal.
