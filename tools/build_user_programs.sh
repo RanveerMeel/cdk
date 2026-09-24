@@ -10,10 +10,13 @@ OUT="${1:-$ROOT/target/initrd.tar}"
 STAGE="$ROOT/target/initrd"
 
 # user/.cargo/config.toml (target, static relocation model, large code
-# model) applies only when cargo runs from inside user/.
-(cd "$ROOT/user" && cargo build --release --bins --quiet)
+# model) applies only when cargo runs from inside user/. Pin the target dir:
+# run_qemu.sh exports CARGO_TARGET_DIR for the kernel, and inheriting it would
+# build the programs elsewhere and pack stale binaries from user/target.
+USER_TARGET="$ROOT/user/target"
+(cd "$ROOT/user" && CARGO_TARGET_DIR="$USER_TARGET" cargo build --release --bins --quiet)
 
-BIN_DIR="$ROOT/user/target/x86_64-unknown-none/release"
+BIN_DIR="$USER_TARGET/x86_64-unknown-none/release"
 rm -rf "$STAGE"
 mkdir -p "$STAGE" "$(dirname "$OUT")"
 for src in "$ROOT"/user/src/bin/*.rs; do
