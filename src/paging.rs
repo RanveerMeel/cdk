@@ -266,6 +266,10 @@ impl MapFlags {
 pub trait FrameSource {
     /// Allocate one zeroed 4 KiB frame.  Returns the physical base address.
     fn alloc_zeroed(&mut self) -> Option<u64>;
+
+    /// Return a frame previously handed out by [`FrameSource::alloc_zeroed`]
+    /// (or by the same underlying allocator) so it can be reused.
+    fn free_frame(&mut self, phys: u64);
 }
 
 // ---------------------------------------------------------------------------
@@ -283,6 +287,10 @@ impl FrameSource for crate::allocator::FrameAllocator {
         }
         Some(phys)
     }
+
+    fn free_frame(&mut self, phys: u64) {
+        let _ = self.free(crate::allocator::PhysFrame(phys));
+    }
 }
 
 // On the host (test build): FrameAllocator bitmap starts at address 0, so
@@ -293,6 +301,10 @@ impl FrameSource for crate::allocator::FrameAllocator {
     fn alloc_zeroed(&mut self) -> Option<u64> {
         // Never called on the host — MockAlloc is used instead.
         None
+    }
+
+    fn free_frame(&mut self, phys: u64) {
+        let _ = phys;
     }
 }
 
@@ -312,9 +324,38 @@ pub enum PagingError {
     AlreadyMapped,
     /// The virtual address is not mapped (unmap / translate on absent entry).
     NotMapped,
+    /// A user mapping was requested outside [`USER_BASE`]..[`USER_TOP`].
+    OutsideUserRegion,
+    /// The kernel already occupies [`USER_PML4_SLOT`], so no user space can be built.
+    UserSlotInUse,
+    /// The page is mapped but not accessible from ring 3.
+    NotUserAccessible,
 }
 
 pub type PagingResult<T> = Result<T, PagingError>;
+
+// ---------------------------------------------------------------------------
+// User region
+// ---------------------------------------------------------------------------
+
+/// PML4 slot reserved for ring-3 mappings (512 GiB at `0x80_0000_0000`).
+///
+/// Every other slot is shared by reference with the kernel's PML4, so a user
+/// mapping anywhere else would be written into kernel-owned page tables and
+/// leak into every address space. The bootloader occupies slot 0 and 2+.
+pub const USER_PML4_SLOT: usize = 1;
+/// First user virtual address.
+pub const USER_BASE: u64 = (USER_PML4_SLOT as u64) << 39;
+/// One past the last user virtual address.
+pub const USER_TOP: u64 = USER_BASE + (1u64 << 39);
+
+/// `true` when `[start, start + len)` lies entirely inside the user region.
+pub fn is_user_range(start: u64, len: u64) -> bool {
+    match start.checked_add(len) {
+        Some(end) => start >= USER_BASE && end <= USER_TOP,
+        None => false,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Virtual address decomposition
@@ -526,6 +567,44 @@ impl PageTableManager {
         Ok(entry.addr().as_u64())
     }
 
+    /// Like [`translate`](Self::translate), but also requires the USER bit at
+    /// every level of the walk, i.e. the page is reachable from ring 3.
+    pub fn translate_user(&self, virt: u64) -> PagingResult<u64> {
+        if !is_user_range(virt, 1) {
+            return Err(PagingError::OutsideUserRegion);
+        }
+        let idx = VirtIndices::from_u64(virt);
+        let pdpt_phys = self.descend_user(self.pml4_phys, idx.pml4)?;
+        let pd_phys = self.descend_user(pdpt_phys, idx.pdpt)?;
+        let pt_phys = self.descend_user(pd_phys, idx.pd)?;
+        self.descend_user(pt_phys, idx.pt)
+    }
+
+    /// Copy `out.len()` bytes starting at user address `virt` into `out`.
+    ///
+    /// Reads through the physical-memory mapping, so it works regardless of
+    /// SMAP and never faults: every page is checked with
+    /// [`translate_user`](Self::translate_user) before it is read.
+    pub fn copy_from_user(&self, virt: u64, out: &mut [u8]) -> PagingResult<()> {
+        if !is_user_range(virt, out.len() as u64) {
+            return Err(PagingError::OutsideUserRegion);
+        }
+        let mut done = 0usize;
+        while done < out.len() {
+            let addr = virt + done as u64;
+            let page_off = (addr & (PAGE_SIZE - 1)) as usize;
+            let n = (PAGE_SIZE as usize - page_off).min(out.len() - done);
+            let phys = self.translate_user(addr & !(PAGE_SIZE - 1))?;
+            // SAFETY: phys is a mapped user frame; page_off + n <= PAGE_SIZE.
+            unsafe {
+                let src = crate::phys_mem::phys_to_ptr::<u8>(phys).add(page_off);
+                core::ptr::copy_nonoverlapping(src, out[done..].as_mut_ptr(), n);
+            }
+            done += n;
+        }
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // Private walk helpers
     // -----------------------------------------------------------------------
@@ -552,6 +631,19 @@ impl PageTableManager {
                 f |= X86Flags::USER_ACCESSIBLE;
                 entry.set_flags(f);
             }
+            Ok(entry.addr().as_u64())
+        }
+    }
+
+    /// Walk down one level, requiring the USER bit on the entry.
+    fn descend_user(&self, parent_phys: u64, child_idx: usize) -> PagingResult<u64> {
+        // SAFETY: as for `descend`.
+        let entry = unsafe { &*Self::entry_ptr(parent_phys, child_idx) };
+        if entry.is_unused() {
+            Err(PagingError::NotMapped)
+        } else if !entry.flags().contains(X86Flags::USER_ACCESSIBLE) {
+            Err(PagingError::NotUserAccessible)
+        } else {
             Ok(entry.addr().as_u64())
         }
     }
@@ -594,19 +686,29 @@ impl PageTableManager {
 
 /// Per-task address space: private PML4 that shares kernel mappings (M14).
 ///
-/// Kernel PML4 entries (indices 256..512, plus any already-present lower
-/// entries from the bootloader/kernel) are copied by reference so kernel
-/// code/data stay mapped after `activate()`.
+/// Every present kernel PML4 entry is copied by reference so kernel
+/// code/data stay mapped after `activate()`. [`USER_PML4_SLOT`] is the one
+/// slot the address space owns outright: user pages live only there (see
+/// [`map_user`](Self::map_user)) and [`destroy`](Self::destroy) frees it.
 pub struct AddressSpace {
     tables: PageTableManager,
 }
 
 impl AddressSpace {
     /// Allocate a new PML4 and share the kernel's present top-level entries.
+    ///
+    /// Fails with [`PagingError::UserSlotInUse`] if the kernel itself maps
+    /// anything in [`USER_PML4_SLOT`].
     pub fn from_kernel<A: FrameSource>(
         kernel: &PageTableManager,
         alloc: &mut A,
     ) -> Result<Self, PagingError> {
+        // SAFETY: kernel PML4 is a valid frame.
+        let kernel_user_slot =
+            unsafe { &*PageTableManager::entry_ptr(kernel.pml4_phys(), USER_PML4_SLOT) };
+        if !kernel_user_slot.is_unused() {
+            return Err(PagingError::UserSlotInUse);
+        }
         let tables = PageTableManager::new(alloc).ok_or(PagingError::OutOfMemory)?;
         for idx in 0..512usize {
             // SAFETY: both PML4s are valid frames owned/adopted by the managers.
@@ -620,8 +722,48 @@ impl AddressSpace {
         Ok(Self { tables })
     }
 
+    /// Re-adopt an address space previously built by [`from_kernel`](Self::from_kernel)
+    /// (e.g. from a process table entry) so it can be destroyed.
+    pub fn from_pml4_phys(pml4_phys: u64) -> Self {
+        Self {
+            tables: PageTableManager::from_pml4_phys(pml4_phys),
+        }
+    }
+
     pub fn tables(&mut self) -> &mut PageTableManager {
         &mut self.tables
+    }
+
+    /// Map a user page. `virt` must lie in the user region and `flags.user`
+    /// must be set, so kernel-shared tables are never touched.
+    pub fn map_user<A: FrameSource>(
+        &mut self,
+        virt: u64,
+        phys: u64,
+        flags: MapFlags,
+        alloc: &mut A,
+    ) -> PagingResult<()> {
+        if !flags.user || !is_user_range(virt, PAGE_SIZE) {
+            return Err(PagingError::OutsideUserRegion);
+        }
+        self.tables.map(virt, phys, flags, alloc)
+    }
+
+    /// Free every frame owned by this address space: the user pages, the page
+    /// tables under [`USER_PML4_SLOT`], and the PML4 itself.
+    ///
+    /// Kernel-shared slots are left untouched. The address space must not be
+    /// active (`CR3`) on any CPU. Returns the number of frames freed.
+    pub fn destroy<A: FrameSource>(self, alloc: &mut A) -> usize {
+        let pml4 = self.tables.pml4_phys();
+        // SAFETY: pml4 is the valid root this address space owns.
+        let pdpt = unsafe { &*PageTableManager::entry_ptr(pml4, USER_PML4_SLOT) };
+        let mut freed = 0;
+        if !pdpt.is_unused() {
+            freed += free_subtree(pdpt.addr().as_u64(), 3, alloc);
+        }
+        alloc.free_frame(pml4);
+        freed + 1
     }
 
     pub fn pml4_phys(&self) -> u64 {
@@ -644,6 +786,28 @@ impl AddressSpace {
             let _ = root;
         }
     }
+}
+
+/// Free the table at `phys` and everything below it. `level` 3 = PDPT,
+/// 2 = PD, 1 = PT (whose entries are leaf 4 KiB frames).
+fn free_subtree<A: FrameSource>(phys: u64, level: u8, alloc: &mut A) -> usize {
+    let mut freed = 0;
+    for idx in 0..512usize {
+        // SAFETY: phys is a page-table frame owned by the address space.
+        let entry = unsafe { &*PageTableManager::entry_ptr(phys, idx) };
+        if entry.is_unused() {
+            continue;
+        }
+        let child = entry.addr().as_u64();
+        if level == 1 {
+            alloc.free_frame(child);
+            freed += 1;
+        } else {
+            freed += free_subtree(child, level - 1, alloc);
+        }
+    }
+    alloc.free_frame(phys);
+    freed + 1
 }
 
 /// Invalidate a single page in the local TLB (`invlpg`).
@@ -709,11 +873,16 @@ mod tests {
     struct MockAlloc {
         // Each element owns a heap-allocated, 4096-byte-aligned page-table frame.
         frames: Vec<Box<X86PageTable>>,
+        // Frames returned via `free_frame` (kept alive so pointers stay valid).
+        freed: Vec<u64>,
     }
 
     impl MockAlloc {
         fn new() -> Self {
-            Self { frames: Vec::new() }
+            Self {
+                frames: Vec::new(),
+                freed: Vec::new(),
+            }
         }
     }
 
@@ -729,6 +898,11 @@ mod tests {
             assert_eq!(addr % PAGE_SIZE, 0, "frame not page-aligned");
             self.frames.push(frame);
             Some(addr)
+        }
+
+        fn free_frame(&mut self, phys: u64) {
+            assert!(!self.freed.contains(&phys), "double free of {phys:#x}");
+            self.freed.push(phys);
         }
     }
 
@@ -843,6 +1017,8 @@ mod tests {
                     None
                 }
             }
+
+            fn free_frame(&mut self, _phys: u64) {}
         }
         let mut one = OneFrameAlloc::new();
         let mut mgr = PageTableManager::new(&mut one).unwrap();
@@ -965,5 +1141,162 @@ mod tests {
         assert!(!rx.writable && !rx.user && !rx.no_exec);
         assert!(rw.writable && !rw.user && rw.no_exec);
         assert!(ur.writable && ur.user && ur.no_exec);
+    }
+    // -----------------------------------------------------------------------
+    // User region / AddressSpace
+    // -----------------------------------------------------------------------
+
+    const UVA: u64 = USER_BASE + 0x40_0000;
+
+    fn user_space() -> (PageTableManager, AddressSpace, MockAlloc) {
+        let (mut kernel, mut alloc) = make_mgr();
+        // Give the kernel a mapping in slot 0 so there is something to share.
+        let kphys = alloc_phys(&mut alloc);
+        kernel
+            .map(VA1, kphys, MapFlags::kernel_rw(), &mut alloc)
+            .unwrap();
+        let aspace = AddressSpace::from_kernel(&kernel, &mut alloc).unwrap();
+        (kernel, aspace, alloc)
+    }
+
+    #[test]
+    fn user_range_bounds() {
+        assert!(is_user_range(USER_BASE, 1));
+        assert!(is_user_range(USER_TOP - 1, 1));
+        assert!(!is_user_range(USER_BASE - 1, 1));
+        assert!(!is_user_range(USER_TOP - 1, 2));
+        assert!(!is_user_range(u64::MAX, 2));
+    }
+
+    #[test]
+    fn from_kernel_refuses_occupied_user_slot() {
+        let (mut kernel, mut alloc) = make_mgr();
+        let phys = alloc_phys(&mut alloc);
+        kernel
+            .map(UVA, phys, MapFlags::kernel_rw(), &mut alloc)
+            .unwrap();
+        assert!(matches!(
+            AddressSpace::from_kernel(&kernel, &mut alloc),
+            Err(PagingError::UserSlotInUse)
+        ));
+    }
+
+    #[test]
+    fn map_user_rejects_kernel_region_and_kernel_flags() {
+        let (_k, mut aspace, mut alloc) = user_space();
+        let phys = alloc_phys(&mut alloc);
+        assert_eq!(
+            aspace.map_user(VA2, phys, MapFlags::user_rw(), &mut alloc),
+            Err(PagingError::OutsideUserRegion)
+        );
+        assert_eq!(
+            aspace.map_user(UVA, phys, MapFlags::kernel_rw(), &mut alloc),
+            Err(PagingError::OutsideUserRegion)
+        );
+        aspace
+            .map_user(UVA, phys, MapFlags::user_rw(), &mut alloc)
+            .unwrap();
+    }
+
+    #[test]
+    fn user_mappings_do_not_leak_into_kernel_tables() {
+        let (kernel, mut aspace, mut alloc) = user_space();
+        let phys = alloc_phys(&mut alloc);
+        aspace
+            .map_user(UVA, phys, MapFlags::user_rw(), &mut alloc)
+            .unwrap();
+        assert_eq!(kernel.translate(UVA), Err(PagingError::NotMapped));
+        // Kernel mapping stays visible through the user address space.
+        assert!(aspace.tables().translate(VA1).is_ok());
+    }
+
+    #[test]
+    fn translate_user_requires_user_bit() {
+        let (_k, mut aspace, mut alloc) = user_space();
+        let phys = alloc_phys(&mut alloc);
+        aspace
+            .map_user(UVA, phys, MapFlags::user_rw(), &mut alloc)
+            .unwrap();
+        assert_eq!(aspace.tables().translate_user(UVA), Ok(phys));
+        assert_eq!(
+            aspace.tables().translate_user(UVA + PAGE_SIZE),
+            Err(PagingError::NotMapped)
+        );
+        assert_eq!(
+            aspace.tables().translate_user(VA1),
+            Err(PagingError::OutsideUserRegion)
+        );
+        let kphys = alloc_phys(&mut alloc);
+        aspace
+            .tables()
+            .map(
+                UVA + 2 * PAGE_SIZE,
+                kphys,
+                MapFlags::kernel_rw(),
+                &mut alloc,
+            )
+            .unwrap();
+        assert_eq!(
+            aspace.tables().translate_user(UVA + 2 * PAGE_SIZE),
+            Err(PagingError::NotUserAccessible)
+        );
+    }
+
+    #[test]
+    fn copy_from_user_spans_pages_and_rejects_holes() {
+        let (_k, mut aspace, mut alloc) = user_space();
+        let p0 = alloc_phys(&mut alloc);
+        let p1 = alloc_phys(&mut alloc);
+        aspace
+            .map_user(UVA, p0, MapFlags::user_rw(), &mut alloc)
+            .unwrap();
+        aspace
+            .map_user(UVA + PAGE_SIZE, p1, MapFlags::user_rw(), &mut alloc)
+            .unwrap();
+        unsafe {
+            *((p0 + PAGE_SIZE - 2) as *mut u8) = b'h';
+            *((p0 + PAGE_SIZE - 1) as *mut u8) = b'i';
+            *(p1 as *mut u8) = b'!';
+        }
+        let mut out = [0u8; 3];
+        aspace
+            .tables()
+            .copy_from_user(UVA + PAGE_SIZE - 2, &mut out)
+            .unwrap();
+        assert_eq!(&out, b"hi!");
+        // Third page is unmapped.
+        let mut big = [0u8; 8];
+        assert_eq!(
+            aspace
+                .tables()
+                .copy_from_user(UVA + 2 * PAGE_SIZE - 4, &mut big),
+            Err(PagingError::NotMapped)
+        );
+        assert_eq!(
+            aspace.tables().copy_from_user(VA1, &mut out),
+            Err(PagingError::OutsideUserRegion)
+        );
+    }
+
+    #[test]
+    fn destroy_frees_user_frames_and_tables_only() {
+        let (kernel, mut aspace, mut alloc) = user_space();
+        let before = alloc.frames.len();
+        let pml4 = aspace.pml4_phys();
+        for i in 0..3 {
+            let phys = alloc_phys(&mut alloc);
+            aspace
+                .map_user(UVA + i * PAGE_SIZE, phys, MapFlags::user_rw(), &mut alloc)
+                .unwrap();
+        }
+        // 3 leaf frames + PDPT + PD + PT, plus the PML4 from `user_space`.
+        let owned = alloc.frames.len() - before + 1;
+        assert_eq!(owned, 7);
+        assert_eq!(aspace.destroy(&mut alloc), owned);
+        assert_eq!(alloc.freed.len(), owned);
+        assert!(alloc.freed.contains(&pml4));
+        // Kernel tables and mappings are intact.
+        assert!(!alloc.freed.contains(&kernel.pml4_phys()));
+        assert!(kernel.translate(VA1).is_ok());
     }
 }

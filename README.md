@@ -70,6 +70,8 @@ A **bare-metal operating system kernel** written in Rust, designed around capabi
 
 **CPU Hardening + Ring-3 Foundation (M7–M14)** — Quiet LAPIC/IPI logging with cooperative `yield`/`complete`; contiguous-frame heap; GS-base `PerCpu`; kernel `CpuContext` switch; BSP `lapic-local`; x2APIC (xAPIC fallback); MADT IOAPIC + `irq-route`; user GDT + SCE/`user-smoke`; ELF64 loader and minimal process table.
 
+**User Processes** — Each process gets its own PML4 that shares kernel mappings; user pages live only in a dedicated PML4 slot (`0x80_0000_0000`, 512 GiB) so they never touch kernel page tables. `SYS_exit` restores the kernel context that entered ring 3, so `elf-run` returns to the console; `SYS_write(ptr, len)` copies from user memory after checking every page is user-mapped; `reap` frees the address space.
+
 **GPU Foundation** — Virtio-gpu 2D command packing, soft scanout/resource/flush into the boot framebuffer, modern virtio-pci capability parse + control virtqueue under `virtio-hw`, console `gpuinfo` / `gpusmoke`.
 
 **Unified Memory Foundation** — Contiguous shared CPU/GPU regions (`umalloc` / `umfree` / `um-smoke`), coherency fence before device attach, IOMMU identity stub; page migration not yet implemented.
@@ -157,6 +159,12 @@ cargo check --features virtio-hw
 | `run` | Manually dispatch next task from the scheduler queue |
 | `running` | Show the currently running (preempted) task |
 | `timeslice` | Show the preemptive time-slice length in ticks |
+| `elf-spawn` | Load the built-in smoke ELF as a `Ready` process |
+| `elf-run <pid>` | Run a `Ready` process in ring 3 until it calls `SYS_exit` |
+| `elf-smoke` | `elf-spawn` + `elf-run` in one step |
+| `ps` | List processes (Ready / Running / Zombie) |
+| `reap <pid>` | Free a `Ready`/`Zombie` process and its address space |
+| `user-smoke` | Minimal ring-3 round trip (enter, `SYS_exit`, return) |
 | `send <id> <text>` | Send a text message to an object |
 | `recv <id>` | Pop next message from an object |
 | `delete <id>` | Remove an object |
@@ -247,7 +255,9 @@ Deployment:
 - [x] Multi-core hardening (quiet SMP lifecycle, contiguous heap, GS-base PerCpu, kernel context switch, BSP lapic-local, x2APIC with xAPIC fallback, IOAPIC IRQ0/1 + optional `irq-route`)
 - [x] User-mode / ring-3 foundation (user GDT segments, SCE/LSTAR syscall + `user-smoke`)
 - [x] ELF64 loader and minimal process table
-- [ ] Run a loaded ELF as a ring-3 process (spawn → user entry → syscalls → exit)
+- [x] Run a loaded ELF as a ring-3 process (spawn → user entry → `SYS_write` → `SYS_exit` returns to the kernel → reap frees the address space)
+- [ ] Load ELF programs from the boot image instead of the built-in smoke binary
+- [ ] Schedule user processes preemptively alongside kernel tasks
 - [x] GPU support (soft 2D command pipeline + FB flush; PCI/MMIO virtio-gpu probe under `virtio-hw`; `gpuinfo` / `gpusmoke`)
 - [x] Unified memory foundation (contiguous shared regions, CPU fill + fence, virtio-gpu attach; IOMMU identity stub — no migration yet)
 

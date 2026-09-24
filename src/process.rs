@@ -1,7 +1,9 @@
 //! Minimal process table for ring-3 ELF tasks.
 //!
-//! Tracks pid, address-space root, entry/stack, and Running/Zombie state.
-//! `SYS_exit` marks the current process Zombie; console `ps` / `reap` inspect it.
+//! Lifecycle: [`spawn_smoke_elf`] loads a program and records it `Ready`;
+//! [`enter`] runs it in ring 3 (`Running`) until `SYS_exit` marks it
+//! `Zombie` and control returns to the caller; [`reap`] frees its address
+//! space and slot. Console `elf-spawn` / `elf-run` / `ps` / `reap` drive this.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use heapless::Vec;
@@ -9,14 +11,18 @@ use spin::Mutex;
 
 use crate::allocator::FrameAllocator;
 use crate::elf::{self, ElfError};
-use crate::paging::PageTableManager;
+use crate::paging::{AddressSpace, PageTableManager};
 
 pub const MAX_PROCESSES: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProcessState {
     Free,
+    /// Loaded, not yet entered.
+    Ready,
+    /// Executing in ring 3.
     Running,
+    /// Exited; address space still allocated until reaped.
     Zombie,
 }
 
@@ -43,6 +49,18 @@ impl Process {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessError {
+    Full,
+    NotFound,
+    /// The process is not in a state that allows the operation.
+    BadState(ProcessState),
+    /// Another process is already running on this CPU.
+    Busy,
+    Elf(ElfError),
+    Enter(&'static str),
+}
+
 struct ProcessTable {
     slots: [Process; MAX_PROCESSES],
     current: Option<u32>,
@@ -55,81 +73,132 @@ impl ProcessTable {
             current: None,
         }
     }
+
+    fn find(&self, pid: u32) -> Option<usize> {
+        self.slots
+            .iter()
+            .position(|s| s.state != ProcessState::Free && s.pid == pid)
+    }
+
+    fn insert(
+        &mut self,
+        pid: u32,
+        entry: u64,
+        stack_top: u64,
+        pml4_phys: u64,
+    ) -> Result<Process, ProcessError> {
+        let idx = self
+            .slots
+            .iter()
+            .position(|s| s.state == ProcessState::Free)
+            .ok_or(ProcessError::Full)?;
+        self.slots[idx] = Process {
+            pid,
+            state: ProcessState::Ready,
+            exit_code: 0,
+            entry,
+            stack_top,
+            pml4_phys,
+        };
+        Ok(self.slots[idx])
+    }
+
+    /// `Ready` → `Running` and make it current.
+    fn start(&mut self, pid: u32) -> Result<Process, ProcessError> {
+        if self.current.is_some() {
+            return Err(ProcessError::Busy);
+        }
+        let idx = self.find(pid).ok_or(ProcessError::NotFound)?;
+        let p = &mut self.slots[idx];
+        if p.state != ProcessState::Ready {
+            return Err(ProcessError::BadState(p.state));
+        }
+        p.state = ProcessState::Running;
+        self.current = Some(pid);
+        Ok(*p)
+    }
+
+    /// Current process → `Zombie` with `code`; clears `current`.
+    fn exit_current(&mut self, code: u64) {
+        let Some(pid) = self.current.take() else {
+            return;
+        };
+        if let Some(idx) = self.find(pid) {
+            self.slots[idx].state = ProcessState::Zombie;
+            self.slots[idx].exit_code = code;
+        }
+    }
+
+    /// Remove a `Ready` or `Zombie` process, returning it so the caller can
+    /// free its address space.
+    fn take_for_reap(&mut self, pid: u32) -> Result<Process, ProcessError> {
+        let idx = self.find(pid).ok_or(ProcessError::NotFound)?;
+        let p = self.slots[idx];
+        match p.state {
+            ProcessState::Ready | ProcessState::Zombie => {
+                self.slots[idx] = Process::free_slot();
+                Ok(p)
+            }
+            other => Err(ProcessError::BadState(other)),
+        }
+    }
 }
 
 static TABLE: Mutex<ProcessTable> = Mutex::new(ProcessTable::new());
 static NEXT_PID: AtomicU32 = AtomicU32::new(1);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProcessError {
-    Full,
-    NotFound,
-    Elf(ElfError),
-    NoSelectors,
-    NoKernelStack,
-}
-
-/// Spawn the built-in smoke ELF into a new address space and record a Running process.
+/// Load the built-in smoke ELF into a new address space and record it `Ready`.
 pub fn spawn_smoke_elf(
     kernel_pt: &PageTableManager,
     fa: &mut FrameAllocator,
 ) -> Result<Process, ProcessError> {
-    let (aspace, entry, stack_top) =
-        elf::load_smoke(kernel_pt, fa).map_err(ProcessError::Elf)?;
-    let pml4 = aspace.pml4_phys();
+    let (aspace, entry, stack_top) = elf::load_smoke(kernel_pt, fa).map_err(ProcessError::Elf)?;
     let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+    let inserted = TABLE
+        .lock()
+        .insert(pid, entry, stack_top, aspace.pml4_phys());
+    if inserted.is_err() {
+        aspace.destroy(fa);
+    }
+    inserted
+}
 
-    let mut t = TABLE.lock();
-    let idx = t
-        .slots
-        .iter()
-        .position(|s| s.state == ProcessState::Free)
-        .ok_or(ProcessError::Full)?;
-    t.slots[idx] = Process {
-        pid,
-        state: ProcessState::Running,
-        exit_code: 0,
-        entry,
-        stack_top,
-        pml4_phys: pml4,
-    };
-    t.current = Some(pid);
-    let proc = t.slots[idx];
-    drop(t);
-
-    // Activate user address space before returning so caller can enter_user.
-    aspace.activate();
-    Ok(proc)
+/// Run a `Ready` process in ring 3 until it exits; returns its exit code.
+///
+/// The process stays in the table as a `Zombie` until [`reap`]ed.
+pub fn enter(pid: u32) -> Result<u64, ProcessError> {
+    let proc = TABLE.lock().start(pid)?;
+    // TABLE must not be held here: SYS_exit takes it from the syscall path.
+    match crate::syscall::run_user(proc.entry, proc.stack_top, proc.pml4_phys) {
+        Ok(code) => Ok(code),
+        Err(e) => {
+            // Never reached ring 3: put it back so it can be retried or reaped.
+            let mut t = TABLE.lock();
+            t.current = None;
+            if let Some(idx) = t.find(pid) {
+                t.slots[idx].state = ProcessState::Ready;
+            }
+            Err(ProcessError::Enter(e))
+        }
+    }
 }
 
 pub fn current_pid() -> Option<u32> {
     TABLE.lock().current
 }
 
+/// Called from `SYS_exit`: mark the current process `Zombie`.
 pub fn mark_exit(code: u64) {
-    let mut t = TABLE.lock();
-    let Some(pid) = t.current else {
-        return;
-    };
-    if let Some(p) = t.slots.iter_mut().find(|s| s.pid == pid) {
-        p.state = ProcessState::Zombie;
-        p.exit_code = code;
-    }
+    TABLE.lock().exit_current(code);
 }
 
-pub fn reap(pid: u32) -> Result<u64, ProcessError> {
-    let mut t = TABLE.lock();
-    let idx = t
-        .slots
-        .iter()
-        .position(|s| s.pid == pid && s.state == ProcessState::Zombie)
-        .ok_or(ProcessError::NotFound)?;
-    let code = t.slots[idx].exit_code;
-    if t.current == Some(pid) {
-        t.current = None;
-    }
-    t.slots[idx] = Process::free_slot();
-    Ok(code)
+/// Free a `Ready` or `Zombie` process's address space and slot.
+///
+/// Returns `(exit_code, frames_freed)`.
+pub fn reap(pid: u32, fa: &mut FrameAllocator) -> Result<(u64, usize), ProcessError> {
+    let p = TABLE.lock().take_for_reap(pid)?;
+    let freed = AddressSpace::from_pml4_phys(p.pml4_phys).destroy(fa);
+    Ok((p.exit_code, freed))
 }
 
 pub fn for_each(mut f: impl FnMut(&Process)) {
@@ -149,67 +218,79 @@ pub fn list() -> Vec<Process, MAX_PROCESSES> {
     out
 }
 
-/// Enter ring-3 for `proc` (does not return on success).
-pub fn enter(proc: &Process) -> Result<(), ProcessError> {
-    #[cfg(not(target_os = "none"))]
-    {
-        let _ = proc;
-        crate::println!(
-            "process: host stub enter pid={} entry={:#x}",
-            proc.pid,
-            proc.entry
-        );
-        mark_exit(0);
-        return Ok(());
-    }
-    #[cfg(target_os = "none")]
-    {
-        let Some((_, ucode, udata)) = crate::gdt::star_selectors() else {
-            return Err(ProcessError::NoSelectors);
-        };
-        let kstack = crate::gdt::kernel_stack_top(0).ok_or(ProcessError::NoKernelStack)?;
-        crate::gdt::set_rsp0(0, kstack);
-        crate::percpu::set_kernel_rsp(0, kstack);
-        crate::percpu::prepare_user_gs(0);
-        // Ensure CR3 is the process PML4.
-        unsafe {
-            core::arch::asm!(
-                "mov cr3, {}",
-                in(reg) proc.pml4_phys,
-                options(nostack, preserves_flags)
-            );
-        }
-        crate::println!(
-            "process: enter pid={} rip={:#x} rsp={:#x} cr3={:#x}",
-            proc.pid,
-            proc.entry,
-            proc.stack_top,
-            proc.pml4_phys
-        );
-        unsafe {
-            crate::syscall::enter_user_public(
-                proc.entry,
-                proc.stack_top,
-                ucode.0 as u64,
-                udata.0 as u64,
-            );
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn reap_missing_pid_fails() {
-        assert_eq!(reap(0xFFFF_FFFE), Err(ProcessError::NotFound));
+    fn lifecycle_ready_running_zombie_reaped() {
+        let mut t = ProcessTable::new();
+        t.insert(7, 0x1000, 0x2000, 0x3000).unwrap();
+        assert_eq!(t.slots[0].state, ProcessState::Ready);
+        assert_eq!(t.current, None);
+
+        t.start(7).unwrap();
+        assert_eq!(t.slots[0].state, ProcessState::Running);
+        assert_eq!(t.current, Some(7));
+
+        t.exit_current(19);
+        assert_eq!(t.slots[0].state, ProcessState::Zombie);
+        assert_eq!(t.slots[0].exit_code, 19);
+        assert_eq!(t.current, None);
+
+        let p = t.take_for_reap(7).unwrap();
+        assert_eq!((p.exit_code, p.pml4_phys), (19, 0x3000));
+        assert_eq!(t.find(7), None);
     }
 
     #[test]
-    fn mark_exit_without_current_is_noop() {
-        let before = list().len();
-        mark_exit(42);
-        assert_eq!(list().len(), before);
+    fn cannot_start_twice_or_while_busy() {
+        let mut t = ProcessTable::new();
+        t.insert(1, 0, 0, 0).unwrap();
+        t.insert(2, 0, 0, 0).unwrap();
+        t.start(1).unwrap();
+        assert_eq!(t.start(2), Err(ProcessError::Busy));
+        t.exit_current(0);
+        assert_eq!(
+            t.start(1),
+            Err(ProcessError::BadState(ProcessState::Zombie))
+        );
+        t.start(2).unwrap();
+    }
+
+    #[test]
+    fn running_process_cannot_be_reaped() {
+        let mut t = ProcessTable::new();
+        t.insert(3, 0, 0, 0).unwrap();
+        t.start(3).unwrap();
+        assert_eq!(
+            t.take_for_reap(3),
+            Err(ProcessError::BadState(ProcessState::Running))
+        );
+    }
+
+    #[test]
+    fn ready_process_can_be_reaped_and_slot_reused() {
+        let mut t = ProcessTable::new();
+        for pid in 0..MAX_PROCESSES as u32 {
+            t.insert(pid + 1, 0, 0, 0).unwrap();
+        }
+        assert_eq!(t.insert(99, 0, 0, 0), Err(ProcessError::Full));
+        t.take_for_reap(1).unwrap();
+        t.insert(99, 0, 0, 0).unwrap();
+    }
+
+    #[test]
+    fn exit_without_current_is_noop() {
+        let mut t = ProcessTable::new();
+        t.insert(4, 0, 0, 0).unwrap();
+        t.exit_current(42);
+        assert_eq!(t.slots[0].state, ProcessState::Ready);
+    }
+
+    #[test]
+    fn reap_missing_pid_fails() {
+        let mut t = ProcessTable::new();
+        assert_eq!(t.take_for_reap(0xFFFF_FFFE), Err(ProcessError::NotFound));
     }
 }

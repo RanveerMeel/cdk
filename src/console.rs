@@ -85,6 +85,7 @@ const COMMANDS: &[&str] = &[
     "running",
     "user-smoke",
     "elf-spawn",
+    "elf-run",
     "elf-smoke",
     "ps",
     "reap",
@@ -548,9 +549,10 @@ fn dispatch(
         "run" => cmd_run_next(kernel),
         "user-smoke" => cmd_user_smoke(page_table, frame_alloc),
         "elf-spawn" => cmd_elf_spawn(page_table, frame_alloc, false),
+        "elf-run" => cmd_elf_run(arg1),
         "elf-smoke" => cmd_elf_spawn(page_table, frame_alloc, true),
         "ps" => cmd_ps(),
-        "reap" => cmd_reap(arg1),
+        "reap" => cmd_reap(arg1, frame_alloc),
         "irq-route" => cmd_irq_route(arg1, arg2),
         "send" => cmd_send(arg1, arg2, kernel),
         "recv" => cmd_recv(arg1, kernel),
@@ -631,11 +633,12 @@ fn cmd_help() {
     crate::println!("  yield [apic]      Requeue running task (default apic 0)");
     crate::println!("  run               Manually dispatch next task (ignores preemption)");
     crate::println!("  running           Show the currently running task");
-    crate::println!("  user-smoke        Ring-3 smoke test (syscall exit)");
-    crate::println!("  elf-spawn         Load smoke ELF into process table (no enter)");
-    crate::println!("  elf-smoke         Load smoke ELF and enter ring-3");
+    crate::println!("  user-smoke        Ring-3 smoke test (syscall exit, returns)");
+    crate::println!("  elf-spawn         Load smoke ELF into process table (Ready)");
+    crate::println!("  elf-run <pid>     Run a Ready process until it exits");
+    crate::println!("  elf-smoke         Load smoke ELF and run it");
     crate::println!("  ps                List processes");
-    crate::println!("  reap <pid>        Reap a Zombie process");
+    crate::println!("  reap <pid>        Free a Ready/Zombie process and its memory");
     crate::println!("  irq-route <irq> <apic>  Route IOAPIC IRQ affinity");
     crate::println!("  send <id> <text>  Send a text message to an object");
     crate::println!("  recv <id>         Receive next message from an object");
@@ -2189,7 +2192,7 @@ fn cmd_user_smoke(
 fn cmd_elf_spawn(
     page_table: &mut Option<PageTableManager>,
     frame_alloc: &mut FrameAllocator,
-    enter: bool,
+    run: bool,
 ) {
     let Some(pt) = page_table.as_mut() else {
         crate::println!("Page table not initialised.");
@@ -2204,13 +2207,26 @@ fn cmd_elf_spawn(
                 proc.stack_top,
                 proc.pml4_phys
             );
-            if enter {
-                if let Err(e) = crate::process::enter(&proc) {
-                    crate::println!("elf-smoke enter failed: {:?}", e);
-                }
+            if run {
+                run_process(proc.pid);
             }
         }
         Err(e) => crate::println!("elf-spawn failed: {:?}", e),
+    }
+}
+
+fn cmd_elf_run(pid_str: &str) {
+    let Some(pid) = parse_u32(pid_str) else {
+        crate::println!("Usage: elf-run <pid>");
+        return;
+    };
+    run_process(pid);
+}
+
+fn run_process(pid: u32) {
+    match crate::process::enter(pid) {
+        Ok(code) => crate::println!("elf: pid={} exited code={}", pid, code),
+        Err(e) => crate::println!("elf-run failed: {:?}", e),
     }
 }
 
@@ -2220,15 +2236,16 @@ fn cmd_ps() {
         crate::println!("ps: (no processes)");
         return;
     }
-    crate::println!("PID   STATE     EXIT  ENTRY      CR3");
+    crate::println!("PID   STATE     EXIT  ENTRY          CR3");
     for p in procs.iter() {
         let state = match p.state {
             crate::process::ProcessState::Free => "Free",
+            crate::process::ProcessState::Ready => "Ready",
             crate::process::ProcessState::Running => "Running",
             crate::process::ProcessState::Zombie => "Zombie",
         };
         crate::println!(
-            "{:<5} {:<9} {:<5} {:#010x} {:#x}",
+            "{:<5} {:<9} {:<5} {:#014x} {:#x}",
             p.pid,
             state,
             p.exit_code,
@@ -2241,13 +2258,15 @@ fn cmd_ps() {
     }
 }
 
-fn cmd_reap(pid_str: &str) {
+fn cmd_reap(pid_str: &str, frame_alloc: &mut FrameAllocator) {
     let Some(pid) = parse_u32(pid_str) else {
         crate::println!("Usage: reap <pid>");
         return;
     };
-    match crate::process::reap(pid) {
-        Ok(code) => crate::println!("reaped pid={} exit={}", pid, code),
+    match crate::process::reap(pid, frame_alloc) {
+        Ok((code, freed)) => {
+            crate::println!("reaped pid={} exit={} freed_frames={}", pid, code, freed)
+        }
         Err(e) => crate::println!("reap failed: {:?}", e),
     }
 }
