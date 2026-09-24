@@ -11,6 +11,8 @@ use crate::percpu::{CPULOCAL_KERNEL_RSP, CPULOCAL_USER_RSP};
 
 pub const SYS_EXIT: u64 = 1;
 pub const SYS_WRITE: u64 = 2;
+/// Returns the caller's pid.
+pub const SYS_GETPID: u64 = 8;
 
 /// Largest buffer a single `SYS_write` will copy from user space.
 pub const MAX_WRITE_LEN: usize = 1024;
@@ -43,10 +45,51 @@ pub fn init() {
     }
 }
 
-/// Rust dispatcher: `nr` in rax, `arg0` in rdi, `arg1` in rsi.
+/// What a syscall handler decided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// Return this value in `rax`.
+    Return(u64),
+    /// Park the calling process (e.g. waiting for human approval); its
+    /// result is delivered later by [`crate::process::unblock`].
+    Block,
+}
+
+/// Rust side of the syscall entry stub. `frame` is the caller's full
+/// register state (number in `rax`; arguments in `rdi`, `rsi`, `rdx`).
 #[no_mangle]
-pub extern "C" fn syscall_dispatch(nr: u64, arg0: u64, arg1: u64) -> u64 {
-    match nr {
+pub extern "C" fn syscall_entry(frame: &mut crate::process::TrapFrame) {
+    match syscall_dispatch(frame.rax, frame.rdi, frame.rsi, frame.rdx) {
+        Outcome::Return(v) => frame.rax = v,
+        Outcome::Block => block_current(frame),
+    }
+}
+
+/// Save the caller's frame into its process, mark it `Blocked`, and resume
+/// the scheduler loop. Does not return (bare metal).
+fn block_current(frame: &mut crate::process::TrapFrame) {
+    #[cfg(target_os = "none")]
+    {
+        if let Some((_, ucode, udata)) = crate::gdt::star_selectors() {
+            frame.cs = ucode.0 as u64;
+            frame.ss = udata.0 as u64;
+        }
+        frame.rflags |= 0x200;
+        crate::process::block_current(frame);
+        if let Some(slot) = resume::take_armed(current_slot()) {
+            unsafe { resume::resume(slot, 0) }
+        }
+        loop {
+            unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)) };
+        }
+    }
+    #[cfg(not(target_os = "none"))]
+    crate::process::block_current(frame);
+}
+
+/// Dispatch syscall `nr` with its arguments.
+pub fn syscall_dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64) -> Outcome {
+    let value = match nr {
         SYS_EXIT => {
             crate::process::mark_exit(arg0);
             crate::println!("Syscall: SYS_exit code={}", arg0);
@@ -66,12 +109,18 @@ pub extern "C" fn syscall_dispatch(nr: u64, arg0: u64, arg1: u64) -> u64 {
             #[cfg(not(target_os = "none"))]
             0
         }
+        crate::agent::SYS_SEND => return crate::agent::sys_send_outcome(arg0, arg1, arg2),
         SYS_WRITE => sys_write(arg0, arg1),
+        SYS_GETPID => crate::process::current_pid().map_or(SYSCALL_ERR, |p| p as u64),
+        crate::agent::SYS_CAP_LIST..=crate::agent::SYS_RECV => {
+            crate::agent::syscall(nr, arg0, arg1, arg2)
+        }
         _ => {
             crate::println!("Syscall: unknown nr={}", nr);
             SYSCALL_ERR
         }
-    }
+    };
+    Outcome::Return(value)
 }
 
 /// Terminate the ring-3 program that raised `fault` and resume the kernel
@@ -91,6 +140,19 @@ pub fn abort_user(fault: crate::process::UserFault) -> ! {
         fault.addr,
         fault.error_code
     );
+    // The word at the user stack pointer is usually the return address of
+    // the call that jumped to a bad `rip`; read it through the checked path.
+    let mut top = [0u8; 8];
+    if crate::paging::PageTableManager::from_pml4_phys(current_cr3())
+        .copy_from_user(fault.rsp, &mut top)
+        .is_ok()
+    {
+        crate::println!(
+            "       rsp={:#x} [rsp]={:#x}",
+            fault.rsp,
+            u64::from_le_bytes(top)
+        );
+    }
     if let Some(slot) = resume::take_armed(current_slot()) {
         unsafe { resume::resume(slot, fault.exit_code()) }
     }
@@ -122,7 +184,8 @@ fn sys_write(ptr: u64, len: u64) -> u64 {
     len
 }
 
-fn current_cr3() -> u64 {
+/// Physical address of the active page-table root.
+pub fn current_cr3() -> u64 {
     #[cfg(target_os = "none")]
     {
         let cr3: u64;
@@ -151,15 +214,53 @@ core::arch::global_asm!(
         swapgs
         mov gs:[{user_rsp}], rsp
         mov rsp, gs:[{kernel_rsp}]
-        push rcx
+        // Build a full process::TrapFrame (the timer stubs' layout) so a
+        // syscall can block and later resume via iretq. cs/ss are filled in
+        // only if the process blocks. 20 pushes keep RSP 16-byte aligned.
+        push 0
+        push qword ptr gs:[{user_rsp}]
         push r11
-        mov rdx, rsi
-        mov rsi, rdi
-        mov rdi, rax
-        call syscall_dispatch
+        push 0
+        push rcx
+        push rax
+        push rbx
+        push rcx
+        push rdx
+        push rsi
+        push rdi
+        push rbp
+        push r8
+        push r9
+        push r10
+        push r11
+        push r12
+        push r13
+        push r14
+        push r15
+        mov rdi, rsp
+        cld
+        call syscall_entry
+        pop r15
+        pop r14
+        pop r13
+        pop r12
         pop r11
+        pop r10
+        pop r9
+        pop r8
+        pop rbp
+        pop rdi
+        pop rsi
+        pop rdx
         pop rcx
-        mov rsp, gs:[{user_rsp}]
+        pop rbx
+        pop rax
+        // Interrupt-frame part: rip -> rcx, skip cs, rflags -> r11, then the
+        // user rsp. Interrupts stay masked (SFMASK) until sysretq.
+        pop rcx
+        add rsp, 8
+        pop r11
+        pop rsp
         swapgs
         sysretq
     "#,
@@ -220,10 +321,12 @@ mod resume {
 
     core::arch::global_asm!(
         r#"
-        // u64 cdk_user_enter(ctx, rip, rsp, cs, ss, cr3)
-        //   rdi=ctx rsi=rip rdx=rsp rcx=cs r8=ss r9=cr3
-        // Saves the kernel context, then iretq's into ring 3. Returns only
-        // via cdk_user_resume, with the exit code in rax.
+        // u64 cdk_user_enter(ctx, frame, cr3, user_ds)
+        //   rdi=ctx rsi=frame (a TrapFrame on this CPU's kernel stack)
+        //   rdx=cr3 rcx=user data selector
+        // Saves the kernel context, loads every register from the frame,
+        // then iretq's into ring 3. Returns only via cdk_user_resume, with
+        // the exit code in rax.
         .global cdk_user_enter
         .type cdk_user_enter, @function
         cdk_user_enter:
@@ -239,15 +342,26 @@ mod resume {
             mov [rdi + 0x38], rax
             mov rax, cr3
             mov [rdi + 0x40], rax
-            mov cr3, r9
-            mov ax, r8w
+            mov cr3, rdx
+            mov ax, cx
             mov ds, ax
             mov es, ax
-            push r8
-            push rdx
-            push 0x202
-            push rcx
-            push rsi
+            mov rsp, rsi
+            pop r15
+            pop r14
+            pop r13
+            pop r12
+            pop r11
+            pop r10
+            pop r9
+            pop r8
+            pop rbp
+            pop rdi
+            pop rsi
+            pop rdx
+            pop rcx
+            pop rbx
+            pop rax
             iretq
 
         // ! cdk_user_resume(ctx, code)  —  rdi=ctx rsi=code
@@ -278,23 +392,29 @@ mod resume {
     unsafe extern "C" {
         fn cdk_user_enter(
             ctx: *mut KernelResume,
-            rip: u64,
-            rsp: u64,
-            cs: u64,
-            ss: u64,
+            frame: *const crate::process::TrapFrame,
             cr3: u64,
+            user_ds: u64,
         ) -> u64;
         fn cdk_user_resume(ctx: *const KernelResume, code: u64) -> !;
     }
 
-    /// Enter ring 3 on `slot` and block until the program calls `SYS_exit`.
+    /// Enter ring 3 on `slot` with every register from `frame` and block
+    /// until the running program exits, crashes, or is killed.
     ///
     /// # Safety
-    /// `cr3` must map `rip`/`rsp` as user pages and share the kernel mappings;
-    /// selectors must be ring-3; per-CPU syscall state must be prepared.
-    pub unsafe fn enter(slot: usize, rip: u64, rsp: u64, cs: u64, ss: u64, cr3: u64) -> u64 {
+    /// `frame` must sit on this CPU's kernel stack (it is popped in place);
+    /// `cr3` must map the frame's `rip`/`rsp` as user pages and share the
+    /// kernel mappings; selectors must be ring-3; per-CPU syscall state must
+    /// be prepared.
+    pub unsafe fn enter(
+        slot: usize,
+        frame: *const crate::process::TrapFrame,
+        cr3: u64,
+        user_ds: u64,
+    ) -> u64 {
         ARMED[slot].store(true, Ordering::Release);
-        let code = cdk_user_enter(SLOTS[slot].0.get(), rip, rsp, cs, ss, cr3);
+        let code = cdk_user_enter(SLOTS[slot].0.get(), frame, cr3, user_ds);
         ARMED[slot].store(false, Ordering::Release);
         code
     }
@@ -311,31 +431,71 @@ mod resume {
     }
 }
 
-/// Run user code at `rip`/`rsp` in address space `pml4_phys` until it calls
-/// `SYS_exit`, then return its exit code. Kernel `CR3` is restored on return.
+/// Run user code at `rip`/`rsp` in address space `pml4_phys` until it exits.
 pub fn run_user(rip: u64, rsp: u64, pml4_phys: u64) -> Result<u64, &'static str> {
+    run_frame(&crate::process::TrapFrame::user_entry(rip, rsp), pml4_phys)
+}
+
+/// Enter ring 3 with the registers in `frame` (selectors are filled in) and
+/// the page tables at `pml4_phys`; return when the running program (which
+/// may be a different process after preemption) exits, crashes, or is
+/// killed. Kernel `CR3` is restored on return.
+pub fn run_frame(frame: &crate::process::TrapFrame, pml4_phys: u64) -> Result<u64, &'static str> {
     #[cfg(not(target_os = "none"))]
     {
-        let _ = (rip, rsp, pml4_phys);
+        let _ = (frame, pml4_phys);
         // Host stub: behave as if the program exited immediately with 0.
         crate::process::mark_exit(0);
         Ok(0)
     }
     #[cfg(target_os = "none")]
     {
+        use crate::process::TrapFrame;
         let Some((_, ucode, udata)) = crate::gdt::star_selectors() else {
             return Err("no user selectors");
         };
         let apic = crate::percpu::current_apic_id();
         let slot = crate::percpu::slot_for_apic(apic).unwrap_or(0);
-        let kstack = crate::gdt::kernel_stack_top(apic).ok_or("no kernel stack")?;
+        // The static kernel stack's end is not 16-byte aligned; align it so
+        // syscall handlers run on an ABI-aligned stack.
+        let kstack = crate::gdt::kernel_stack_top(apic).ok_or("no kernel stack")? & !0xf;
         crate::gdt::set_rsp0(apic, kstack);
         crate::percpu::set_kernel_rsp(slot, kstack);
         crate::percpu::prepare_user_gs(slot);
-        // SAFETY: caller provides a user address space built by `AddressSpace`.
-        let code =
-            unsafe { resume::enter(slot, rip, rsp, ucode.0 as u64, udata.0 as u64, pml4_phys) };
+        // Place the frame at the top of the kernel stack; the enter stub pops
+        // it in place, leaving RSP0 at the top exactly as an interrupt from
+        // ring 3 would expect.
+        let mut f = *frame;
+        f.cs = ucode.0 as u64;
+        f.ss = udata.0 as u64;
+        f.rflags |= 0x200; // interrupts always on in ring 3
+        let slot_ptr = (kstack as usize - TrapFrame::SIZE) as *mut TrapFrame;
+        // SAFETY: the kernel stack top is ours; nothing else uses it until the
+        // program traps back in.
+        let code = unsafe {
+            slot_ptr.write(f);
+            resume::enter(slot, slot_ptr, pml4_phys, udata.0 as u64)
+        };
         Ok(code)
+    }
+}
+
+/// Kill the running ring-3 program from the timer interrupt (budget
+/// exhausted; already marked `Killed`) and resume the kernel context.
+#[cfg(target_os = "none")]
+pub fn abort_user_killed(pid: u32, ticks: u64) -> ! {
+    // Same GS situation as `abort_user`: the interrupt gate did not swapgs.
+    unsafe { core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags)) };
+    crate::println!(
+        "Watchdog: pid {} exceeded its CPU budget ({} ticks) — process killed",
+        pid,
+        ticks
+    );
+    if let Some(slot) = resume::take_armed(current_slot()) {
+        unsafe { resume::resume(slot, u64::MAX) }
+    }
+    loop {
+        unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)) };
     }
 }
 

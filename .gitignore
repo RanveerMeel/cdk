@@ -1,5 +1,7 @@
 /target/
 /tools/create_disk_image/target/
+/user/target/
+/user/ml/target/
 *.log
 *.tmp
 *.swp

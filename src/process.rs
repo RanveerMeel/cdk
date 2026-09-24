@@ -1,12 +1,21 @@
 //! Minimal process table for ring-3 ELF tasks.
 //!
-//! Lifecycle: [`spawn_smoke_elf`] loads a program and records it `Ready`;
-//! [`enter`] runs it in ring 3 (`Running`) until `SYS_exit` marks it
-//! `Zombie` — or a CPU exception marks it `Crashed` — and control returns to
-//! the caller; [`reap`] frees its address space and slot. Console
-//! `elf-spawn` / `elf-run` / `ps` / `reap` drive this.
+//! Lifecycle: [`spawn_smoke_elf`] / [`spawn_image`] load a program and record
+//! it `Ready`; [`run_scheduled`] runs the selected processes in ring 3 until
+//! each exits (`Zombie`), faults (`Crashed`), or exhausts its CPU budget
+//! (`Killed`); [`reap`] frees its address space and slot.
+//!
+//! ## Preemptive scheduling (roadmap 2.3)
+//!
+//! Every process carries a saved [`TrapFrame`]. When a timer interrupt
+//! arrives while a process is in ring 3, [`on_user_tick`] charges it one
+//! tick; after [`slice_ticks`] it saves the interrupted frame, loads the next
+//! runnable process's frame and page tables, and the interrupt returns into
+//! that process (round-robin). Switching happens only at ring-3 interrupt
+//! boundaries — syscalls run with interrupts disabled — so one kernel stack
+//! per CPU suffices. A process that exceeds [`budget_ticks`] is killed.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use heapless::Vec;
 use spin::Mutex;
 
@@ -28,6 +37,117 @@ pub enum ProcessState {
     Zombie,
     /// Killed by a CPU exception; address space kept until reaped.
     Crashed,
+    /// Killed by the kernel for exceeding its CPU budget.
+    Killed,
+    /// Waiting in a syscall (e.g. for human approval); resumes when
+    /// [`unblock`] delivers the result.
+    Blocked,
+}
+
+/// Saved ring-3 register state. The layout matches the timer entry stubs:
+/// general-purpose registers in reverse push order, then the CPU's interrupt
+/// frame (`rip, cs, rflags, rsp, ss`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TrapFrame {
+    pub r15: u64,
+    pub r14: u64,
+    pub r13: u64,
+    pub r12: u64,
+    pub r11: u64,
+    pub r10: u64,
+    pub r9: u64,
+    pub r8: u64,
+    pub rbp: u64,
+    pub rdi: u64,
+    pub rsi: u64,
+    pub rdx: u64,
+    pub rcx: u64,
+    pub rbx: u64,
+    pub rax: u64,
+    pub rip: u64,
+    pub cs: u64,
+    pub rflags: u64,
+    pub rsp: u64,
+    pub ss: u64,
+}
+
+impl TrapFrame {
+    /// Size in bytes (15 GPRs + 5-word interrupt frame).
+    pub const SIZE: usize = 20 * 8;
+
+    /// Initial frame for a new process: all registers zero, interrupts on.
+    /// `cs`/`ss` are filled in with the user selectors at dispatch.
+    pub const fn user_entry(rip: u64, rsp: u64) -> Self {
+        Self {
+            r15: 0,
+            r14: 0,
+            r13: 0,
+            r12: 0,
+            r11: 0,
+            r10: 0,
+            r9: 0,
+            r8: 0,
+            rbp: 0,
+            rdi: 0,
+            rsi: 0,
+            rdx: 0,
+            rcx: 0,
+            rbx: 0,
+            rax: 0,
+            rip,
+            cs: 0,
+            rflags: 0x202,
+            rsp,
+            ss: 0,
+        }
+    }
+
+    /// Whether the interrupted code ran in ring 3.
+    pub fn from_user(&self) -> bool {
+        self.cs & 3 == 3
+    }
+}
+
+/// Which `Ready` processes [`run_scheduled`] should run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Select {
+    One(u32),
+    AllReady,
+}
+
+/// What the timer path should do after charging a tick.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TickAction {
+    /// Keep running the current process.
+    Continue,
+    /// The frame now holds another process; load this page-table root.
+    Switch { pml4_phys: u64 },
+    /// The current process exceeded its budget and has been marked `Killed`.
+    Kill { pid: u32, ticks: u64 },
+}
+
+// Ticks are timer interrupts landing while a process is in ring 3. On the
+// BSP that is the local APIC timer, calibrated to 20 Hz (50 ms per tick).
+static SLICE_TICKS: AtomicU64 = AtomicU64::new(2); // ~100 ms
+static BUDGET_TICKS: AtomicU64 = AtomicU64::new(200); // ~10 s
+
+/// Timer ticks a process runs before another runnable one gets the CPU.
+pub fn slice_ticks() -> u64 {
+    SLICE_TICKS.load(Ordering::Relaxed)
+}
+
+/// Total timer ticks a process may run before it is killed.
+pub fn budget_ticks() -> u64 {
+    BUDGET_TICKS.load(Ordering::Relaxed)
+}
+
+pub fn set_budget_ticks(ticks: u64) {
+    BUDGET_TICKS.store(ticks.max(1), Ordering::Relaxed);
+}
+
+pub fn set_slice_ticks(ticks: u64) {
+    SLICE_TICKS.store(ticks.max(1), Ordering::Relaxed);
 }
 
 /// Offset added to the exception vector to form a crashed process's exit
@@ -44,6 +164,8 @@ pub struct UserFault {
     pub rip: u64,
     /// Faulting address (`CR2`) for page faults, otherwise 0.
     pub addr: u64,
+    /// User stack pointer at the fault.
+    pub rsp: u64,
 }
 
 impl UserFault {
@@ -80,6 +202,8 @@ pub enum ExitStatus {
     Exited(u64),
     /// Killed by a CPU exception.
     Crashed(UserFault),
+    /// Killed for exceeding its CPU budget after this many ticks.
+    Killed { ticks: u64 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,6 +216,55 @@ pub struct Process {
     pub pml4_phys: u64,
     /// Set when the process is `Crashed`.
     pub fault: Option<UserFault>,
+    /// Program name (ramdisk file or built-in program).
+    pub name: ProcName,
+    /// Saved user registers (valid while not `Running`).
+    pub frame: TrapFrame,
+    /// Timer ticks spent in ring 3.
+    pub ticks_used: u64,
+    /// Times the process was preempted.
+    pub switches: u32,
+    /// Selected by the current [`run_scheduled`] call.
+    pub scheduled: bool,
+    /// Has entered ring 3 at least once.
+    pub started: bool,
+}
+
+/// Fixed-size, `Copy` process name (truncated to [`ProcName::CAPACITY`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcName {
+    bytes: [u8; ProcName::CAPACITY],
+    len: u8,
+}
+
+impl ProcName {
+    pub const CAPACITY: usize = 24;
+
+    pub const fn empty() -> Self {
+        Self {
+            bytes: [0; Self::CAPACITY],
+            len: 0,
+        }
+    }
+
+    pub fn new(name: &str) -> Self {
+        let mut out = Self::empty();
+        for ch in name.chars() {
+            let mut buf = [0u8; 4];
+            let enc = ch.encode_utf8(&mut buf).as_bytes();
+            let at = out.len as usize;
+            if at + enc.len() > Self::CAPACITY {
+                break;
+            }
+            out.bytes[at..at + enc.len()].copy_from_slice(enc);
+            out.len += enc.len() as u8;
+        }
+        out
+    }
+
+    pub fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.bytes[..self.len as usize]).unwrap_or("?")
+    }
 }
 
 impl Process {
@@ -104,6 +277,12 @@ impl Process {
             stack_top: 0,
             pml4_phys: 0,
             fault: None,
+            name: ProcName::empty(),
+            frame: TrapFrame::user_entry(0, 0),
+            ticks_used: 0,
+            switches: 0,
+            scheduled: false,
+            started: false,
         }
     }
 }
@@ -123,6 +302,10 @@ pub enum ProcessError {
 struct ProcessTable {
     slots: [Process; MAX_PROCESSES],
     current: Option<u32>,
+    /// Ticks the current process has run since it was dispatched.
+    slice_used: u64,
+    /// Slot index dispatched most recently (round-robin cursor).
+    cursor: usize,
 }
 
 impl ProcessTable {
@@ -130,6 +313,8 @@ impl ProcessTable {
         Self {
             slots: [Process::free_slot(); MAX_PROCESSES],
             current: None,
+            slice_used: 0,
+            cursor: MAX_PROCESSES - 1,
         }
     }
 
@@ -159,23 +344,164 @@ impl ProcessTable {
             stack_top,
             pml4_phys,
             fault: None,
+            name: ProcName::empty(),
+            frame: TrapFrame::user_entry(entry, stack_top),
+            ticks_used: 0,
+            switches: 0,
+            scheduled: false,
+            started: false,
         };
         Ok(self.slots[idx])
     }
 
-    /// `Ready` → `Running` and make it current.
-    fn start(&mut self, pid: u32) -> Result<Process, ProcessError> {
+    /// Mark which `Ready` processes the next run may schedule. Returns the
+    /// selected pids.
+    fn select(&mut self, which: Select) -> Result<Vec<u32, MAX_PROCESSES>, ProcessError> {
         if self.current.is_some() {
             return Err(ProcessError::Busy);
         }
-        let idx = self.find(pid).ok_or(ProcessError::NotFound)?;
-        let p = &mut self.slots[idx];
-        if p.state != ProcessState::Ready {
-            return Err(ProcessError::BadState(p.state));
+        if let Select::One(pid) = which {
+            let idx = self.find(pid).ok_or(ProcessError::NotFound)?;
+            if self.slots[idx].state != ProcessState::Ready {
+                return Err(ProcessError::BadState(self.slots[idx].state));
+            }
         }
+        let mut picked = Vec::new();
+        for p in self.slots.iter_mut() {
+            p.scheduled = p.state == ProcessState::Ready
+                && match which {
+                    Select::One(pid) => p.pid == pid,
+                    Select::AllReady => true,
+                };
+            if p.scheduled {
+                let _ = picked.push(p.pid);
+            }
+        }
+        Ok(picked)
+    }
+
+    /// Next scheduled `Ready` slot after the cursor (round-robin).
+    fn next_runnable(&self) -> Option<usize> {
+        (1..=MAX_PROCESSES)
+            .map(|k| (self.cursor + k) % MAX_PROCESSES)
+            .find(|&i| self.slots[i].scheduled && self.slots[i].state == ProcessState::Ready)
+    }
+
+    /// Make the next runnable process current and `Running`.
+    fn dispatch_next(&mut self) -> Option<Process> {
+        if self.current.is_some() {
+            return None;
+        }
+        let idx = self.next_runnable()?;
+        self.run_slot(idx);
+        Some(self.slots[idx])
+    }
+
+    fn run_slot(&mut self, idx: usize) {
+        let p = &mut self.slots[idx];
         p.state = ProcessState::Running;
-        self.current = Some(pid);
-        Ok(*p)
+        self.current = Some(p.pid);
+        self.cursor = idx;
+        self.slice_used = 0;
+    }
+
+    /// Charge the current process one tick of ring-3 time; preempt or kill
+    /// it as the policy requires. On `Switch`, `frame` has been saved into
+    /// the old process and replaced with the new one's.
+    fn tick(&mut self, frame: &mut TrapFrame, slice: u64, budget: u64) -> TickAction {
+        let Some(pid) = self.current else {
+            return TickAction::Continue;
+        };
+        let Some(idx) = self.find(pid) else {
+            return TickAction::Continue;
+        };
+        self.slots[idx].ticks_used += 1;
+        self.slice_used += 1;
+        let used = self.slots[idx].ticks_used;
+        if used > budget {
+            return TickAction::Kill { pid, ticks: used };
+        }
+        if self.slice_used < slice {
+            return TickAction::Continue;
+        }
+        self.slice_used = 0;
+        // Round-robin from the current slot; staying put if nobody else is runnable.
+        let Some(next) = self.next_runnable() else {
+            return TickAction::Continue;
+        };
+        let old = &mut self.slots[idx];
+        old.frame = *frame;
+        old.state = ProcessState::Ready;
+        old.switches += 1;
+        let (user_cs, user_ss) = (frame.cs, frame.ss);
+        self.current = None;
+        self.run_slot(next);
+        let new = &self.slots[next];
+        *frame = new.frame;
+        // A process that has never run has no selectors yet (they are
+        // filled in at first dispatch); `iretq` with a null CS faults. All
+        // processes share the ring-3 selectors, so take the interrupted
+        // process's.
+        if frame.cs == 0 {
+            frame.cs = user_cs;
+            frame.ss = user_ss;
+        }
+        frame.rflags |= 0x200;
+        TickAction::Switch {
+            pml4_phys: new.pml4_phys,
+        }
+    }
+
+    /// Current process → `Blocked` with its registers saved; clears `current`.
+    fn block_current(&mut self, frame: &TrapFrame) -> Option<u32> {
+        let pid = self.current.take()?;
+        if let Some(idx) = self.find(pid) {
+            let p = &mut self.slots[idx];
+            p.frame = *frame;
+            p.state = ProcessState::Blocked;
+        }
+        Some(pid)
+    }
+
+    /// `Blocked` → `Ready`, with `result` returned from its syscall.
+    fn unblock(&mut self, pid: u32, result: u64) -> bool {
+        match self.find(pid) {
+            Some(idx) if self.slots[idx].state == ProcessState::Blocked => {
+                let p = &mut self.slots[idx];
+                p.frame.rax = result;
+                p.state = ProcessState::Ready;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn blocked_scheduled(&self) -> Vec<u32, MAX_PROCESSES> {
+        let mut out = Vec::new();
+        for p in self.slots.iter() {
+            if p.scheduled && p.state == ProcessState::Blocked {
+                let _ = out.push(p.pid);
+            }
+        }
+        out
+    }
+
+    /// Current process → `Killed`; clears `current`.
+    fn kill_current(&mut self) -> Option<u32> {
+        let pid = self.current.take()?;
+        if let Some(idx) = self.find(pid) {
+            let p = &mut self.slots[idx];
+            p.state = ProcessState::Killed;
+            p.scheduled = false;
+        }
+        Some(pid)
+    }
+
+    /// Test helper: select and dispatch exactly `pid`.
+    #[cfg(test)]
+    fn start(&mut self, pid: u32) -> Result<Process, ProcessError> {
+        self.select(Select::One(pid))?;
+        self.dispatch_next().ok_or(ProcessError::NotFound)
     }
 
     /// Current process → `Zombie` with `code`; clears `current`.
@@ -185,8 +511,15 @@ impl ProcessTable {
         if let Some(idx) = self.find(pid) {
             self.slots[idx].state = ProcessState::Zombie;
             self.slots[idx].exit_code = code;
+            self.slots[idx].scheduled = false;
         }
         Some(pid)
+    }
+
+    fn set_name(&mut self, pid: u32, name: ProcName) {
+        if let Some(idx) = self.find(pid) {
+            self.slots[idx].name = name;
+        }
     }
 
     /// Current process → `Crashed` with `fault`; clears `current`.
@@ -198,6 +531,7 @@ impl ProcessTable {
             p.state = ProcessState::Crashed;
             p.exit_code = fault.exit_code();
             p.fault = Some(fault);
+            p.scheduled = false;
         }
         Some(pid)
     }
@@ -207,6 +541,9 @@ impl ProcessTable {
         match (p.state, p.fault) {
             (ProcessState::Crashed, Some(f)) => Some(ExitStatus::Crashed(f)),
             (ProcessState::Zombie, _) => Some(ExitStatus::Exited(p.exit_code)),
+            (ProcessState::Killed, _) => Some(ExitStatus::Killed {
+                ticks: p.ticks_used,
+            }),
             _ => None,
         }
     }
@@ -217,7 +554,10 @@ impl ProcessTable {
         let idx = self.find(pid).ok_or(ProcessError::NotFound)?;
         let p = self.slots[idx];
         match p.state {
-            ProcessState::Ready | ProcessState::Zombie | ProcessState::Crashed => {
+            ProcessState::Ready
+            | ProcessState::Zombie
+            | ProcessState::Crashed
+            | ProcessState::Killed => {
                 self.slots[idx] = Process::free_slot();
                 Ok(p)
             }
@@ -235,44 +575,196 @@ pub fn spawn_smoke_elf(
     fa: &mut FrameAllocator,
     program: elf::SmokeProgram,
 ) -> Result<Process, ProcessError> {
-    let (aspace, entry, stack_top) =
-        elf::load_smoke(kernel_pt, fa, program).map_err(ProcessError::Elf)?;
-    let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
-    let inserted = TABLE
-        .lock()
-        .insert(pid, entry, stack_top, aspace.pml4_phys());
-    match inserted {
-        Ok(_) => audit::record_fmt(
-            EventKind::ProcessSpawned,
-            format_args!("pid-{}", pid),
-            entry,
-        ),
-        Err(_) => {
-            aspace.destroy(fa);
-        }
-    }
-    inserted
+    let loaded = elf::load_smoke(kernel_pt, fa, program).map_err(ProcessError::Elf)?;
+    register(loaded, program.name(), fa)
 }
 
-/// Run a `Ready` process in ring 3 until it exits or crashes.
-///
-/// The process stays in the table (`Zombie` or `Crashed`) until [`reap`]ed.
-pub fn enter(pid: u32) -> Result<ExitStatus, ProcessError> {
-    let proc = TABLE.lock().start(pid)?;
-    audit::record_fmt(EventKind::ProcessStarted, format_args!("pid-{}", pid), 0);
-    // TABLE must not be held here: SYS_exit takes it from the syscall path.
-    match crate::syscall::run_user(proc.entry, proc.stack_top, proc.pml4_phys) {
-        Ok(code) => Ok(TABLE.lock().status(pid).unwrap_or(ExitStatus::Exited(code))),
+/// Load an ELF `image` (e.g. from the boot ramdisk) as process `name` and
+/// record it `Ready`. Returns the process and the image's SHA-256, which is
+/// also written to the audit log (`program-loaded`) for provenance.
+pub fn spawn_image(
+    kernel_pt: &PageTableManager,
+    fa: &mut FrameAllocator,
+    name: &str,
+    image: &[u8],
+) -> Result<(Process, [u8; 32]), ProcessError> {
+    use sha2::{Digest, Sha256};
+    let hash: [u8; 32] = Sha256::digest(image).into();
+    let loaded = elf::load_image(kernel_pt, fa, image).map_err(ProcessError::Elf)?;
+    let proc = register(loaded, name, fa)?;
+    let mut prefix = [0u8; 8];
+    prefix.copy_from_slice(&hash[..8]);
+    audit::record_fmt(
+        EventKind::ProgramLoaded,
+        format_args!("pid-{}:{}", proc.pid, name),
+        u64::from_be_bytes(prefix),
+    );
+    Ok((proc, hash))
+}
+
+/// Record a loaded address space as a new `Ready` process.
+fn register(
+    (aspace, entry, stack_top): (AddressSpace, u64, u64),
+    name: &str,
+    fa: &mut FrameAllocator,
+) -> Result<Process, ProcessError> {
+    let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+    let inserted = {
+        let mut table = TABLE.lock();
+        table
+            .insert(pid, entry, stack_top, aspace.pml4_phys())
+            .map(|mut proc| {
+                let name = ProcName::new(name);
+                table.set_name(pid, name);
+                proc.name = name;
+                proc
+            })
+    };
+    match inserted {
+        Ok(proc) => {
+            let _ = crate::agent::create_table(pid);
+            audit::record_fmt(
+                EventKind::ProcessSpawned,
+                format_args!("pid-{}", pid),
+                entry,
+            );
+            Ok(proc)
+        }
         Err(e) => {
+            aspace.destroy(fa);
+            Err(e)
+        }
+    }
+}
+
+/// Run one `Ready` process until it exits, crashes, or is killed.
+///
+/// The process stays in the table until [`reap`]ed.
+pub fn enter(pid: u32) -> Result<ExitStatus, ProcessError> {
+    let results = run_scheduled(Select::One(pid))?;
+    results
+        .iter()
+        .find(|(p, _)| *p == pid)
+        .map(|(_, s)| *s)
+        .ok_or(ProcessError::NotFound)
+}
+
+/// Run the selected `Ready` processes, preemptively and round-robin, until
+/// every one of them has exited, crashed, or been killed. Returns each
+/// selected pid's outcome.
+///
+/// Runs on the calling CPU; returns only when the run is over.
+pub fn run_scheduled(which: Select) -> Result<Vec<(u32, ExitStatus), MAX_PROCESSES>, ProcessError> {
+    let selected = TABLE.lock().select(which)?;
+    loop {
+        // An agent that just blocked for approval returns control here;
+        // ask the human right away rather than after the others finish.
+        if crate::agent::has_pending() {
+            crate::agent::resolve_approvals();
+        }
+        let next = TABLE.lock().dispatch_next();
+        let Some(proc) = next else {
+            // Nothing runnable. Processes waiting on a human get their
+            // decisions now; anything still blocked afterwards has no
+            // pending request and is released with an error.
+            let blocked = TABLE.lock().blocked_scheduled();
+            if blocked.is_empty() {
+                break;
+            }
+            crate::agent::resolve_approvals();
+            for pid in TABLE.lock().blocked_scheduled() {
+                unblock(pid, crate::agent::err(crate::agent::errno::EDENIED));
+            }
+            continue;
+        };
+        if !proc.started {
+            {
+                let mut t = TABLE.lock();
+                if let Some(idx) = t.find(proc.pid) {
+                    t.slots[idx].started = true;
+                }
+            }
+            audit::record_fmt(
+                EventKind::ProcessStarted,
+                format_args!("pid-{}", proc.pid),
+                0,
+            );
+        }
+        // TABLE must not be held here: SYS_exit, faults, and the timer path
+        // all take it while the process runs. Returns when the running
+        // process (whichever that is after preemption) exits, crashes, or
+        // is killed.
+        if let Err(e) = crate::syscall::run_frame(&proc.frame, proc.pml4_phys) {
             // Never reached ring 3: put it back so it can be retried or reaped.
             let mut t = TABLE.lock();
             t.current = None;
-            if let Some(idx) = t.find(pid) {
-                t.slots[idx].state = ProcessState::Ready;
+            for p in t.slots.iter_mut() {
+                if p.state == ProcessState::Running {
+                    p.state = ProcessState::Ready;
+                }
+                p.scheduled = false;
             }
-            Err(ProcessError::Enter(e))
+            return Err(ProcessError::Enter(e));
         }
     }
+    let t = TABLE.lock();
+    let mut out = Vec::new();
+    for pid in selected {
+        if let Some(status) = t.status(pid) {
+            let _ = out.push((pid, status));
+        }
+    }
+    Ok(out)
+}
+
+/// Timer interrupt from ring 3: charge the current process and decide
+/// whether to keep it, switch to another, or kill it. On `Switch` the new
+/// process's page tables are already loaded.
+pub fn on_user_tick(frame: &mut TrapFrame) -> TickAction {
+    // The interrupted code was in ring 3, so no kernel lock is held on this
+    // CPU; `try_lock` only guards against another CPU holding the table.
+    let Some(mut t) = TABLE.try_lock() else {
+        return TickAction::Continue;
+    };
+    let action = t.tick(frame, slice_ticks(), budget_ticks());
+    match action {
+        TickAction::Switch { pml4_phys } => {
+            drop(t);
+            load_page_tables(pml4_phys);
+        }
+        TickAction::Kill { pid, ticks } => {
+            t.kill_current();
+            drop(t);
+            audit::record_fmt(EventKind::ProcessKilled, format_args!("pid-{}", pid), ticks);
+        }
+        TickAction::Continue => {}
+    }
+    action
+}
+
+fn load_page_tables(pml4_phys: u64) {
+    #[cfg(target_os = "none")]
+    unsafe {
+        core::arch::asm!("mov cr3, {}", in(reg) pml4_phys, options(nostack, preserves_flags));
+    }
+    #[cfg(not(target_os = "none"))]
+    let _ = pml4_phys;
+}
+
+/// Park the current process (called from the syscall path with its frame).
+pub fn block_current(frame: &TrapFrame) {
+    TABLE.lock().block_current(frame);
+}
+
+/// Resume a `Blocked` process with `result` as its syscall return value.
+pub fn unblock(pid: u32, result: u64) -> bool {
+    TABLE.lock().unblock(pid, result)
+}
+
+/// Name of process `pid`, if it exists.
+pub fn name_of(pid: u32) -> Option<ProcName> {
+    let t = TABLE.lock();
+    t.find(pid).map(|i| t.slots[i].name)
 }
 
 pub fn current_pid() -> Option<u32> {
@@ -305,6 +797,7 @@ pub fn mark_crashed(fault: UserFault) {
 /// Returns `(exit_code, frames_freed)`.
 pub fn reap(pid: u32, fa: &mut FrameAllocator) -> Result<(u64, usize), ProcessError> {
     let p = TABLE.lock().take_for_reap(pid)?;
+    crate::agent::destroy_table(pid);
     let freed = AddressSpace::from_pml4_phys(p.pml4_phys).destroy(fa);
     audit::record_fmt(
         EventKind::ProcessReaped,
@@ -403,6 +896,7 @@ mod tests {
             error_code: 4,
             rip: 0x8000400000,
             addr: 0,
+            rsp: 0,
         };
         assert_eq!(t.crash_current(fault), Some(5));
         assert_eq!(t.current, None);
@@ -433,12 +927,162 @@ mod tests {
             error_code: 0,
             rip: 0,
             addr: 0,
+            rsp: 0,
         };
         assert_eq!(f(0).name(), "#DE divide error");
         assert_eq!(f(6).name(), "#UD invalid opcode");
         assert_eq!(f(13).name(), "#GP general protection");
         assert_eq!(f(14).name(), "#PF page fault");
         assert_eq!(f(0).exit_code(), 128);
+    }
+
+    #[test]
+    fn names_are_kept_and_truncated() {
+        let mut t = ProcessTable::new();
+        t.insert(9, 0, 0, 0).unwrap();
+        t.set_name(9, ProcName::new("hello"));
+        assert_eq!(t.slots[0].name.as_str(), "hello");
+        let long = ProcName::new("a-very-long-program-name-over-24");
+        assert_eq!(long.as_str().len(), ProcName::CAPACITY);
+        assert_eq!(ProcName::new("héllo").as_str(), "héllo");
+    }
+
+    fn frame(tag: u64) -> TrapFrame {
+        let mut f = TrapFrame::user_entry(0x1000 * tag, 0x2000 * tag);
+        f.rax = tag;
+        f.cs = 0x23;
+        f.ss = 0x1b;
+        f
+    }
+
+    fn table_with(n: u32) -> ProcessTable {
+        let mut t = ProcessTable::new();
+        for pid in 1..=n {
+            t.insert(
+                pid,
+                0x1000 * pid as u64,
+                0x2000 * pid as u64,
+                0x100 * pid as u64,
+            )
+            .unwrap();
+        }
+        t
+    }
+
+    #[test]
+    fn trap_frame_layout_matches_entry_stub() {
+        assert_eq!(core::mem::size_of::<TrapFrame>(), TrapFrame::SIZE);
+        assert_eq!(core::mem::offset_of!(TrapFrame, rax), 14 * 8);
+        assert_eq!(core::mem::offset_of!(TrapFrame, rip), 15 * 8);
+        assert_eq!(core::mem::offset_of!(TrapFrame, ss), 19 * 8);
+        assert!(frame(1).from_user());
+    }
+
+    #[test]
+    fn round_robin_switches_after_a_slice() {
+        let mut t = table_with(3);
+        assert_eq!(t.select(Select::AllReady).unwrap().len(), 3);
+        let first = t.dispatch_next().unwrap();
+        assert_eq!(first.pid, 1);
+        assert_eq!(first.frame.rip, 0x1000);
+
+        let mut f = frame(1);
+        assert_eq!(t.tick(&mut f, 2, 100), TickAction::Continue);
+        f.rax = 111; // process 1 made progress
+        assert_eq!(
+            t.tick(&mut f, 2, 100),
+            TickAction::Switch { pml4_phys: 0x200 }
+        );
+        assert_eq!(t.current, Some(2));
+        assert_eq!(f.rip, 0x2000, "frame now belongs to pid 2");
+        // Regression: pid 2 never ran, so its selectors come from pid 1.
+        assert_eq!((f.cs, f.ss), (0x23, frame(1).ss));
+        assert_ne!(f.rflags & 0x200, 0, "interrupts stay enabled in ring 3");
+        assert_eq!(t.slots[0].frame.rax, 111, "pid 1's registers were saved");
+        assert_eq!(t.slots[0].state, ProcessState::Ready);
+        assert_eq!(t.slots[0].switches, 1);
+
+        t.tick(&mut f, 2, 100);
+        assert_eq!(
+            t.tick(&mut f, 2, 100),
+            TickAction::Switch { pml4_phys: 0x300 }
+        );
+        t.tick(&mut f, 2, 100);
+        // Wraps around to pid 1 with its saved registers.
+        assert_eq!(
+            t.tick(&mut f, 2, 100),
+            TickAction::Switch { pml4_phys: 0x100 }
+        );
+        assert_eq!(f.rax, 111);
+    }
+
+    #[test]
+    fn lone_process_keeps_running_and_budget_kills() {
+        let mut t = table_with(1);
+        t.select(Select::One(1)).unwrap();
+        t.dispatch_next().unwrap();
+        let mut f = frame(1);
+        for _ in 0..5 {
+            assert_eq!(t.tick(&mut f, 1, 5), TickAction::Continue);
+        }
+        assert_eq!(t.tick(&mut f, 1, 5), TickAction::Kill { pid: 1, ticks: 6 });
+        assert_eq!(t.kill_current(), Some(1));
+        assert_eq!(t.slots[0].state, ProcessState::Killed);
+        assert_eq!(t.status(1), Some(ExitStatus::Killed { ticks: 6 }));
+        assert!(t.take_for_reap(1).is_ok());
+    }
+
+    #[test]
+    fn select_one_leaves_others_unscheduled() {
+        let mut t = table_with(2);
+        t.select(Select::One(2)).unwrap();
+        assert_eq!(t.dispatch_next().unwrap().pid, 2);
+        let mut f = frame(2);
+        // Slice expires but pid 1 was not selected: pid 2 keeps the CPU.
+        assert_eq!(t.tick(&mut f, 1, 100), TickAction::Continue);
+        t.exit_current(0);
+        assert_eq!(t.dispatch_next(), None);
+        assert_eq!(t.slots[0].state, ProcessState::Ready);
+    }
+
+    #[test]
+    fn exited_process_is_not_dispatched_again() {
+        let mut t = table_with(2);
+        t.select(Select::AllReady).unwrap();
+        t.dispatch_next().unwrap();
+        t.exit_current(7);
+        assert_eq!(t.dispatch_next().unwrap().pid, 2);
+        t.exit_current(8);
+        assert_eq!(t.dispatch_next(), None);
+    }
+
+    #[test]
+    fn blocked_process_resumes_with_result() {
+        let mut t = table_with(2);
+        t.select(Select::AllReady).unwrap();
+        t.dispatch_next().unwrap();
+        let mut f = frame(1);
+        f.rip = 0x1234;
+        assert_eq!(t.block_current(&f), Some(1));
+        assert_eq!(t.slots[0].state, ProcessState::Blocked);
+        assert_eq!(t.current, None);
+        // A blocked process is not dispatched; the other one is.
+        assert_eq!(t.dispatch_next().unwrap().pid, 2);
+        t.exit_current(0);
+        assert_eq!(t.dispatch_next(), None);
+        assert_eq!(&t.blocked_scheduled()[..], &[1]);
+        assert!(t.unblock(1, 42));
+        assert!(!t.unblock(1, 42), "only blocked processes can be unblocked");
+        let p = t.dispatch_next().unwrap();
+        assert_eq!((p.pid, p.frame.rax, p.frame.rip), (1, 42, 0x1234));
+        // Blocked processes are not reapable.
+        let mut t2 = table_with(1);
+        t2.start(1).unwrap();
+        t2.block_current(&frame(1));
+        assert_eq!(
+            t2.take_for_reap(1).err(),
+            Some(ProcessError::BadState(ProcessState::Blocked))
+        );
     }
 
     #[test]

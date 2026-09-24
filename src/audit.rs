@@ -69,6 +69,24 @@ pub enum EventKind {
     ProcessReaped = 8,
     /// Process killed by a CPU exception. `detail` = exception vector.
     ProcessCrashed = 9,
+    /// Program image loaded. Subject `pid-N:name`; `detail` = first 8 bytes
+    /// of the image's SHA-256 (big-endian).
+    ProgramLoaded = 10,
+    /// Capability handle given to a process. Subject `pid-N:hH:object`;
+    /// `detail` = permission bitmask.
+    CapGranted = 11,
+    /// Process derived a weaker handle. Subject `pid-N:hP->hC:object`;
+    /// `detail` = the child's permission bitmask.
+    CapDerived = 12,
+    /// Process killed for exceeding its CPU budget. `detail` = ticks used.
+    ProcessKilled = 13,
+    /// An agent asked for human approval. Subject `pid-N:req-R:object`;
+    /// `detail` = request id.
+    ApprovalRequested = 14,
+    /// A human approved request `detail`.
+    ApprovalGranted = 15,
+    /// A human denied request `detail`.
+    ApprovalDenied = 16,
 }
 
 impl EventKind {
@@ -83,6 +101,13 @@ impl EventKind {
             EventKind::ProcessExited => "proc-exited",
             EventKind::ProcessReaped => "proc-reaped",
             EventKind::ProcessCrashed => "proc-crashed",
+            EventKind::ProgramLoaded => "program-loaded",
+            EventKind::CapGranted => "cap-granted",
+            EventKind::CapDerived => "cap-derived",
+            EventKind::ProcessKilled => "proc-killed",
+            EventKind::ApprovalRequested => "approval-asked",
+            EventKind::ApprovalGranted => "approval-yes",
+            EventKind::ApprovalDenied => "approval-no",
         }
     }
 }
@@ -95,6 +120,8 @@ pub mod reject_reason {
     pub const UNKNOWN_ISSUER: u64 = 2;
     /// Unsupported token format.
     pub const UNSUPPORTED_FORMAT: u64 = 3;
+    /// Valid token, but it lacks the permission (or a derive tried to add one).
+    pub const PERMISSION_DENIED: u64 = 4;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

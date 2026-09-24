@@ -118,7 +118,7 @@
           <pre class="diagram" aria-label="Target architecture: CDK trust kernel beside Linux, connected over virtio-vsock"><code>┌──────────── CDK (trust kernel) ────────────┐     ┌──────── Linux ────────┐
 │ agents = isolated ring-3 processes         │     │ GPU driver + CUDA/... │
 │ hybrid PQ-signed capability tokens         │     │ inference servers     │
-│ policy + human-approval gates     (planned)│     │ MCP tool servers      │
+│ policy + human-approval gates              │     │ MCP tool servers      │
 │ tamper-evident signed audit log            │     └───────────▲───────────┘
 │ PQ-secure channel X25519+ML-KEM   (planned)│◄── virtio-vsock ┘
 └────────────────────────────────────────────┘</code></pre>
@@ -144,12 +144,17 @@
                 <li>Tamper-evident audit log: SHA-256 hash chain with hybrid-signed checkpoints</li>
                 <li>Fault containment: a crashing agent is terminated and logged; the kernel keeps running</li>
                 <li>Key hygiene: zeroized keys, scrubbed crypto stack, zero-on-free heap, known-answer tests</li>
+                <li>Rust agent programs loaded from a boot ramdisk, each traced to its SHA-256 in the audit log</li>
+                <li>Per-agent capability handles: agents can only derive weaker handles, never stronger ones</li>
+                <li>Preemptive scheduling of agents with a CPU-budget watchdog for runaway agents</li>
+                <li>Native integer-only ML inference inside agents; the model's hash is in the audit trail</li>
+                <li>Human-approval gates: an agent waits until a person approves the exact action</li>
               </ul>
             </div>
             <div>
               <h3 class="status-head next">Next on the roadmap</h3>
               <ul class="checklist todo">
-                <li>Per-agent capability handles and human-approval gates</li>
+                <li>Signed operator approvals; agents on every CPU</li>
                 <li>Hybrid X25519 + ML-KEM-768 channel to Linux; MCP gateway</li>
                 <li>Native CPU inference demo; ARM64 port</li>
               </ul>

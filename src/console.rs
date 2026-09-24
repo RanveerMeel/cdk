@@ -84,6 +84,14 @@ const COMMANDS: &[&str] = &[
     "run",
     "running",
     "user-smoke",
+    "ls",
+    "spawn",
+    "exec",
+    "grant",
+    "handles",
+    "run-all",
+    "budget",
+    "slice",
     "elf-spawn",
     "elf-run",
     "elf-smoke",
@@ -554,13 +562,21 @@ fn dispatch(
         "yield" => cmd_yield(arg1, kernel),
         "run" => cmd_run_next(kernel),
         "user-smoke" => cmd_user_smoke(page_table, frame_alloc),
-        "elf-spawn" => cmd_elf_spawn(arg1, page_table, frame_alloc, false),
-        "elf-run" => cmd_elf_run(arg1),
-        "elf-smoke" => cmd_elf_spawn(arg1, page_table, frame_alloc, true),
+        "ls" => cmd_ls(),
+        "spawn" => cmd_spawn(arg1, "", "", page_table, frame_alloc, kernel, false),
+        "exec" => cmd_spawn(arg1, arg2, arg3, page_table, frame_alloc, kernel, true),
+        "grant" => cmd_grant(arg1, arg2, arg3, kernel),
+        "handles" => cmd_handles(arg1),
+        "run-all" => cmd_run_all(kernel),
+        "budget" => cmd_budget(arg1),
+        "slice" => cmd_slice(arg1),
+        "elf-spawn" => cmd_elf_spawn(arg1, page_table, frame_alloc, kernel, false),
+        "elf-run" => cmd_elf_run(arg1, kernel),
+        "elf-smoke" => cmd_elf_spawn(arg1, page_table, frame_alloc, kernel, true),
         "ps" => cmd_ps(),
         "reap" => cmd_reap(arg1, frame_alloc),
         "irq-route" => cmd_irq_route(arg1, arg2),
-        "send" => cmd_send(arg1, arg2, kernel),
+        "send" => cmd_send(arg1, line.splitn(3, ' ').nth(2).unwrap_or(""), kernel),
         "recv" => cmd_recv(arg1, kernel),
         "delete" => cmd_delete(arg1, kernel, mem_graph),
         "mem" => cmd_mem(mem_graph),
@@ -646,6 +662,14 @@ fn cmd_help() {
     crate::println!("  run               Manually dispatch next task (ignores preemption)");
     crate::println!("  running           Show the currently running task");
     crate::println!("  user-smoke        Ring-3 smoke test (syscall exit, returns)");
+    crate::println!("  ls                List programs in the boot ramdisk (size, SHA-256)");
+    crate::println!("  spawn <name>      Load a ramdisk program as a Ready process");
+    crate::println!("  exec <name> [obj perms]  Load and run a ramdisk program (optionally grant a handle)");
+    crate::println!("  grant <pid> <obj> [perms]  Give a process a capability handle (default send,recv; add ,approval to require a human for each send)");
+    crate::println!("  handles <pid>     List a process's capability handles");
+    crate::println!("  run-all           Run all Ready processes concurrently (preemptive)");
+    crate::println!("  budget [ticks]    Show/set the per-process CPU budget (watchdog)");
+    crate::println!("  slice [ticks]     Show/set the time slice before preemption");
     crate::println!("  elf-spawn [prog]  Load a built-in program (hello|ud|pf|gp|de) as Ready");
     crate::println!("  elf-run <pid>     Run a Ready process until it exits");
     crate::println!("  elf-smoke [prog]  Load and run a built-in program (ud/pf/gp/de crash it)");
@@ -1243,11 +1267,11 @@ fn cmd_audit(n_str: &str) {
         }
     };
     crate::audit::with_log(|log| {
-        crate::println!("SEQ    TSC(M)    EVENT         SUBJECT          DETAIL   HASH");
+        crate::println!("SEQ    TSC(M)    EVENT           SUBJECT          DETAIL   HASH");
         let skip = log.records().len().saturating_sub(n);
         for r in log.records().skip(skip) {
             crate::print!(
-                "{:<6} {:<9} {:<13} {:<16} ",
+                "{:<6} {:<9} {:<15} {:<16} ",
                 r.seq,
                 r.tsc / 1_000_000,
                 r.kind.name(),
@@ -1255,6 +1279,8 @@ fn cmd_audit(n_str: &str) {
             );
             if r.kind == crate::audit::EventKind::ProcessSpawned {
                 crate::print!("{:#x} ", r.detail);
+            } else if r.kind == crate::audit::EventKind::ProgramLoaded {
+                crate::print!("sha256:{:016x} ", r.detail);
             } else {
                 crate::print!("{:<8} ", r.detail);
             }
@@ -2405,6 +2431,7 @@ fn cmd_elf_spawn(
     program: &str,
     page_table: &mut Option<PageTableManager>,
     frame_alloc: &mut FrameAllocator,
+    kernel: &mut Kernel,
     run: bool,
 ) {
     let Some(program) = crate::elf::SmokeProgram::parse(program) else {
@@ -2426,33 +2453,200 @@ fn cmd_elf_spawn(
                 proc.pml4_phys
             );
             if run {
-                run_process(proc.pid);
+                run_process(proc.pid, kernel);
             }
         }
         Err(e) => crate::println!("elf-spawn failed: {:?}", e),
     }
 }
 
-fn cmd_elf_run(pid_str: &str) {
+fn cmd_ls() {
+    use sha2::{Digest, Sha256};
+    let mut any = false;
+    for f in crate::initrd::files() {
+        match f {
+            Ok(f) => {
+                any = true;
+                let hash = Sha256::digest(f.data);
+                crate::print!("  {:<20} {:>8} bytes  sha256:", f.name, f.data.len());
+                print_hex(&hash[..8]);
+                crate::println!("…");
+            }
+            Err(e) => crate::println!("  ramdisk error: {:?} (listing stopped)", e),
+        }
+    }
+    if !any {
+        crate::println!("ls: ramdisk is empty or missing");
+    }
+}
+
+fn cmd_spawn(
+    name: &str,
+    grant_obj: &str,
+    grant_perms: &str,
+    page_table: &mut Option<PageTableManager>,
+    frame_alloc: &mut FrameAllocator,
+    kernel: &mut Kernel,
+    run: bool,
+) {
+    if name.is_empty() {
+        crate::println!("Usage: {} <name>   (see `ls`)", if run { "exec" } else { "spawn" });
+        return;
+    }
+    let Some(file) = crate::initrd::find(name) else {
+        crate::println!("No program '{}' in the ramdisk (see `ls`)", name);
+        return;
+    };
+    let Some(pt) = page_table.as_mut() else {
+        crate::println!("Page table not initialised.");
+        return;
+    };
+    match crate::process::spawn_image(pt, frame_alloc, file.name, file.data) {
+        Ok((proc, hash)) => {
+            crate::print!(
+                "spawn: '{}' pid={} entry={:#x} sha256:",
+                file.name,
+                proc.pid,
+                proc.entry
+            );
+            print_hex(&hash[..8]);
+            crate::println!("…");
+            if !grant_obj.is_empty() {
+                grant_handle(proc.pid, grant_obj, grant_perms, kernel);
+            }
+            if run {
+                run_process(proc.pid, kernel);
+            }
+        }
+        Err(e) => crate::println!("spawn failed: {:?}", e),
+    }
+}
+
+fn cmd_elf_run(pid_str: &str, kernel: &mut Kernel) {
     let Some(pid) = parse_u32(pid_str) else {
         crate::println!("Usage: elf-run <pid>");
         return;
     };
-    run_process(pid);
+    run_process(pid, kernel);
 }
 
-fn run_process(pid: u32) {
+fn cmd_grant(pid_str: &str, obj_ref: &str, perms: &str, kernel: &mut Kernel) {
+    let Some(pid) = parse_u32(pid_str) else {
+        crate::println!("Usage: grant <pid> <object> [perms]   perms: read,write,exec,send,recv,delete|all");
+        return;
+    };
+    grant_handle(pid, obj_ref, perms, kernel);
+}
+
+fn grant_handle(pid: u32, obj_ref: &str, perms: &str, kernel: &mut Kernel) {
+    let perms = if perms.is_empty() { "send,recv" } else { perms };
+    let Some(perms) = crate::agent::parse_permissions(perms) else {
+        crate::println!("grant: bad permissions (use read,write,exec,send,recv,delete or all)");
+        return;
+    };
+    let id = match kernel.resolve_object_ref(obj_ref) {
+        Ok(id) => id,
+        Err(e) => {
+            crate::println!("grant: object '{}': {:?}", obj_ref, e);
+            return;
+        }
+    };
+    let Some(obj) = kernel.for_each_object_find(&id) else {
+        crate::println!("grant: object '{}' not found", obj_ref);
+        return;
+    };
+    match crate::agent::grant(pid, obj, &perms) {
+        Ok(h) => crate::println!(
+            "grant: pid={} handle={} -> {} [{}] (issued, Ed25519+ML-DSA-65)",
+            pid,
+            h,
+            id,
+            crate::agent::permission_names(
+                perms.iter().fold(0, |m, p| m | (1u64 << p.tag()))
+            )
+        ),
+        Err(e) => crate::println!("grant failed: {:?}", e),
+    }
+}
+
+fn cmd_handles(pid_str: &str) {
+    let Some(pid) = parse_u32(pid_str) else {
+        crate::println!("Usage: handles <pid>");
+        return;
+    };
+    let mut any = false;
+    let r = crate::agent::describe(pid, |h, mask, object| {
+        any = true;
+        crate::println!(
+            "  h{:<3} {:<12} {}",
+            h,
+            object,
+            crate::agent::permission_names(mask)
+        );
+    });
+    match r {
+        Ok(()) if !any => crate::println!("handles: pid {} holds none", pid),
+        Ok(()) => {}
+        Err(e) => crate::println!("handles: {:?}", e),
+    }
+}
+
+fn run_process(pid: u32, kernel: &mut Kernel) {
+    match crate::agent::with_kernel(kernel, || crate::process::enter(pid)) {
+        Ok(status) => print_exit_status(pid, status),
+        Err(e) => crate::println!("elf-run failed: {:?}", e),
+    }
+}
+
+fn print_exit_status(pid: u32, status: crate::process::ExitStatus) {
     use crate::process::ExitStatus;
-    match crate::process::enter(pid) {
-        Ok(ExitStatus::Exited(code)) => crate::println!("elf: pid={} exited code={}", pid, code),
-        Ok(ExitStatus::Crashed(fault)) => crate::println!(
+    match status {
+        ExitStatus::Exited(code) => crate::println!("elf: pid={} exited code={}", pid, code),
+        ExitStatus::Crashed(fault) => crate::println!(
             "elf: pid={} CRASHED ({}) exit={} — kernel unaffected",
             pid,
             fault.name(),
             fault.exit_code()
         ),
-        Err(e) => crate::println!("elf-run failed: {:?}", e),
+        ExitStatus::Killed { ticks } => crate::println!(
+            "elf: pid={} KILLED by watchdog after {} ticks — kernel unaffected",
+            pid,
+            ticks
+        ),
     }
+}
+
+/// Run every `Ready` process concurrently under the preemptive scheduler.
+fn cmd_run_all(kernel: &mut Kernel) {
+    let result = crate::agent::with_kernel(kernel, || {
+        crate::process::run_scheduled(crate::process::Select::AllReady)
+    });
+    match result {
+        Ok(results) if results.is_empty() => crate::println!("run-all: no Ready processes"),
+        Ok(results) => {
+            for (pid, status) in results {
+                print_exit_status(pid, status);
+            }
+        }
+        Err(e) => crate::println!("run-all failed: {:?}", e),
+    }
+}
+
+fn cmd_budget(n: &str) {
+    if let Some(ticks) = parse_u32(n) {
+        crate::process::set_budget_ticks(ticks as u64);
+    }
+    crate::println!(
+        "budget: {} ticks per process (watchdog kills beyond this)",
+        crate::process::budget_ticks()
+    );
+}
+
+fn cmd_slice(n: &str) {
+    if let Some(ticks) = parse_u32(n) {
+        crate::process::set_slice_ticks(ticks as u64);
+    }
+    crate::println!("slice: {} ticks before preemption", crate::process::slice_ticks());
 }
 
 fn cmd_ps() {
@@ -2461,7 +2655,7 @@ fn cmd_ps() {
         crate::println!("ps: (no processes)");
         return;
     }
-    crate::println!("PID   STATE     EXIT  ENTRY          CR3");
+    crate::println!("PID   NAME         STATE     EXIT  TICKS    SWITCHES CR3");
     for p in procs.iter() {
         let state = match p.state {
             crate::process::ProcessState::Free => "Free",
@@ -2469,13 +2663,17 @@ fn cmd_ps() {
             crate::process::ProcessState::Running => "Running",
             crate::process::ProcessState::Zombie => "Zombie",
             crate::process::ProcessState::Crashed => "Crashed",
+            crate::process::ProcessState::Blocked => "Blocked",
+            crate::process::ProcessState::Killed => "Killed",
         };
         crate::println!(
-            "{:<5} {:<9} {:<5} {:#014x} {:#x}",
+            "{:<5} {:<12} {:<9} {:<5} {:<8} {:<8} {:#x}",
             p.pid,
+            p.name.as_str(),
             state,
             p.exit_code,
-            p.entry,
+            p.ticks_used,
+            p.switches,
             p.pml4_phys
         );
     }

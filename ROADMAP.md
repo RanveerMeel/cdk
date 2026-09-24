@@ -91,11 +91,14 @@ copies, address-space teardown. See `README.md` for the full list.
 
 | # | Milestone | Status |
 |---|---|---|
-| 2.1 | Load ELF programs and data from the boot image (ramdisk) instead of the built-in smoke binary. | ⬜ |
-| 2.2 | **Agents hold capability handles.** Per-process handle table; syscalls take handles and the kernel checks rights (`SYS_cap_list`, `SYS_cap_derive` with attenuation only, `SYS_cap_drop`). | ⬜ |
-| 2.3 | Preemptive scheduling of user processes; per-process FPU/SSE/AVX state (XSAVE) so user code can run vectorized inference. | ⬜ |
-| 2.4 | **Native CPU inference demo:** run the SecureGuard int8 scam classifier inside a CDK process. | ⬜ |
-| 2.5 | Human-approval capabilities: an action tagged consequential blocks until an approval token is presented on the console / approval channel. | ⬜ |
+| 2.1 | **Programs from the boot ramdisk.** User programs written in Rust (`user/`, static ET_EXEC at the user base, large code model) are packed into a reproducible `ustar` ramdisk; the kernel parses it strictly (checksums, bounds), loads programs with a 64 KiB stack plus guard page, and records each image's SHA-256 in the audit log. Console `ls`, `spawn`, `exec`. | ✅ |
+| 2.2 | **Agents hold capability handles.** Per-process table of kernel-held tokens referenced by index; syscalls `cap_list`, `cap_drop`, `cap_derive` (attenuation only, re-issued with hybrid PQ signatures), `send`/`recv` to the handle's object; every use re-verified and permission-checked; grants, derivations, and denials audit-logged. Console `grant`, `handles`, `exec <prog> <obj> <perms>`. | ✅ |
+| 2.3 | **Preemptive scheduling of agents (one CPU).** Timer entry stubs save full register frames; round-robin switching at ring-3 interrupt boundaries (100 ms slice); per-process CPU budget watchdog (10 s default) kills runaway agents; `run-all`, `budget`, `slice`, `getpid`. | ✅ |
+| 2.4 | **Native CPU inference.** `cdk-ml`: integer-only (`no_std`, no FPU) `CDKLM1` int8 linear-model format and runtime with a hashed-trigram text featurizer; public demo model trained reproducibly by `tools/train_demo_model.py` and cross-checked bit-for-bit against an independent Python implementation; `classify` agent reads messages through a capability handle. Proprietary agents and models are packed into the ramdisk from outside the repository (`CDK_PRIVATE_PROGRAMS_DIR`), never committed. | ✅ |
+| 2.5 | **Human-approval gates.** `RequiresApproval` is a signed capability constraint that derived handles can never drop. A `send` through a gated handle blocks the agent (syscalls now save a full register frame, so any syscall can park a process); the console immediately shows the exact, sanitized payload; the kernel performs the send only on approval, otherwise the agent gets `HumanDenied`. Requests and decisions are audit-logged. | ✅ |
+| 2.8 | Approver identity: decisions signed by an operator key (hardware token / second device), multi-party approval, time-outs, and gating of more effect types than `send`. | ⬜ |
+| 2.6 | Per-process FPU/SSE/AVX state (`XSAVE`) so agents can run vectorized code; today user programs are soft-float. | ⬜ |
+| 2.7 | Agents on every CPU: per-CPU run queues and proper kernel locking in place of the console lending its kernel reference to syscalls. | ⬜ |
 
 ### Phase 3 — Connected agents
 

@@ -171,6 +171,55 @@ Pixel-level text renderer that displays kernel output directly on the QEMU graph
 
 Boot sequence: serial init → **framebuffer init** → interrupts → frame allocator → heap → page tables → console.
 
+### Boot Ramdisk and User Programs (`src/initrd.rs`, `user/`)
+
+**Building.** `user/` is a separate `no_std` crate. `cdk_user` supplies `_start` (aligns the stack, calls `cdk_main`, exits with its return value), `write`/`exit` syscall wrappers, `print!`/`println!`, and a panic handler. `user/.cargo/config.toml` builds static, non-PIE executables (`relocation-model=static`, `code-model=large`, because the user region starts at 512 GiB, beyond the small model's 2 GiB reach); `user/link.ld` links them at `0x80_0040_0000` with `.text`, `.rodata`, `.data`+`.got`, and `.bss` on separate pages. `tools/build_user_programs.sh` builds every `user/src/bin/*.rs` and packs a reproducible `ustar` archive (sorted, owner 0, mtime 0), which `create_disk_image` hands to the bootloader as the ramdisk.
+
+**Loading.** At boot the kernel adopts the ramdisk from `BootInfo`. The tar parser treats it as untrusted: header checksums are verified, sizes are bounds-checked, names must be short printable ASCII without a ustar prefix, non-regular entries are skipped, and parsing stops at the first malformed header. `spawn`/`exec` hash the image (SHA-256), load it with `elf::load_image` (segments capped at 16 MiB, all inside the user region), map a 64 KiB stack whose lower neighbour page stays unmapped as a guard, and record `program-loaded` (`pid-N:name`, first 8 hash bytes) in the audit log.
+
+### Preemptive Agent Scheduling (`src/process.rs`, `src/interrupts.rs`, `src/syscall.rs`)
+
+Each process carries a saved `TrapFrame` (15 general-purpose registers plus the CPU interrupt frame). The PIT and local-APIC timer vectors use full-register assembly entry stubs instead of `x86-interrupt` handlers: they push every register (the stack then *is* a `TrapFrame`), call `timer_dispatch`, and pop whatever the frame holds afterwards.
+
+- `process::run_scheduled` (console `run-all`, or `elf-run` for one pid) marks the selected `Ready` processes and dispatches one: `syscall::run_frame` writes its frame to the top of the CPU's kernel stack and `cdk_user_enter` pops every register and `iretq`s into it.
+- On each timer interrupt from ring 3, `on_user_tick` charges the running process a tick. After `slice` ticks (default 2 ≈ 100 ms; the BSP LAPIC timer runs at 20 Hz), it saves the interrupted frame into that process, copies the next runnable process's frame over the stack frame, loads its `CR3`, and the stub's `iretq` resumes the new process (round-robin). A never-run process borrows the ring-3 selectors from the interrupted one.
+- A process that exceeds `budget` ticks (default 200 ≈ 10 s) is marked `Killed`, logged as `proc-killed`, and the kernel context resumes, exactly like a crash.
+- `SYS_exit` or a fault resumes the kernel loop, which dispatches the next runnable process until none remain.
+
+Switching only happens at ring-3 interrupt boundaries or when a syscall blocks (syscalls run with interrupts masked by `SFMASK`), so one kernel stack per CPU is enough and no kernel state is ever suspended mid-operation. User programs are soft-float, so no FPU state is switched yet (roadmap 2.6); all agents currently run on the console's CPU (roadmap 2.7), which is also what keeps `agent::with_kernel` sound.
+
+### Human-Approval Gates (`src/agent.rs`, `src/syscall.rs`, `src/process.rs`)
+
+`Permission::RequiresApproval` (tag 7) is a *constraint* carried in the signed permission set: an agent can't strip it by forging, and `cap_derive` always carries it into the child (a child may add it but never drop it). `all` grants every right but not the constraint.
+
+**Blocking syscalls.** The syscall entry stub now pushes a complete `TrapFrame` (same layout as the timer stubs) and calls `syscall_entry(&mut frame)`; results go back in `frame.rax` and every other user register is preserved. A handler may instead return `Outcome::Block`: the frame is saved into the process (`Blocked`), and the kernel context resumes the scheduler loop. `process::unblock(pid, result)` later makes it `Ready` with `result` in `rax`, and it resumes via `iretq` right after its `syscall`.
+
+**Flow.** A `send` through a gated handle copies and validates the payload, queues a `Pending` request (id, pid, handle, token, payload), records `approval-asked`, and blocks. The scheduler loop, which regains control as soon as the agent blocks, prompts on the console: agent pid and name, target object, handle, and the payload with every non-printable byte, `"` and `\` escaped as `\xNN` (an agent cannot inject terminal control sequences or fake console text). `y`/`yes` approves: the kernel performs the send through `Kernel::send_message` (re-verifying the token) and returns its result; anything else returns `HumanDenied` (`-8`). Decisions are recorded as `approval-yes` / `approval-no`. Other agents are paused while the human decides.
+
+**Limits.** One console operator, whose identity is not cryptographically bound to the decision; only `send` is gated; requests wait indefinitely (the CPU-budget watchdog does not tick while blocked). Signed operator approvals and multi-party rules are roadmap item 2.8.
+
+### Native Inference (`user/ml`, `user/models`, `tools/train_demo_model.py`)
+
+`cdk-ml` is a `no_std` crate with no floating point: agents are soft-float and have no FPU state (roadmap 2.6). Models use the `CDKLM1` format — header (magic, feature count ≤ 1024, class count 2–16, feature kind, logit scale), 16-byte labels, i32 biases, i8 weights — and are rejected unless the byte length matches the header exactly. Features are u8 (255 ≙ 1.0); logits are `bias + Σ w·x` in 64-bit accumulators, clamped to i32; `classify` returns argmax and the margin over the runner-up. `text::hashed_trigrams` is a generic featurizer (ASCII-lowercased, non-alphanumerics to spaces, FNV-1a of each 3-byte window, bucket presence).
+
+The demo model is trained by a dependency-free, deterministic Python script that also writes `priority-demo.vectors`: expected integer logits from its own independent implementation of the featurizer and inference. `cdk-ml`'s host tests must reproduce them exactly. Agents embed models with `include_bytes!`, so the `program-loaded` hash covers the model. `tools/build_user_programs.sh` optionally adds prebuilt programs from `CDK_PRIVATE_PROGRAMS_DIR` (must be outside the repo) to a local ramdisk, which is how proprietary models are run without publishing them.
+
+### Agent Capability Handles (`src/agent.rs`)
+
+Each process gets a table of up to 16 `Capability` tokens when it is spawned; the table is cleared when it is reaped. Tokens stay in kernel memory; programs use the index.
+
+| nr | Syscall | Arguments | Result |
+|---|---|---|---|
+| 3 | `cap_list` | `buf, max` | handle count; writes `{u32 handle, u32 perms}` entries |
+| 4 | `cap_drop` | `handle` | 0 |
+| 5 | `cap_derive` | `handle, mask` | new handle, holding only `mask` (must be a subset; the parent is re-verified first) |
+| 6 | `send` | `handle, ptr, len ≤ 64` | 0; message goes to the handle's object, `from = pid-N` |
+| 7 | `recv` | `handle, ptr, len` | bytes copied from the next message |
+
+Errors return as `-(code)`: 1 bad handle, 2 denied, 3 invalid, 4 queue full, 5 empty, 6 table full, 7 bad signature. `send`/`recv` go through `Kernel::send_message`/`receive_message`, so every use re-verifies the hybrid proof (usually a verified-proof cache hit) and checks the permission. Grants (`cap-granted`), derivations (`cap-derived`), and denials (`cap-rejected`, reason 4) are audit-logged. The syscall entry stub now passes a third argument (`rdx`). User writes (`recv`, `cap_list`) use `copy_to_user`, which requires every destination page to be user-accessible and writable before writing anything.
+
+**Kernel access from syscalls.** The console holds the kernel lock while a program runs, so syscalls can't take it. `agent::with_kernel` lends the console's `&mut Kernel` to the syscall layer for the duration of `process::enter`; this is sound because the program runs synchronously on the console's CPU until it exits. This remains sound with preemptive scheduling because every agent still runs on the console's CPU and preemption only switches between ring-3 programs; running agents on other CPUs (roadmap 2.7) must replace it with proper locking.
+
 ### Audit Log (`src/audit.rs`)
 
 A tamper-evident record of security-relevant events: capability issuance (`cap-issued`), every capability check (`cap-accepted`, or `cap-rejected` with a reason code: 1 invalid signature, 2 unknown issuer, 3 unsupported format), and process `spawned` / `started` / `exited` / `reaped`.

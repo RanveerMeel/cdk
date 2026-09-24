@@ -1,0 +1,10 @@
+# User programs run in CDK's ring 3 at fixed addresses inside the user region
+# (PML4 slot 1, 512 GiB and up). Build them as static, non-PIE executables
+# (ET_EXEC) so the kernel loader maps segments exactly where they were linked
+# and never has to apply relocations. The `large` code model is required
+# because the default `small` model assumes everything lives below 2 GiB.
+[build]
+target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+rustflags = ["-C", "relocation-model=static", "-C", "code-model=large"]

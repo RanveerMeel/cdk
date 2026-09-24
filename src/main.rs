@@ -294,6 +294,23 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         cdk::println!("Heap: WARNING — skipped (no physical memory map offset)");
     }
 
+    // Boot ramdisk (ustar archive of user programs), if the image carries one.
+    match boot_info.ramdisk_addr.into_option() {
+        Some(addr) if boot_info.ramdisk_len > 0 => {
+            // SAFETY: the bootloader maps the ramdisk read-only for the
+            // kernel's lifetime and never reuses it.
+            unsafe { cdk::initrd::init(addr, boot_info.ramdisk_len) };
+            let count = cdk::initrd::files().filter(|f| f.is_ok()).count();
+            cdk::println!(
+                "Ramdisk: {} bytes at {:#x}, {} program(s)",
+                boot_info.ramdisk_len,
+                addr,
+                count
+            );
+        }
+        _ => cdk::println!("Ramdisk: none"),
+    }
+
     // Kernel capability issuer (hybrid Ed25519 + ML-DSA-65). Needs the heap.
     {
         let issuer = cdk::issuer::init();

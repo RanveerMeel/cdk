@@ -24,6 +24,9 @@ const BITMAP_WORDS: usize = MAX_FRAMES / 64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PhysFrame(pub u64); // physical base address of the 4 KiB frame
 
+/// Physical memory below this address is never allocated (see `init`).
+pub const LOW_MEMORY_RESERVED: u64 = 0x10_0000;
+
 impl PhysFrame {
     /// Physical base address of this frame.
     pub fn base_addr(self) -> u64 {
@@ -108,6 +111,23 @@ impl FrameAllocator {
         // Recount after init.
         self.free_frames = self.count_free();
         self.reserved_frames = self.total_frames - self.free_frames;
+    }
+
+    /// Permanently reserve every frame overlapping `[start, end)`.
+    /// Returns how many previously free frames were taken out of service.
+    pub fn reserve_range(&mut self, start: u64, end: u64) -> usize {
+        let first = (start / FRAME_SIZE) as usize;
+        let last = (end.div_ceil(FRAME_SIZE) as usize).min(self.total_frames);
+        let mut taken = 0;
+        for frame in first..last {
+            if !self.is_used(frame) {
+                self.set_used(frame);
+                taken += 1;
+            }
+        }
+        self.free_frames -= taken;
+        self.reserved_frames += taken;
+        taken
     }
 
     // -----------------------------------------------------------------
@@ -271,6 +291,11 @@ pub mod boot {
             let _ = entries.push((region.start, region.end - region.start, usable));
         }
         allocator.init_from_regions(&entries);
+        // Never hand out the first 1 MiB: it holds the real-mode IVT/BDA/EBDA
+        // and the AP startup trampoline (0x8000), whose page doubles as the
+        // AP's startup stack and status mailbox. Allocating it let SMP
+        // bring-up writes land in a user program's code page.
+        allocator.reserve_range(0, super::LOW_MEMORY_RESERVED);
     }
 }
 
@@ -331,6 +356,23 @@ mod tests {
         let mut a = make_allocator(&[(0, FRAME_SIZE, true)]);
         let ghost = PhysFrame(1024 * FRAME_SIZE); // beyond total_frames
         assert!(matches!(a.free(ghost), Err(AllocError::OutOfRange)));
+    }
+
+    #[test]
+    fn reserve_range_takes_frames_out_of_service() {
+        let mut fa = FrameAllocator::new();
+        fa.init_from_regions(&[(0, 16 * FRAME_SIZE, true)]);
+        let free = fa.free_frames();
+        assert_eq!(fa.reserve_range(0, 8 * FRAME_SIZE), 8);
+        assert_eq!(fa.free_frames(), free - 8);
+        // Idempotent for already-reserved frames; partial frames round outward
+        // (frame 7 is already reserved, frame 8 is taken).
+        assert_eq!(fa.reserve_range(7 * FRAME_SIZE, 8 * FRAME_SIZE + 1), 1);
+        for _ in 0..(free - 9) {
+            let f = fa.alloc().unwrap();
+            assert!(f.base_addr() >= 9 * FRAME_SIZE, "reserved frame handed out");
+        }
+        assert_eq!(fa.alloc(), Err(AllocError::OutOfMemory));
     }
 
     #[test]
