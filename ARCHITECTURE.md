@@ -119,7 +119,9 @@ The `FrameSource` trait decouples the walker from the concrete allocator, enabli
 
 ### User Processes (`src/process.rs`, `src/syscall.rs`, `src/elf.rs`)
 
-Lifecycle: `elf-spawn` loads an ELF into a new address space → `Ready`; `elf-run` → `Running`; `SYS_exit` → `Zombie`; `reap` frees the address space and slot.
+Lifecycle: `elf-spawn` loads an ELF into a new address space → `Ready`; `elf-run` → `Running`; `SYS_exit` → `Zombie`, or a CPU exception → `Crashed`; `reap` frees the address space and slot.
+
+**Fault containment.** Every exception vector a ring-3 program can raise (`#DE #OF #BR #UD #NM #NP #SS #GP #PF #MF #AC #XM`, and `#BP` from user mode) has a handler that checks the saved code segment's privilege level. For a ring-3 fault, `syscall::abort_user` swaps GS back to the kernel base (interrupt gates don't `swapgs`), marks the process `Crashed` with exit code 128 + vector, records `proc-crashed` in the audit log, and restores the kernel context saved by `run_user`, so `elf-run` reports the crash and the console continues. Kernel-mode faults print the vector, RIP, faulting address and error code, then halt the CPU instead of escalating to a double fault. Built-in crash programs (`elf-smoke ud|pf|gp|de`) exercise the path.
 
 `syscall::run_user` saves the caller's callee-saved registers, `RSP`, `RFLAGS` and `CR3` in a per-CPU slot, loads the process `CR3`, and `iretq`s into ring 3. On `SYS_exit` the syscall path restores that context, so `run_user` simply returns the exit code — the console keeps running. Syscalls: `SYS_exit(code)` (1) and `SYS_write(ptr, len)` (2, up to 1024 bytes, returns the byte count or `-1`).
 

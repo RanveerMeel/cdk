@@ -142,12 +142,12 @@
                 <li>Dedicated crypto stack for post-quantum operations</li>
                 <li>Capability-gated IPC and networking</li>
                 <li>Tamper-evident audit log: SHA-256 hash chain with hybrid-signed checkpoints</li>
+                <li>Fault containment: a crashing agent is terminated and logged; the kernel keeps running</li>
               </ul>
             </div>
             <div>
               <h3 class="status-head next">Next on the roadmap</h3>
               <ul class="checklist todo">
-                <li>User-fault containment (a crashing agent can't take down the kernel)</li>
                 <li>Per-agent capability handles and human-approval gates</li>
                 <li>Hybrid X25519 + ML-KEM-768 channel to Linux; MCP gateway</li>
                 <li>Native CPU inference demo; ARM64 port</li>

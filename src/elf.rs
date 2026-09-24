@@ -248,11 +248,75 @@ pub const SMOKE_VADDR: u64 = paging::USER_BASE + 0x40_0000;
 /// Message the smoke ELF prints with `SYS_write`.
 pub const SMOKE_MESSAGE: &[u8] = b"Hello from ring 3!\n";
 
-/// Build a tiny ELF64 ET_EXEC at [`SMOKE_VADDR`] that writes
-/// [`SMOKE_MESSAGE`] and exits with the byte count `SYS_write` returned.
-pub fn build_smoke_elf(out: &mut [u8]) -> Result<usize, ElfError> {
-    // Layout: [Ehdr][Phdr][code...][message]
-    const CODE_VADDR: u64 = SMOKE_VADDR;
+/// Exit code a crash test program returns if its faulting instruction
+/// unexpectedly succeeds.
+pub const NO_FAULT_EXIT: u64 = 0xBAD;
+
+/// Built-in ring-3 test programs (console `elf-spawn [program]`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SmokeProgram {
+    /// Writes [`SMOKE_MESSAGE`] and exits with the byte count.
+    Hello,
+    /// `ud2` → #UD.
+    InvalidOpcode,
+    /// Reads address 0 (kernel-shared, not user-accessible) → #PF.
+    PageFault,
+    /// `hlt` is privileged → #GP.
+    GeneralProtection,
+    /// Divides by zero → #DE.
+    DivideByZero,
+}
+
+impl SmokeProgram {
+    pub const ALL: [SmokeProgram; 5] = [
+        SmokeProgram::Hello,
+        SmokeProgram::InvalidOpcode,
+        SmokeProgram::PageFault,
+        SmokeProgram::GeneralProtection,
+        SmokeProgram::DivideByZero,
+    ];
+
+    /// Console name (`hello`, `ud`, `pf`, `gp`, `de`).
+    pub fn name(self) -> &'static str {
+        match self {
+            SmokeProgram::Hello => "hello",
+            SmokeProgram::InvalidOpcode => "ud",
+            SmokeProgram::PageFault => "pf",
+            SmokeProgram::GeneralProtection => "gp",
+            SmokeProgram::DivideByZero => "de",
+        }
+    }
+
+    /// Parse a console name; empty means [`SmokeProgram::Hello`].
+    pub fn parse(name: &str) -> Option<Self> {
+        if name.is_empty() {
+            return Some(SmokeProgram::Hello);
+        }
+        Self::ALL.into_iter().find(|p| p.name() == name)
+    }
+
+    /// Write the program's machine code into `out`; returns its length.
+    fn code(self, out: &mut [u8; 64]) -> usize {
+        // Crash programs fall through to exit(NO_FAULT_EXIT) if no fault occurs.
+        const FALLBACK: &[u8] = &[
+            0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1 (SYS_EXIT)
+            0xBF, 0xAD, 0x0B, 0x00, 0x00, // mov edi, 0xBAD
+            0x0F, 0x05, //                   syscall
+        ];
+        let faulting: &[u8] = match self {
+            SmokeProgram::Hello => return hello_code(out),
+            SmokeProgram::InvalidOpcode => &[0x0F, 0x0B], // ud2
+            SmokeProgram::PageFault => &[0x48, 0x8B, 0x04, 0x25, 0, 0, 0, 0], // mov rax, [0]
+            SmokeProgram::GeneralProtection => &[0xF4], //  hlt
+            SmokeProgram::DivideByZero => &[0x31, 0xC9, 0xF7, 0xF1], // xor ecx, ecx; div ecx
+        };
+        out[..faulting.len()].copy_from_slice(faulting);
+        out[faulting.len()..faulting.len() + FALLBACK.len()].copy_from_slice(FALLBACK);
+        faulting.len() + FALLBACK.len()
+    }
+}
+
+fn hello_code(out: &mut [u8; 64]) -> usize {
     const MSG_LEN: u8 = SMOKE_MESSAGE.len() as u8;
     const PROGRAM: &[u8] = &[
         0xB8, 0x02, 0x00, 0x00, 0x00, //       mov eax, 2        (SYS_WRITE)
@@ -264,13 +328,26 @@ pub fn build_smoke_elf(out: &mut [u8]) -> Result<usize, ElfError> {
         0x0F, 0x05, //                         syscall
         0x0F, 0x0B, //                         ud2
     ];
-    let mut code = [0u8; PROGRAM.len() + SMOKE_MESSAGE.len()];
-    code[..PROGRAM.len()].copy_from_slice(PROGRAM);
-    code[PROGRAM.len()..].copy_from_slice(SMOKE_MESSAGE);
-    const CODE: usize = PROGRAM.len() + SMOKE_MESSAGE.len();
+    out[..PROGRAM.len()].copy_from_slice(PROGRAM);
+    out[PROGRAM.len()..PROGRAM.len() + SMOKE_MESSAGE.len()].copy_from_slice(SMOKE_MESSAGE);
+    PROGRAM.len() + SMOKE_MESSAGE.len()
+}
+
+/// Build the [`SmokeProgram::Hello`] ELF (see [`build_program_elf`]).
+pub fn build_smoke_elf(out: &mut [u8]) -> Result<usize, ElfError> {
+    build_program_elf(SmokeProgram::Hello, out)
+}
+
+/// Build a tiny ELF64 ET_EXEC at [`SMOKE_VADDR`] containing `program`.
+pub fn build_program_elf(program: SmokeProgram, out: &mut [u8]) -> Result<usize, ElfError> {
+    // Layout: [Ehdr][Phdr][code...]
+    const CODE_VADDR: u64 = SMOKE_VADDR;
+    let mut code = [0u8; 64];
+    let code_len = program.code(&mut code);
+    let code = &code[..code_len];
     let phoff = EHDR_SIZE as u64;
     let code_off = (EHDR_SIZE + PHDR_SIZE) as u64;
-    let total = code_off as usize + CODE;
+    let total = code_off as usize + code_len;
     if out.len() < total {
         return Err(ElfError::Truncated);
     }
@@ -298,12 +375,12 @@ pub fn build_smoke_elf(out: &mut [u8]) -> Result<usize, ElfError> {
     ph[8..16].copy_from_slice(&code_off.to_le_bytes());
     ph[16..24].copy_from_slice(&CODE_VADDR.to_le_bytes());
     ph[24..32].copy_from_slice(&CODE_VADDR.to_le_bytes()); // paddr
-    let fsz = CODE as u64;
+    let fsz = code_len as u64;
     ph[32..40].copy_from_slice(&fsz.to_le_bytes());
     ph[40..48].copy_from_slice(&fsz.to_le_bytes());
     ph[48..56].copy_from_slice(&FRAME_SIZE.to_le_bytes());
 
-    out[code_off as usize..total].copy_from_slice(&code);
+    out[code_off as usize..total].copy_from_slice(code);
     let _ = EI_NIDENT;
     Ok(total)
 }
@@ -317,9 +394,10 @@ pub const USER_STACK_TOP: u64 = paging::USER_BASE + 0x80_0000;
 pub fn load_smoke(
     kernel_pt: &PageTableManager,
     fa: &mut FrameAllocator,
+    program: SmokeProgram,
 ) -> Result<(AddressSpace, u64, u64), ElfError> {
     let mut blob = [0u8; 256];
-    let n = build_smoke_elf(&mut blob)?;
+    let n = build_program_elf(program, &mut blob)?;
     let img = parse(&blob[..n])?;
     let mut aspace = AddressSpace::from_kernel(kernel_pt, fa).map_err(ElfError::Map)?;
     let loaded = load_into(&img, &mut aspace, fa).and_then(|entry| {
@@ -371,6 +449,31 @@ mod tests {
         let msg = 12 + disp;
         assert_eq!(&code[msg..msg + SMOKE_MESSAGE.len()], SMOKE_MESSAGE);
         assert_eq!(code[13] as usize, SMOKE_MESSAGE.len());
+    }
+
+    #[test]
+    fn every_builtin_program_builds_and_parses() {
+        for program in SmokeProgram::ALL {
+            let mut blob = [0u8; 256];
+            let n = build_program_elf(program, &mut blob).unwrap();
+            let img = parse(&blob[..n]).unwrap();
+            assert_eq!(img.entry, SMOKE_VADDR);
+            assert_eq!(SmokeProgram::parse(program.name()), Some(program));
+        }
+        assert_eq!(SmokeProgram::parse(""), Some(SmokeProgram::Hello));
+        assert_eq!(SmokeProgram::parse("nope"), None);
+    }
+
+    #[test]
+    fn crash_programs_fall_back_to_bad_exit() {
+        let mut code = [0u8; 64];
+        let n = SmokeProgram::GeneralProtection.code(&mut code);
+        assert_eq!(code[0], 0xF4); // hlt
+        // hlt (1 byte), mov eax, 1 (5 bytes), then mov edi, 0xBAD: opcode at 6,
+        // immediate at 7..11.
+        assert_eq!(code[6], 0xBF);
+        assert_eq!(&code[7..11], &(NO_FAULT_EXIT as u32).to_le_bytes());
+        assert_eq!(&code[n - 2..n], &[0x0F, 0x05]);
     }
 
     #[test]

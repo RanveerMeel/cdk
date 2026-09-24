@@ -83,7 +83,7 @@ copies, address-space teardown. See `README.md` for the full list.
 |---|---|---|
 | 1.1 | **Issuer-bound, hybrid post-quantum capability tokens.** A kernel issuer identity (Ed25519 + ML-DSA-65) is generated at boot. Tokens carry a format version, algorithm ID, issuer key ID, and a canonical, domain-separated digest. Verification checks the signature against the **pinned issuer key**, not a key embedded in the token (fixes a forgery hole in the original design, where any self-signed token verified). | ✅ |
 | 1.2 | **Tamper-evident audit log.** Append-only, hash-chained records (SHA-256) of capability issuance, use, denial, and process lifecycle; hybrid-signed checkpoints every 64 records; console `audit` / `audit-verify`. Exporting checkpoints off the machine follows in Phase 3. | ✅ |
-| 1.3 | **User-fault containment.** Page faults, `#UD`, `#GP`, divide errors from ring 3 terminate the offending process (Zombie + crash code) and return to the kernel instead of taking the machine down. | ⬜ |
+| 1.3 | **User-fault containment.** CPU exceptions raised in ring 3 (`#DE #OF #BR #UD #NM #NP #SS #GP #PF #MF #AC #XM #BP`) terminate the offending process (`Crashed`, exit code 128 + vector, audit-logged) and return to the kernel; kernel-mode faults print diagnostics and halt instead of escalating to a double fault. | ✅ |
 | 1.4 | **Key hygiene.** Zeroize secret keys, keep issuer secrets out of copyable structures, constant-time comparisons, KAT tests against NIST vectors for ML-DSA / ML-KEM, cache verified proofs so hot paths avoid repeated ML-DSA verification. | ⬜ |
 
 ### Phase 2 — Agent runtime

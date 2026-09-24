@@ -67,6 +67,8 @@ pub enum EventKind {
     ProcessExited = 7,
     /// Process reaped. `detail` = frames freed.
     ProcessReaped = 8,
+    /// Process killed by a CPU exception. `detail` = exception vector.
+    ProcessCrashed = 9,
 }
 
 impl EventKind {
@@ -80,6 +82,7 @@ impl EventKind {
             EventKind::ProcessStarted => "proc-started",
             EventKind::ProcessExited => "proc-exited",
             EventKind::ProcessReaped => "proc-reaped",
+            EventKind::ProcessCrashed => "proc-crashed",
         }
     }
 }

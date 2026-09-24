@@ -74,6 +74,32 @@ pub extern "C" fn syscall_dispatch(nr: u64, arg0: u64, arg1: u64) -> u64 {
     }
 }
 
+/// Terminate the ring-3 program that raised `fault` and resume the kernel
+/// context that entered it (as `SYS_exit` does). Called from CPU exception
+/// handlers only when the fault came from ring 3.
+#[cfg(target_os = "none")]
+pub fn abort_user(fault: crate::process::UserFault) -> ! {
+    // The exception arrived through an interrupt gate, which (unlike the
+    // SYSCALL stub) does not swap GS: GS_BASE still holds the user value and
+    // KERNEL_GS_BASE the CpuLocal pointer. Swap back before anything else.
+    unsafe { core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags)) };
+    crate::process::mark_crashed(fault);
+    crate::println!(
+        "Fault: {} in ring 3 at rip={:#x} addr={:#x} err={:#x} — process terminated",
+        fault.name(),
+        fault.rip,
+        fault.addr,
+        fault.error_code
+    );
+    if let Some(slot) = resume::take_armed(current_slot()) {
+        unsafe { resume::resume(slot, fault.exit_code()) }
+    }
+    // No saved context (should not happen): park this CPU.
+    loop {
+        unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)) };
+    }
+}
+
 /// `SYS_write(ptr, len)`: print `len` bytes of user memory at `ptr` to the
 /// console. Returns the byte count, or [`SYSCALL_ERR`] if the buffer is too
 /// long or any byte of it is not mapped user memory.

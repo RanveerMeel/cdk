@@ -553,9 +553,9 @@ fn dispatch(
         "yield" => cmd_yield(arg1, kernel),
         "run" => cmd_run_next(kernel),
         "user-smoke" => cmd_user_smoke(page_table, frame_alloc),
-        "elf-spawn" => cmd_elf_spawn(page_table, frame_alloc, false),
+        "elf-spawn" => cmd_elf_spawn(arg1, page_table, frame_alloc, false),
         "elf-run" => cmd_elf_run(arg1),
-        "elf-smoke" => cmd_elf_spawn(page_table, frame_alloc, true),
+        "elf-smoke" => cmd_elf_spawn(arg1, page_table, frame_alloc, true),
         "ps" => cmd_ps(),
         "reap" => cmd_reap(arg1, frame_alloc),
         "irq-route" => cmd_irq_route(arg1, arg2),
@@ -644,11 +644,11 @@ fn cmd_help() {
     crate::println!("  run               Manually dispatch next task (ignores preemption)");
     crate::println!("  running           Show the currently running task");
     crate::println!("  user-smoke        Ring-3 smoke test (syscall exit, returns)");
-    crate::println!("  elf-spawn         Load smoke ELF into process table (Ready)");
+    crate::println!("  elf-spawn [prog]  Load a built-in program (hello|ud|pf|gp|de) as Ready");
     crate::println!("  elf-run <pid>     Run a Ready process until it exits");
-    crate::println!("  elf-smoke         Load smoke ELF and run it");
+    crate::println!("  elf-smoke [prog]  Load and run a built-in program (ud/pf/gp/de crash it)");
     crate::println!("  ps                List processes");
-    crate::println!("  reap <pid>        Free a Ready/Zombie process and its memory");
+    crate::println!("  reap <pid>        Free a Ready/Zombie/Crashed process and its memory");
     crate::println!("  irq-route <irq> <apic>  Route IOAPIC IRQ affinity");
     crate::println!("  send <id> <text>  Send a text message to an object");
     crate::println!("  recv <id>         Receive next message from an object");
@@ -2347,18 +2347,24 @@ fn cmd_user_smoke(
 }
 
 fn cmd_elf_spawn(
+    program: &str,
     page_table: &mut Option<PageTableManager>,
     frame_alloc: &mut FrameAllocator,
     run: bool,
 ) {
+    let Some(program) = crate::elf::SmokeProgram::parse(program) else {
+        crate::println!("Unknown program '{}'. Choose: hello ud pf gp de", program);
+        return;
+    };
     let Some(pt) = page_table.as_mut() else {
         crate::println!("Page table not initialised.");
         return;
     };
-    match crate::process::spawn_smoke_elf(pt, frame_alloc) {
+    match crate::process::spawn_smoke_elf(pt, frame_alloc, program) {
         Ok(proc) => {
             crate::println!(
-                "elf: spawned pid={} entry={:#x} stack={:#x} cr3={:#x}",
+                "elf: spawned '{}' pid={} entry={:#x} stack={:#x} cr3={:#x}",
+                program.name(),
                 proc.pid,
                 proc.entry,
                 proc.stack_top,
@@ -2381,8 +2387,15 @@ fn cmd_elf_run(pid_str: &str) {
 }
 
 fn run_process(pid: u32) {
+    use crate::process::ExitStatus;
     match crate::process::enter(pid) {
-        Ok(code) => crate::println!("elf: pid={} exited code={}", pid, code),
+        Ok(ExitStatus::Exited(code)) => crate::println!("elf: pid={} exited code={}", pid, code),
+        Ok(ExitStatus::Crashed(fault)) => crate::println!(
+            "elf: pid={} CRASHED ({}) exit={} — kernel unaffected",
+            pid,
+            fault.name(),
+            fault.exit_code()
+        ),
         Err(e) => crate::println!("elf-run failed: {:?}", e),
     }
 }
@@ -2400,6 +2413,7 @@ fn cmd_ps() {
             crate::process::ProcessState::Ready => "Ready",
             crate::process::ProcessState::Running => "Running",
             crate::process::ProcessState::Zombie => "Zombie",
+            crate::process::ProcessState::Crashed => "Crashed",
         };
         crate::println!(
             "{:<5} {:<9} {:<5} {:#014x} {:#x}",
