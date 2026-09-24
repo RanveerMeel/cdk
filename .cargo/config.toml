@@ -3,6 +3,11 @@ target = "x86_64-unknown-none"
 
 [target.x86_64-unknown-none]
 runner = "qemu-system-x86_64 -drive format=raw,file=target/x86_64-unknown-none/debug/bootimage-cdk.bin"
+# curve25519-dalek auto-selects its SIMD backend on nightly, which LLVM cannot lower
+# for this SSE-less target. Force the portable serial backend for every build.
+# Note: a RUSTFLAGS env var replaces this list, so scripts that set RUSTFLAGS must
+# repeat the cfg (see run_qemu.sh).
+rustflags = ['--cfg', 'curve25519_dalek_backend="serial"']
 
 [alias]
 # Run host-side unit tests (bypasses the bare-metal default target).
