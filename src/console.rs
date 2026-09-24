@@ -141,6 +141,7 @@ const COMMANDS: &[&str] = &[
     "capsign",
     "capverify",
     "issuer",
+    "capbench",
     "audit",
     "audit-verify",
     "audit-checkpoint",
@@ -613,6 +614,7 @@ fn dispatch(
         "capsign" => cmd_capsign(arg1, kernel),
         "capverify" => cmd_capverify(arg1, kernel),
         "issuer" => cmd_issuer(),
+        "capbench" => cmd_capbench(arg1, arg2, kernel),
         "audit" => cmd_audit(arg1),
         "audit-verify" => cmd_audit_verify(),
         "audit-checkpoint" => cmd_audit_checkpoint(),
@@ -711,6 +713,7 @@ fn cmd_help() {
     crate::println!("  capsign <id>      Issue a hybrid PQ-signed capability for <id> and verify it");
     crate::println!("  capverify <id>    Show that unsigned, forged, and tampered tokens are rejected");
     crate::println!("  issuer            Show the kernel capability issuer (Ed25519+ML-DSA-65)");
+    crate::println!("  capbench <id> [n] Time n capability checks, uncached vs cached");
     crate::println!("  audit [n]         Show the last n audit records (default 12)");
     crate::println!("  audit-verify      Verify the audit hash chain and signed checkpoints");
     crate::println!("  audit-checkpoint  Sign a checkpoint over the audit log now");
@@ -1169,9 +1172,61 @@ fn cmd_issuer() {
         }
     );
     crate::println!(
-        "Crypto stack   : {} KiB peak of {} KiB",
+        "Crypto stack   : {} KiB peak of {} KiB, {} bytes residue (scrubbed after every use)",
         crate::issuer::crypto_stack::high_water().div_ceil(1024),
-        crate::issuer::crypto_stack::SIZE / 1024
+        crate::issuer::crypto_stack::SIZE / 1024,
+        crate::issuer::crypto_stack::residue()
+    );
+    let (hits, misses, entries) = crate::capability::verify_cache::stats();
+    crate::println!(
+        "Verify cache   : {} hits, {} misses, {}/{} entries",
+        hits,
+        misses,
+        entries,
+        crate::capability::verify_cache::CAPACITY
+    );
+}
+
+/// Time capability verification with and without the verified-proof cache.
+fn cmd_capbench(id: &str, n_str: &str, kernel: &mut Kernel) {
+    let Some(obj) = kernel.for_each_object_find(id) else {
+        crate::println!("Usage: capbench <object-id> [n]  (object not found)");
+        return;
+    };
+    let n = if n_str.is_empty() {
+        20
+    } else {
+        match parse_u32(n_str) {
+            Some(n) if n > 0 => n as u64,
+            _ => {
+                crate::println!("Usage: capbench <object-id> [n]");
+                return;
+            }
+        }
+    };
+    let mut cap = Capability::new(obj);
+    if cap.issue().is_err() {
+        crate::println!("capbench: issuance failed");
+        return;
+    }
+    let time = |f: &dyn Fn() -> bool| {
+        let start = crate::cpu::rdtsc();
+        let mut ok = true;
+        for _ in 0..n {
+            ok &= f();
+        }
+        ((crate::cpu::rdtsc() - start) / n, ok)
+    };
+    let (uncached, ok1) = time(&|| cap.verify_uncached() == Ok(true));
+    let _ = cap.verify(); // warm the cache
+    let (cached, ok2) = time(&|| cap.verify() == Ok(true));
+    crate::println!(
+        "capbench: {} checks each — uncached {} kcycles/check, cached {} kcycles/check ({}x){}",
+        n,
+        uncached / 1000,
+        cached / 1000,
+        if cached > 0 { uncached / cached } else { 0 },
+        if ok1 && ok2 { "" } else { "  (VERIFY FAILED)" }
     );
 }
 

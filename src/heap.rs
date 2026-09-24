@@ -54,6 +54,11 @@ unsafe impl core::alloc::GlobalAlloc for GlobalHeapAdaptor {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: core::alloc::Layout) {
+        // Zero-on-free: crypto code (ML-DSA) keeps secret intermediates in
+        // heap boxes; wipe every block so nothing lingers for a later owner.
+        // `zeroize` uses volatile writes, so the compiler can't elide them.
+        // SAFETY: the block is ours until handed back below.
+        zeroize::Zeroize::zeroize(core::slice::from_raw_parts_mut(ptr, layout.size()));
         // SAFETY: ptr was returned by `alloc` with the same layout.
         KERNEL_HEAP
             .inner

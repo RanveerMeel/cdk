@@ -13,7 +13,7 @@ Heavy AI inference (GPUs, CUDA) runs on Linux next to CDK; CDK is the control pl
 
 ## Status
 
-**Early development preview — not for production use.** CDK boots on bare metal (QEMU) with SMP, preemptive scheduling, ring-3 processes in isolated address spaces, and an interactive serial console. The quantum-safe trust core (Phase 1 of the [roadmap](ROADMAP.md)) is being built now: hybrid post-quantum capability tokens, the signed audit log, and user-fault containment are done; key hygiene (1.4) and the agent runtime (Phase 2) are next. Interfaces can still change quickly.
+**Early development preview — not for production use.** CDK boots on bare metal (QEMU) with SMP, preemptive scheduling, ring-3 processes in isolated address spaces, and an interactive serial console. The quantum-safe trust core (Phase 1 of the [roadmap](ROADMAP.md)) is being built now: hybrid post-quantum capability tokens, the signed audit log, user-fault containment, and key hygiene are done; the agent runtime (Phase 2) is next. Interfaces can still change quickly.
 
 ### Editions
 
@@ -183,6 +183,7 @@ cargo check --features virtio-hw
 | `issuer` | Kernel capability issuer: id, algorithms, entropy source, crypto-stack peak |
 | `capsign <id>` | Issue a hybrid post-quantum capability for an object and verify it |
 | `capverify <id>` | Show unsigned, forged, and escalated tokens being rejected |
+| `capbench <id> [n]` | Time *n* capability checks without and with the verified-proof cache |
 | `audit [n]` | Last *n* audit records (default 12) |
 | `audit-verify` | Verify the audit hash chain and every signed checkpoint |
 | `audit-checkpoint` | Sign a checkpoint over the log now |
@@ -275,6 +276,7 @@ The full plan — phases, milestones, and editions — is in [ROADMAP.md](ROADMA
 - [x] Issuer-bound hybrid post-quantum capability tokens (Ed25519 + ML-DSA-65, format v1) — roadmap milestone 1.1
 - [x] Tamper-evident audit log with hybrid-signed checkpoints — roadmap milestone 1.2
 - [x] User-fault containment: a crashing ring-3 program is terminated, audit-logged, and the kernel keeps running — roadmap milestone 1.3
+- [x] Key hygiene: zeroized keys and seeds, scrubbed crypto stack, zero-on-free heap, RFC 8032 / IETF ML-DSA known-answer tests, verified-proof cache — roadmap milestone 1.4
 - [x] Framebuffer text rendering (8×16 bitmap font, RGB/BGR/U8 pixel formats, auto-scroll)
 - [x] Network stack integration (loopback interfaces, capability-gated send/recv, object bridge routing, bindings, pump telemetry)
 - [x] External network transport (virtio-net MMIO bring-up path + non-loopback external interfaces via `eth0` default external backend and adapter-based transports)

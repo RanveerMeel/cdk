@@ -127,9 +127,9 @@ impl Issuer {
 
     fn from_seeds_inner(ed_seed: &[u8; 32], ml_seed: &[u8; 32], entropy: EntropySource) -> Self {
         let ed = ed25519_dalek::SigningKey::from_bytes(ed_seed);
-        let ml = Box::new(ml_dsa::SigningKey::<MlDsa65>::from_seed(&B32::from(
-            *ml_seed,
-        )));
+        let mut ml_seed_arr = B32::from(*ml_seed);
+        let ml = Box::new(ml_dsa::SigningKey::<MlDsa65>::from_seed(&ml_seed_arr));
+        ml_seed_arr.zeroize();
         let ml_vk = Box::new(ml.verifying_key());
 
         let ed_pub = ed.verifying_key().to_bytes();
@@ -248,7 +248,7 @@ pub mod crypto_stack {
 
     #[cfg(target_os = "none")]
     mod imp {
-        use core::sync::atomic::{AtomicBool, Ordering};
+        use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use spin::Mutex;
 
         use super::SIZE;
@@ -260,6 +260,8 @@ pub mod crypto_stack {
         static mut STACK: Stack = Stack([0; SIZE]);
         static LOCK: Mutex<()> = Mutex::new(());
         static PAINTED: AtomicBool = AtomicBool::new(false);
+        /// Peak usage seen so far (scrubbing re-paints, so it can't be rescanned).
+        static PEAK: AtomicUsize = AtomicUsize::new(0);
 
         core::arch::global_asm!(
             r#"
@@ -301,7 +303,8 @@ pub mod crypto_stack {
 
         pub fn run<R>(f: impl FnOnce() -> R) -> R {
             if on_crypto_stack() {
-                // Nested call (already switched): just run it.
+                // Nested call (already switched): just run it; the outer
+                // call scrubs.
                 return f();
             }
             let _guard = LOCK.lock();
@@ -317,19 +320,34 @@ pub mod crypto_stack {
             // SAFETY: the crypto stack is exclusively ours while `LOCK` is held;
             // `top` is 16-byte aligned; the callee returns on the same stack.
             unsafe { cdk_call_on_stack((&mut dyn_call) as *mut _ as *mut u8, trampoline, top) };
+            let used = used_bytes();
+            PEAK.fetch_max(used, Ordering::AcqRel);
+            // Overwrite everything the operation touched so no key material
+            // or intermediates remain on the stack between operations.
+            let (_, hi) = bounds();
+            // SAFETY: lock held; the region [hi-used, hi) is no longer live.
+            unsafe { core::ptr::write_bytes((hi - used) as *mut u8, PAINT, used) };
             out.expect("crypto closure ran")
         }
 
+        /// Bytes below the top that no longer hold the paint pattern.
+        fn used_bytes() -> usize {
+            let (lo, _) = bounds();
+            // SAFETY: called with LOCK held, after the operation returned.
+            let bytes = unsafe { core::slice::from_raw_parts(lo as *const u8, SIZE) };
+            SIZE - bytes.iter().take_while(|&&b| b == PAINT).count()
+        }
+
         pub fn high_water() -> usize {
+            PEAK.load(Ordering::Acquire)
+        }
+
+        pub fn residue() -> usize {
             if !PAINTED.load(Ordering::Acquire) {
                 return 0;
             }
             let _guard = LOCK.lock();
-            let (lo, _) = bounds();
-            // SAFETY: read-only scan while no crypto operation is running.
-            let bytes = unsafe { core::slice::from_raw_parts(lo as *const u8, SIZE) };
-            let untouched = bytes.iter().take_while(|&&b| b == PAINT).count();
-            SIZE - untouched
+            used_bytes()
         }
     }
 
@@ -342,9 +360,15 @@ pub mod crypto_stack {
         pub fn high_water() -> usize {
             0
         }
+
+        pub fn residue() -> usize {
+            0
+        }
     }
 
-    /// Run `f` on the crypto stack (directly on the host).
+    /// Run `f` on the crypto stack (directly on the host). Afterwards the part
+    /// of the stack `f` used is overwritten, so no key material or
+    /// intermediates remain between operations.
     pub fn run<R>(f: impl FnOnce() -> R) -> R {
         imp::run(f)
     }
@@ -352,6 +376,12 @@ pub mod crypto_stack {
     /// Peak crypto-stack usage in bytes since boot (0 on the host).
     pub fn high_water() -> usize {
         imp::high_water()
+    }
+
+    /// Bytes left on the crypto stack by the last operation (always 0 after
+    /// scrubbing; kept as a self-check shown by the `issuer` command).
+    pub fn residue() -> usize {
+        imp::residue()
     }
 }
 
@@ -456,6 +486,70 @@ mod tests {
         let i = issuer(8);
         assert_eq!(i.public().mldsa65.len(), 1952);
         assert_eq!(i.sign(D, &MSG).mldsa65.len(), 3309);
+    }
+
+    fn hex(s: &str) -> [u8; 64] {
+        let mut out = [0u8; 64];
+        for (i, b) in out.iter_mut().enumerate().take(s.len() / 2) {
+            *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap();
+        }
+        out
+    }
+
+    /// Known-answer test: RFC 8032 §7.1 TEST 2 and TEST 3 (Ed25519).
+    /// Also reproduced independently with OpenSSL 3.0 while writing this test.
+    #[test]
+    fn ed25519_matches_rfc8032_vectors() {
+        use ed25519_dalek::{Signer, SigningKey};
+        let cases = [
+            (
+                "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+                "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+                &[0x72u8][..],
+                "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da\
+                 085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00",
+            ),
+            (
+                "c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7",
+                "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025",
+                &[0xafu8, 0x82][..],
+                "6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac\
+                 18ff9b538d16f290ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a",
+            ),
+        ];
+        for (secret, public, msg, sig) in cases {
+            let seed: [u8; 32] = hex(secret)[..32].try_into().unwrap();
+            let key = SigningKey::from_bytes(&seed);
+            assert_eq!(key.verifying_key().to_bytes()[..], hex(public)[..32]);
+            let expected = hex(&sig.replace(' ', ""));
+            let got = key.sign(msg);
+            assert_eq!(got.to_bytes(), expected);
+            assert!(key.verifying_key().verify_strict(msg, &got).is_ok());
+
+            // Our issuer derives the same Ed25519 public key from the seed.
+            let issuer = Issuer::from_seeds(&seed, &[0; 32], EntropySource::Os);
+            assert_eq!(issuer.public().ed25519[..], hex(public)[..32]);
+        }
+    }
+
+    /// Known-answer test: ML-DSA-65 key generation (FIPS 204 KeyGen_internal)
+    /// from seed 00..1f must reproduce the public key of the IETF LAMPS
+    /// example `ML-DSA-65.pub` (github.com/lamps-wg/dilithium-certificates,
+    /// examples/; also shipped in the ml-dsa crate's tests/examples/).
+    #[test]
+    fn mldsa65_keygen_matches_ietf_lamps_example() {
+        let mut seed = [0u8; 32];
+        for (i, b) in seed.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let issuer = Issuer::from_seeds(&[0; 32], &seed, EntropySource::Os);
+        let public = &issuer.public().mldsa65[..];
+        assert_eq!(public[..16], hex("48683d91978e31eb3dddb8b0473482d2")[..16]);
+        let digest: [u8; 32] = Sha256::digest(public).into();
+        assert_eq!(
+            digest[..],
+            hex("d666806e11cee19a7c989f7445f90dd419cf4d2d51db8c0fdb4c0f0a542238c9")[..32]
+        );
     }
 
     #[test]

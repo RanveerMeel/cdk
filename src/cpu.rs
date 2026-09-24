@@ -102,6 +102,27 @@ pub fn cpuid_apic_id() -> u32 {
 }
 
 /// CPUID leaf 1: ECX bit 30 = RDRAND.
+/// Read the CPU timestamp counter (0 on the host).
+pub fn rdtsc() -> u64 {
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    {
+        let lo: u32;
+        let hi: u32;
+        // SAFETY: RDTSC only reads the timestamp counter.
+        unsafe {
+            core::arch::asm!(
+                "rdtsc",
+                out("eax") lo,
+                out("edx") hi,
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+        ((hi as u64) << 32) | lo as u64
+    }
+    #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+    0
+}
+
 pub fn cpuid_has_rdrand() -> bool {
     #[cfg(all(target_os = "none", target_arch = "x86_64"))]
     unsafe {

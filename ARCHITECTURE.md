@@ -45,6 +45,21 @@ Format v0 stored the signer's public key inside the token and accepted any self-
 
 ML-DSA-65 needs more stack than any kernel stack provides (host measurements: ~280 KiB keygen, ~100 KiB sign, ~66 KiB verify; QEMU peak 323 KiB). All issuer operations switch to a dedicated, pattern-painted 512 KiB stack (`issuer::crypto_stack`) under a lock, so capability checks are safe from any context, including 16 KiB syscall/interrupt stacks. `issuer` reports the peak usage.
 
+#### Key hygiene
+
+| Measure | Where |
+|---|---|
+| Secret keys zeroized on drop | `ed25519-dalek` and `ml-dsa` built with their `zeroize` features; RNG seeds and the ML-DSA seed array are wiped explicitly after key generation |
+| Secrets stay in one place | `Issuer` is neither `Clone` nor `Debug`; only `IssuerPublic` is copyable |
+| No stack residue | The crypto stack is re-painted over the used region after every operation (`issuer` shows peak usage and residue, which is 0) |
+| No heap residue | The kernel allocator zeroes every block on free (volatile writes via `zeroize`), covering ML-DSA's heap-boxed intermediates |
+| Constant time | CDK code makes no secret-dependent comparisons; signature arithmetic and checks are inside `ed25519-dalek` and `ml-dsa` |
+| Known-answer tests | Ed25519: RFC 8032 §7.1 TEST 2 and 3 (also reproduced with OpenSSL). ML-DSA-65: key generation from seed `00..1f` reproduces the IETF LAMPS example public key. NIST ACVP signing/verification vectors are roadmap item 1.5. |
+
+#### Verified-proof cache
+
+`Capability::verify` keeps the last 64 proofs that verified against the kernel issuer, keyed by `SHA-256("CDK-CAP-CACHE" ‖ digest ‖ both signatures)`, so a hit requires a byte-identical token and proof. Only successes are cached; the issuer is fixed per boot, and revocation (when added) must call `verify_cache::clear()`. In QEMU a full hybrid check costs ~5.6 M cycles and a cached one ~0.2 M (`capbench`). `verify_uncached` bypasses the cache.
+
 #### RNG (`src/rng.rs`)
 
 `KernelRng` implements `rand_core::CryptoRng + RngCore`:

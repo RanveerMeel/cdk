@@ -24,6 +24,16 @@
 //!
 //! Both signatures must verify. `format` and `algorithm` are covered by the
 //! digest, so a token cannot be downgraded to a weaker algorithm.
+//!
+//! ## Verified-proof cache
+//!
+//! ML-DSA verification is the expensive part of every capability check, and
+//! agents present the same tokens repeatedly. [`verify_cache`] remembers
+//! proofs that verified against the kernel issuer, keyed by
+//! `SHA-256("CDK-CAP-CACHE" ‖ digest ‖ ed25519_sig ‖ mldsa65_sig)`, so a hit
+//! requires a byte-identical token and proof. Only successes are cached, and
+//! the kernel issuer never changes within a boot; when revocation arrives,
+//! revoking must call [`verify_cache::clear`].
 
 use core::str::FromStr;
 use heapless::FnvIndexSet;
@@ -175,6 +185,22 @@ impl Capability {
     pub fn verify(&self) -> Result<bool, CapabilityError> {
         let kernel = issuer::kernel();
         self.verify_by(kernel.id(), |digest, sig| {
+            let key = verify_cache::key(digest, sig);
+            if verify_cache::lookup(&key) {
+                return true;
+            }
+            let ok = kernel.verify(SigDomain::Capability, digest, sig);
+            if ok {
+                verify_cache::insert(key);
+            }
+            ok
+        })
+    }
+
+    /// Verify against the kernel issuer, bypassing the cache (benchmarks).
+    pub fn verify_uncached(&self) -> Result<bool, CapabilityError> {
+        let kernel = issuer::kernel();
+        self.verify_by(kernel.id(), |digest, sig| {
             kernel.verify(SigDomain::Capability, digest, sig)
         })
     }
@@ -265,6 +291,82 @@ impl Capability {
         let mut out = [0u8; 32];
         out.copy_from_slice(&result);
         out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Verified-proof cache
+// ---------------------------------------------------------------------------
+
+/// Cache of proofs that verified against the kernel issuer (see module docs).
+pub mod verify_cache {
+    use sha2::{Digest, Sha256};
+    use spin::Mutex;
+
+    use crate::issuer::HybridSignature;
+
+    /// Entries kept; the oldest is replaced first.
+    pub const CAPACITY: usize = 64;
+    const DOMAIN: &[u8] = b"CDK-CAP-CACHE";
+
+    pub type Key = [u8; 32];
+
+    struct Cache {
+        keys: [Key; CAPACITY],
+        len: usize,
+        next: usize,
+        hits: u64,
+        misses: u64,
+    }
+
+    static CACHE: Mutex<Cache> = Mutex::new(Cache {
+        keys: [[0; 32]; CAPACITY],
+        len: 0,
+        next: 0,
+        hits: 0,
+        misses: 0,
+    });
+
+    /// Cache key: binds the full signed digest and both signatures.
+    pub fn key(digest: &[u8; 32], sig: &HybridSignature) -> Key {
+        let mut h = Sha256::new();
+        h.update(DOMAIN);
+        h.update(digest);
+        h.update(sig.ed25519);
+        h.update(&sig.mldsa65[..]);
+        h.finalize().into()
+    }
+
+    pub fn lookup(key: &Key) -> bool {
+        let mut c = CACHE.lock();
+        let hit = c.keys[..c.len].iter().any(|k| k == key);
+        if hit {
+            c.hits += 1;
+        } else {
+            c.misses += 1;
+        }
+        hit
+    }
+
+    pub fn insert(key: Key) {
+        let mut c = CACHE.lock();
+        let slot = c.next;
+        c.keys[slot] = key;
+        c.next = (slot + 1) % CAPACITY;
+        c.len = (c.len + 1).min(CAPACITY);
+    }
+
+    /// Forget every cached proof (call on revocation or issuer change).
+    pub fn clear() {
+        let mut c = CACHE.lock();
+        c.len = 0;
+        c.next = 0;
+    }
+
+    /// `(hits, misses, entries)`.
+    pub fn stats() -> (u64, u64, usize) {
+        let c = CACHE.lock();
+        (c.hits, c.misses, c.len)
     }
 }
 
@@ -423,6 +525,36 @@ mod tests {
         let mut bad_ml = cap.clone();
         bad_ml.proof.as_mut().unwrap().signature.mldsa65[5] ^= 1;
         assert_eq!(bad_ml.verify(), Ok(false));
+    }
+
+    #[test]
+    fn verified_proofs_are_cached_but_tampering_still_fails() {
+        let mut cap = Capability::with_permissions(&dummy_obj("cache"), &[Permission::Read]);
+        cap.issue().unwrap();
+        let digest = cap.signable_digest(
+            TOKEN_FORMAT_V1,
+            SignatureAlgorithm::HybridEd25519MlDsa65,
+            issuer::kernel().id(),
+        );
+        let key = verify_cache::key(&digest, &cap.proof.as_ref().unwrap().signature);
+
+        assert_eq!(cap.verify(), Ok(true)); // populates the cache
+        assert!(verify_cache::lookup(&key));
+        assert_eq!(cap.verify(), Ok(true)); // served from the cache
+
+        // A cached token with escalated permissions has a different digest.
+        let mut escalated = cap.clone();
+        let _ = escalated.permissions.insert(Permission::Delete);
+        assert_eq!(escalated.verify(), Ok(false));
+
+        // Same digest, corrupted signature: different key, full check fails.
+        let mut corrupted = cap.clone();
+        corrupted.proof.as_mut().unwrap().signature.mldsa65[9] ^= 1;
+        assert_eq!(corrupted.verify(), Ok(false));
+
+        // Cached and uncached paths agree.
+        assert_eq!(cap.verify_uncached(), Ok(true));
+        assert_eq!(corrupted.verify_uncached(), Ok(false));
     }
 
     #[test]

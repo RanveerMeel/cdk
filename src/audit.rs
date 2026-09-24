@@ -369,18 +369,7 @@ static LOG: Mutex<AuditLog<LOG_CAPACITY>> = Mutex::new(AuditLog::new());
 /// CPU timestamp counter. Lock-free, so safe from any context; the PIT tick
 /// counter stops once the BSP switches to its local APIC timer.
 fn now() -> u64 {
-    #[cfg(target_os = "none")]
-    {
-        let lo: u32;
-        let hi: u32;
-        // SAFETY: RDTSC only reads the timestamp counter.
-        unsafe {
-            core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack, preserves_flags));
-        }
-        ((hi as u64) << 32) | lo as u64
-    }
-    #[cfg(not(target_os = "none"))]
-    0
+    crate::cpu::rdtsc()
 }
 
 /// Start the kernel log (bound to the kernel issuer) and record `Boot`.
