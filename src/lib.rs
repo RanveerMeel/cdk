@@ -16,6 +16,7 @@ pub mod gdt;
 pub mod heap;
 pub mod pci;
 pub mod virtio_pci;
+pub mod initrd;
 #[cfg(target_os = "none")]
 pub mod interrupts;
 pub mod issuer;

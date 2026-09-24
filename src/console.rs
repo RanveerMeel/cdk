@@ -84,6 +84,9 @@ const COMMANDS: &[&str] = &[
     "run",
     "running",
     "user-smoke",
+    "ls",
+    "spawn",
+    "exec",
     "elf-spawn",
     "elf-run",
     "elf-smoke",
@@ -554,6 +557,9 @@ fn dispatch(
         "yield" => cmd_yield(arg1, kernel),
         "run" => cmd_run_next(kernel),
         "user-smoke" => cmd_user_smoke(page_table, frame_alloc),
+        "ls" => cmd_ls(),
+        "spawn" => cmd_spawn(arg1, page_table, frame_alloc, false),
+        "exec" => cmd_spawn(arg1, page_table, frame_alloc, true),
         "elf-spawn" => cmd_elf_spawn(arg1, page_table, frame_alloc, false),
         "elf-run" => cmd_elf_run(arg1),
         "elf-smoke" => cmd_elf_spawn(arg1, page_table, frame_alloc, true),
@@ -646,6 +652,9 @@ fn cmd_help() {
     crate::println!("  run               Manually dispatch next task (ignores preemption)");
     crate::println!("  running           Show the currently running task");
     crate::println!("  user-smoke        Ring-3 smoke test (syscall exit, returns)");
+    crate::println!("  ls                List programs in the boot ramdisk (size, SHA-256)");
+    crate::println!("  spawn <name>      Load a ramdisk program as a Ready process");
+    crate::println!("  exec <name>       Load and run a ramdisk program");
     crate::println!("  elf-spawn [prog]  Load a built-in program (hello|ud|pf|gp|de) as Ready");
     crate::println!("  elf-run <pid>     Run a Ready process until it exits");
     crate::println!("  elf-smoke [prog]  Load and run a built-in program (ud/pf/gp/de crash it)");
@@ -1243,11 +1252,11 @@ fn cmd_audit(n_str: &str) {
         }
     };
     crate::audit::with_log(|log| {
-        crate::println!("SEQ    TSC(M)    EVENT         SUBJECT          DETAIL   HASH");
+        crate::println!("SEQ    TSC(M)    EVENT           SUBJECT          DETAIL   HASH");
         let skip = log.records().len().saturating_sub(n);
         for r in log.records().skip(skip) {
             crate::print!(
-                "{:<6} {:<9} {:<13} {:<16} ",
+                "{:<6} {:<9} {:<15} {:<16} ",
                 r.seq,
                 r.tsc / 1_000_000,
                 r.kind.name(),
@@ -1255,6 +1264,8 @@ fn cmd_audit(n_str: &str) {
             );
             if r.kind == crate::audit::EventKind::ProcessSpawned {
                 crate::print!("{:#x} ", r.detail);
+            } else if r.kind == crate::audit::EventKind::ProgramLoaded {
+                crate::print!("sha256:{:016x} ", r.detail);
             } else {
                 crate::print!("{:<8} ", r.detail);
             }
@@ -2433,6 +2444,62 @@ fn cmd_elf_spawn(
     }
 }
 
+fn cmd_ls() {
+    use sha2::{Digest, Sha256};
+    let mut any = false;
+    for f in crate::initrd::files() {
+        match f {
+            Ok(f) => {
+                any = true;
+                let hash = Sha256::digest(f.data);
+                crate::print!("  {:<20} {:>8} bytes  sha256:", f.name, f.data.len());
+                print_hex(&hash[..8]);
+                crate::println!("…");
+            }
+            Err(e) => crate::println!("  ramdisk error: {:?} (listing stopped)", e),
+        }
+    }
+    if !any {
+        crate::println!("ls: ramdisk is empty or missing");
+    }
+}
+
+fn cmd_spawn(
+    name: &str,
+    page_table: &mut Option<PageTableManager>,
+    frame_alloc: &mut FrameAllocator,
+    run: bool,
+) {
+    if name.is_empty() {
+        crate::println!("Usage: {} <name>   (see `ls`)", if run { "exec" } else { "spawn" });
+        return;
+    }
+    let Some(file) = crate::initrd::find(name) else {
+        crate::println!("No program '{}' in the ramdisk (see `ls`)", name);
+        return;
+    };
+    let Some(pt) = page_table.as_mut() else {
+        crate::println!("Page table not initialised.");
+        return;
+    };
+    match crate::process::spawn_image(pt, frame_alloc, file.name, file.data) {
+        Ok((proc, hash)) => {
+            crate::print!(
+                "spawn: '{}' pid={} entry={:#x} sha256:",
+                file.name,
+                proc.pid,
+                proc.entry
+            );
+            print_hex(&hash[..8]);
+            crate::println!("…");
+            if run {
+                run_process(proc.pid);
+            }
+        }
+        Err(e) => crate::println!("spawn failed: {:?}", e),
+    }
+}
+
 fn cmd_elf_run(pid_str: &str) {
     let Some(pid) = parse_u32(pid_str) else {
         crate::println!("Usage: elf-run <pid>");
@@ -2461,7 +2528,7 @@ fn cmd_ps() {
         crate::println!("ps: (no processes)");
         return;
     }
-    crate::println!("PID   STATE     EXIT  ENTRY          CR3");
+    crate::println!("PID   NAME         STATE     EXIT  ENTRY          CR3");
     for p in procs.iter() {
         let state = match p.state {
             crate::process::ProcessState::Free => "Free",
@@ -2471,8 +2538,9 @@ fn cmd_ps() {
             crate::process::ProcessState::Crashed => "Crashed",
         };
         crate::println!(
-            "{:<5} {:<9} {:<5} {:#014x} {:#x}",
+            "{:<5} {:<12} {:<9} {:<5} {:#014x} {:#x}",
             p.pid,
+            p.name.as_str(),
             state,
             p.exit_code,
             p.entry,

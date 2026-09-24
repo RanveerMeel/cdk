@@ -47,8 +47,12 @@ if ! rustup toolchain list | grep -q '^nightly'; then
     echo "  rustup component add rust-src llvm-tools-preview --toolchain nightly"
     exit 1
 fi
+# User programs (user/) packed into the boot ramdisk (ustar).
+echo "Building user programs..."
+RAMDISK="target/initrd.tar"
+tools/build_user_programs.sh "$PWD/$RAMDISK"
 rustup run nightly cargo run --manifest-path tools/create_disk_image/Cargo.toml --release --target "$HOST_TARGET" -- \
-    "$KERNEL_ELF" "$DISK_IMG"
+    "$KERNEL_ELF" "$DISK_IMG" "$RAMDISK"
 
 RUN_IMG="$(mktemp /tmp/cdk_boot.XXXXXX)"
 trap 'rm -f "$RUN_IMG"' EXIT

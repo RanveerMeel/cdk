@@ -69,6 +69,9 @@ pub enum EventKind {
     ProcessReaped = 8,
     /// Process killed by a CPU exception. `detail` = exception vector.
     ProcessCrashed = 9,
+    /// Program image loaded. Subject `pid-N:name`; `detail` = first 8 bytes
+    /// of the image's SHA-256 (big-endian).
+    ProgramLoaded = 10,
 }
 
 impl EventKind {
@@ -83,6 +86,7 @@ impl EventKind {
             EventKind::ProcessExited => "proc-exited",
             EventKind::ProcessReaped => "proc-reaped",
             EventKind::ProcessCrashed => "proc-crashed",
+            EventKind::ProgramLoaded => "program-loaded",
         }
     }
 }

@@ -171,6 +171,12 @@ Pixel-level text renderer that displays kernel output directly on the QEMU graph
 
 Boot sequence: serial init → **framebuffer init** → interrupts → frame allocator → heap → page tables → console.
 
+### Boot Ramdisk and User Programs (`src/initrd.rs`, `user/`)
+
+**Building.** `user/` is a separate `no_std` crate. `cdk_user` supplies `_start` (aligns the stack, calls `cdk_main`, exits with its return value), `write`/`exit` syscall wrappers, `print!`/`println!`, and a panic handler. `user/.cargo/config.toml` builds static, non-PIE executables (`relocation-model=static`, `code-model=large`, because the user region starts at 512 GiB, beyond the small model's 2 GiB reach); `user/link.ld` links them at `0x80_0040_0000` with `.text`, `.rodata`, `.data`+`.got`, and `.bss` on separate pages. `tools/build_user_programs.sh` builds every `user/src/bin/*.rs` and packs a reproducible `ustar` archive (sorted, owner 0, mtime 0), which `create_disk_image` hands to the bootloader as the ramdisk.
+
+**Loading.** At boot the kernel adopts the ramdisk from `BootInfo`. The tar parser treats it as untrusted: header checksums are verified, sizes are bounds-checked, names must be short printable ASCII without a ustar prefix, non-regular entries are skipped, and parsing stops at the first malformed header. `spawn`/`exec` hash the image (SHA-256), load it with `elf::load_image` (segments capped at 16 MiB, all inside the user region), map a 64 KiB stack whose lower neighbour page stays unmapped as a guard, and record `program-loaded` (`pid-N:name`, first 8 hash bytes) in the audit log.
+
 ### Audit Log (`src/audit.rs`)
 
 A tamper-evident record of security-relevant events: capability issuance (`cap-issued`), every capability check (`cap-accepted`, or `cap-rejected` with a reason code: 1 invalid signature, 2 unknown issuer, 3 unsupported format), and process `spawned` / `started` / `exited` / `reaped`.

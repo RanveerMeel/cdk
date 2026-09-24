@@ -46,6 +46,7 @@ cargo build                        # kernel, debug
 cargo build --release --bin cdk    # kernel, release
 cargo check --features virtio-hw   # hardware probe paths
 cargo test-host                    # host unit tests
+tools/build_user_programs.sh       # user programs + ramdisk (user/)
 ./run_qemu.sh                      # boot and exercise your change at the cdk> prompt
 ```
 

@@ -41,3 +41,6 @@ jobs:
 
       - name: Host unit tests
         run: cargo test-host
+
+      - name: User programs and ramdisk
+        run: tools/build_user_programs.sh

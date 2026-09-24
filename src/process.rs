@@ -92,6 +92,45 @@ pub struct Process {
     pub pml4_phys: u64,
     /// Set when the process is `Crashed`.
     pub fault: Option<UserFault>,
+    /// Program name (ramdisk file or built-in program).
+    pub name: ProcName,
+}
+
+/// Fixed-size, `Copy` process name (truncated to [`ProcName::CAPACITY`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcName {
+    bytes: [u8; ProcName::CAPACITY],
+    len: u8,
+}
+
+impl ProcName {
+    pub const CAPACITY: usize = 24;
+
+    pub const fn empty() -> Self {
+        Self {
+            bytes: [0; Self::CAPACITY],
+            len: 0,
+        }
+    }
+
+    pub fn new(name: &str) -> Self {
+        let mut out = Self::empty();
+        for ch in name.chars() {
+            let mut buf = [0u8; 4];
+            let enc = ch.encode_utf8(&mut buf).as_bytes();
+            let at = out.len as usize;
+            if at + enc.len() > Self::CAPACITY {
+                break;
+            }
+            out.bytes[at..at + enc.len()].copy_from_slice(enc);
+            out.len += enc.len() as u8;
+        }
+        out
+    }
+
+    pub fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.bytes[..self.len as usize]).unwrap_or("?")
+    }
 }
 
 impl Process {
@@ -104,6 +143,7 @@ impl Process {
             stack_top: 0,
             pml4_phys: 0,
             fault: None,
+            name: ProcName::empty(),
         }
     }
 }
@@ -159,6 +199,7 @@ impl ProcessTable {
             stack_top,
             pml4_phys,
             fault: None,
+            name: ProcName::empty(),
         };
         Ok(self.slots[idx])
     }
@@ -187,6 +228,12 @@ impl ProcessTable {
             self.slots[idx].exit_code = code;
         }
         Some(pid)
+    }
+
+    fn set_name(&mut self, pid: u32, name: ProcName) {
+        if let Some(idx) = self.find(pid) {
+            self.slots[idx].name = name;
+        }
     }
 
     /// Current process → `Crashed` with `fault`; clears `current`.
@@ -235,23 +282,65 @@ pub fn spawn_smoke_elf(
     fa: &mut FrameAllocator,
     program: elf::SmokeProgram,
 ) -> Result<Process, ProcessError> {
-    let (aspace, entry, stack_top) =
-        elf::load_smoke(kernel_pt, fa, program).map_err(ProcessError::Elf)?;
+    let loaded = elf::load_smoke(kernel_pt, fa, program).map_err(ProcessError::Elf)?;
+    register(loaded, program.name(), fa)
+}
+
+/// Load an ELF `image` (e.g. from the boot ramdisk) as process `name` and
+/// record it `Ready`. Returns the process and the image's SHA-256, which is
+/// also written to the audit log (`program-loaded`) for provenance.
+pub fn spawn_image(
+    kernel_pt: &PageTableManager,
+    fa: &mut FrameAllocator,
+    name: &str,
+    image: &[u8],
+) -> Result<(Process, [u8; 32]), ProcessError> {
+    use sha2::{Digest, Sha256};
+    let hash: [u8; 32] = Sha256::digest(image).into();
+    let loaded = elf::load_image(kernel_pt, fa, image).map_err(ProcessError::Elf)?;
+    let proc = register(loaded, name, fa)?;
+    let mut prefix = [0u8; 8];
+    prefix.copy_from_slice(&hash[..8]);
+    audit::record_fmt(
+        EventKind::ProgramLoaded,
+        format_args!("pid-{}:{}", proc.pid, name),
+        u64::from_be_bytes(prefix),
+    );
+    Ok((proc, hash))
+}
+
+/// Record a loaded address space as a new `Ready` process.
+fn register(
+    (aspace, entry, stack_top): (AddressSpace, u64, u64),
+    name: &str,
+    fa: &mut FrameAllocator,
+) -> Result<Process, ProcessError> {
     let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
-    let inserted = TABLE
-        .lock()
-        .insert(pid, entry, stack_top, aspace.pml4_phys());
+    let inserted = {
+        let mut table = TABLE.lock();
+        table
+            .insert(pid, entry, stack_top, aspace.pml4_phys())
+            .map(|mut proc| {
+                let name = ProcName::new(name);
+                table.set_name(pid, name);
+                proc.name = name;
+                proc
+            })
+    };
     match inserted {
-        Ok(_) => audit::record_fmt(
-            EventKind::ProcessSpawned,
-            format_args!("pid-{}", pid),
-            entry,
-        ),
-        Err(_) => {
+        Ok(proc) => {
+            audit::record_fmt(
+                EventKind::ProcessSpawned,
+                format_args!("pid-{}", pid),
+                entry,
+            );
+            Ok(proc)
+        }
+        Err(e) => {
             aspace.destroy(fa);
+            Err(e)
         }
     }
-    inserted
 }
 
 /// Run a `Ready` process in ring 3 until it exits or crashes.
@@ -439,6 +528,17 @@ mod tests {
         assert_eq!(f(13).name(), "#GP general protection");
         assert_eq!(f(14).name(), "#PF page fault");
         assert_eq!(f(0).exit_code(), 128);
+    }
+
+    #[test]
+    fn names_are_kept_and_truncated() {
+        let mut t = ProcessTable::new();
+        t.insert(9, 0, 0, 0).unwrap();
+        t.set_name(9, ProcName::new("hello"));
+        assert_eq!(t.slots[0].name.as_str(), "hello");
+        let long = ProcName::new("a-very-long-program-name-over-24");
+        assert_eq!(long.as_str().len(), ProcName::CAPACITY);
+        assert_eq!(ProcName::new("héllo").as_str(), "héllo");
     }
 
     #[test]

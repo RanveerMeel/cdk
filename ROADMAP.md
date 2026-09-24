@@ -91,7 +91,7 @@ copies, address-space teardown. See `README.md` for the full list.
 
 | # | Milestone | Status |
 |---|---|---|
-| 2.1 | Load ELF programs and data from the boot image (ramdisk) instead of the built-in smoke binary. | ⬜ |
+| 2.1 | **Programs from the boot ramdisk.** User programs written in Rust (`user/`, static ET_EXEC at the user base, large code model) are packed into a reproducible `ustar` ramdisk; the kernel parses it strictly (checksums, bounds), loads programs with a 64 KiB stack plus guard page, and records each image's SHA-256 in the audit log. Console `ls`, `spawn`, `exec`. | ✅ |
 | 2.2 | **Agents hold capability handles.** Per-process handle table; syscalls take handles and the kernel checks rights (`SYS_cap_list`, `SYS_cap_derive` with attenuation only, `SYS_cap_drop`). | ⬜ |
 | 2.3 | Preemptive scheduling of user processes; per-process FPU/SSE/AVX state (XSAVE) so user code can run vectorized inference. | ⬜ |
 | 2.4 | **Native CPU inference demo:** run the SecureGuard int8 scam classifier inside a CDK process. | ⬜ |

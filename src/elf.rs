@@ -204,7 +204,7 @@ pub fn load_into(
         if ph.p_type != PT_LOAD {
             continue;
         }
-        if ph.p_memsz < ph.p_filesz {
+        if ph.p_memsz < ph.p_filesz || ph.p_memsz > MAX_SEGMENT_BYTES {
             return Err(ElfError::SegmentOverflow);
         }
         let (start, end) = segment_page_span(&ph)?;
@@ -385,12 +385,16 @@ pub fn build_program_elf(program: SmokeProgram, out: &mut [u8]) -> Result<usize,
     Ok(total)
 }
 
-/// Top of the one-page user stack the loader maps for every process.
+/// Top of the user stack the loader maps for every process.
 pub const USER_STACK_TOP: u64 = paging::USER_BASE + 0x80_0000;
+/// User stack size in pages (64 KiB). The page below stays unmapped as a
+/// guard, so an overflow is a contained #PF rather than silent corruption.
+pub const USER_STACK_PAGES: u64 = 16;
+/// Largest `p_memsz` accepted for one segment, so a hostile header can't make
+/// the loader walk the frame allocator dry.
+pub const MAX_SEGMENT_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Load smoke ELF into a fresh address space cloned from `kernel_pt`.
-///
-/// On failure every frame allocated so far is returned to `fa`.
+/// Load a built-in test program into a fresh address space.
 pub fn load_smoke(
     kernel_pt: &PageTableManager,
     fa: &mut FrameAllocator,
@@ -398,15 +402,29 @@ pub fn load_smoke(
 ) -> Result<(AddressSpace, u64, u64), ElfError> {
     let mut blob = [0u8; 256];
     let n = build_program_elf(program, &mut blob)?;
-    let img = parse(&blob[..n])?;
+    load_image(kernel_pt, fa, &blob[..n])
+}
+
+/// Parse and load an ELF image into a fresh address space cloned from
+/// `kernel_pt`, and map the user stack. Returns `(aspace, entry, stack_top)`.
+///
+/// On failure every frame allocated so far is returned to `fa`.
+pub fn load_image(
+    kernel_pt: &PageTableManager,
+    fa: &mut FrameAllocator,
+    image: &[u8],
+) -> Result<(AddressSpace, u64, u64), ElfError> {
+    let img = parse(image)?;
     let mut aspace = AddressSpace::from_kernel(kernel_pt, fa).map_err(ElfError::Map)?;
     let loaded = load_into(&img, &mut aspace, fa).and_then(|entry| {
-        map_zeroed_page(
-            &mut aspace,
-            fa,
-            USER_STACK_TOP - FRAME_SIZE,
-            MapFlags::user_rw(),
-        )?;
+        for i in 1..=USER_STACK_PAGES {
+            map_zeroed_page(
+                &mut aspace,
+                fa,
+                USER_STACK_TOP - i * FRAME_SIZE,
+                MapFlags::user_rw(),
+            )?;
+        }
         Ok(entry)
     });
     match loaded {
