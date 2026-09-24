@@ -5,7 +5,7 @@
 //! via [`parse`] / [`build_smoke_elf`].
 
 use crate::allocator::{FrameAllocator, FRAME_SIZE};
-use crate::paging::{AddressSpace, MapFlags, PageTableManager, PagingError};
+use crate::paging::{self, AddressSpace, MapFlags, PageTableManager, PagingError};
 
 pub const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 pub const ELFCLASS64: u8 = 2;
@@ -180,19 +180,25 @@ fn map_zeroed_page(
         let p = crate::phys_mem::phys_to_mut_ptr::<u8>(phys);
         core::ptr::write_bytes(p, 0, FRAME_SIZE as usize);
     }
-    aspace
-        .tables()
-        .map(virt, phys, flags, fa)
-        .map_err(ElfError::Map)?;
+    if let Err(e) = aspace.map_user(virt, phys, flags, fa) {
+        let _ = fa.free(crate::allocator::PhysFrame(phys));
+        return Err(ElfError::Map(e));
+    }
     Ok(phys)
 }
 
 /// Load all `PT_LOAD` segments into `aspace` (page-aligned map + copy/zero).
+///
+/// Segments and the entry point must lie in the user region
+/// ([`paging::USER_BASE`]..[`paging::USER_TOP`]).
 pub fn load_into(
     img: &ElfImage<'_>,
     aspace: &mut AddressSpace,
     fa: &mut FrameAllocator,
 ) -> Result<u64, ElfError> {
+    if !paging::is_user_range(img.entry, 1) {
+        return Err(ElfError::Map(PagingError::OutsideUserRegion));
+    }
     for i in 0..img.phnum as usize {
         let ph = program_header(img, i)?;
         if ph.p_type != PT_LOAD {
@@ -237,19 +243,34 @@ pub fn load_into(
     Ok(img.entry)
 }
 
-/// Build a tiny ELF64 ET_EXEC that maps code at `0x400000` and runs SYS_exit(0).
+/// Virtual address the smoke ELF is linked at (inside the user region).
+pub const SMOKE_VADDR: u64 = paging::USER_BASE + 0x40_0000;
+/// Message the smoke ELF prints with `SYS_write`.
+pub const SMOKE_MESSAGE: &[u8] = b"Hello from ring 3!\n";
+
+/// Build a tiny ELF64 ET_EXEC at [`SMOKE_VADDR`] that writes
+/// [`SMOKE_MESSAGE`] and exits with the byte count `SYS_write` returned.
 pub fn build_smoke_elf(out: &mut [u8]) -> Result<usize, ElfError> {
-    // Layout: [Ehdr][Phdr][code...]
-    const CODE_VADDR: u64 = 0x400000;
-    const CODE: &[u8] = &[
-        0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1  (SYS_EXIT)
-        0x31, 0xFF, // xor edi, edi
-        0x0F, 0x05, // syscall
-        0x0F, 0x0B, // ud2
+    // Layout: [Ehdr][Phdr][code...][message]
+    const CODE_VADDR: u64 = SMOKE_VADDR;
+    const MSG_LEN: u8 = SMOKE_MESSAGE.len() as u8;
+    const PROGRAM: &[u8] = &[
+        0xB8, 0x02, 0x00, 0x00, 0x00, //       mov eax, 2        (SYS_WRITE)
+        0x48, 0x8D, 0x3D, 0x12, 0x00, 0x00, 0x00, // lea rdi, [rip + 18] (message)
+        0xBE, MSG_LEN, 0x00, 0x00, 0x00, //    mov esi, len
+        0x0F, 0x05, //                         syscall
+        0x89, 0xC7, //                         mov edi, eax      (exit code = bytes written)
+        0xB8, 0x01, 0x00, 0x00, 0x00, //       mov eax, 1        (SYS_EXIT)
+        0x0F, 0x05, //                         syscall
+        0x0F, 0x0B, //                         ud2
     ];
+    let mut code = [0u8; PROGRAM.len() + SMOKE_MESSAGE.len()];
+    code[..PROGRAM.len()].copy_from_slice(PROGRAM);
+    code[PROGRAM.len()..].copy_from_slice(SMOKE_MESSAGE);
+    const CODE: usize = PROGRAM.len() + SMOKE_MESSAGE.len();
     let phoff = EHDR_SIZE as u64;
     let code_off = (EHDR_SIZE + PHDR_SIZE) as u64;
-    let total = code_off as usize + CODE.len();
+    let total = code_off as usize + CODE;
     if out.len() < total {
         return Err(ElfError::Truncated);
     }
@@ -260,7 +281,7 @@ pub fn build_smoke_elf(out: &mut [u8]) -> Result<usize, ElfError> {
     out[4] = ELFCLASS64;
     out[5] = ELFDATA2LSB;
     out[6] = 1; // EV_CURRENT
-    // e_type, e_machine, e_version
+                // e_type, e_machine, e_version
     out[16..18].copy_from_slice(&ET_EXEC.to_le_bytes());
     out[18..20].copy_from_slice(&EM_X86_64.to_le_bytes());
     out[20..24].copy_from_slice(&1u32.to_le_bytes());
@@ -277,17 +298,22 @@ pub fn build_smoke_elf(out: &mut [u8]) -> Result<usize, ElfError> {
     ph[8..16].copy_from_slice(&code_off.to_le_bytes());
     ph[16..24].copy_from_slice(&CODE_VADDR.to_le_bytes());
     ph[24..32].copy_from_slice(&CODE_VADDR.to_le_bytes()); // paddr
-    let fsz = CODE.len() as u64;
+    let fsz = CODE as u64;
     ph[32..40].copy_from_slice(&fsz.to_le_bytes());
     ph[40..48].copy_from_slice(&fsz.to_le_bytes());
     ph[48..56].copy_from_slice(&FRAME_SIZE.to_le_bytes());
 
-    out[code_off as usize..total].copy_from_slice(CODE);
+    out[code_off as usize..total].copy_from_slice(&code);
     let _ = EI_NIDENT;
     Ok(total)
 }
 
+/// Top of the one-page user stack the loader maps for every process.
+pub const USER_STACK_TOP: u64 = paging::USER_BASE + 0x80_0000;
+
 /// Load smoke ELF into a fresh address space cloned from `kernel_pt`.
+///
+/// On failure every frame allocated so far is returned to `fa`.
 pub fn load_smoke(
     kernel_pt: &PageTableManager,
     fa: &mut FrameAllocator,
@@ -296,13 +322,22 @@ pub fn load_smoke(
     let n = build_smoke_elf(&mut blob)?;
     let img = parse(&blob[..n])?;
     let mut aspace = AddressSpace::from_kernel(kernel_pt, fa).map_err(ElfError::Map)?;
-    let entry = load_into(&img, &mut aspace, fa)?;
-
-    // User stack page just below 0x800000.
-    const STACK_TOP: u64 = 0x800000;
-    const STACK_PAGE: u64 = STACK_TOP - FRAME_SIZE;
-    let _ = map_zeroed_page(&mut aspace, fa, STACK_PAGE, MapFlags::user_rw())?;
-    Ok((aspace, entry, STACK_TOP))
+    let loaded = load_into(&img, &mut aspace, fa).and_then(|entry| {
+        map_zeroed_page(
+            &mut aspace,
+            fa,
+            USER_STACK_TOP - FRAME_SIZE,
+            MapFlags::user_rw(),
+        )?;
+        Ok(entry)
+    });
+    match loaded {
+        Ok(entry) => Ok((aspace, entry, USER_STACK_TOP)),
+        Err(e) => {
+            aspace.destroy(fa);
+            Err(e)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -314,12 +349,28 @@ mod tests {
         let mut blob = [0u8; 256];
         let n = build_smoke_elf(&mut blob).unwrap();
         let img = parse(&blob[..n]).unwrap();
-        assert_eq!(img.entry, 0x400000);
+        assert_eq!(img.entry, SMOKE_VADDR);
+        assert!(paging::is_user_range(img.entry, 1));
         assert_eq!(img.phnum, 1);
         let ph = program_header(&img, 0).unwrap();
         assert_eq!(ph.p_type, PT_LOAD);
-        assert_eq!(ph.p_vaddr, 0x400000);
+        assert_eq!(ph.p_vaddr, SMOKE_VADDR);
         assert!(ph.p_filesz > 0);
+    }
+
+    #[test]
+    fn smoke_elf_lea_points_at_message() {
+        let mut blob = [0u8; 256];
+        let n = build_smoke_elf(&mut blob).unwrap();
+        let img = parse(&blob[..n]).unwrap();
+        let ph = program_header(&img, 0).unwrap();
+        let code = &blob[ph.p_offset as usize..n];
+        // lea rdi, [rip + disp32] is at offset 5; rip is the next instruction (12).
+        assert_eq!(&code[5..8], &[0x48, 0x8D, 0x3D]);
+        let disp = i32::from_le_bytes(code[8..12].try_into().unwrap()) as usize;
+        let msg = 12 + disp;
+        assert_eq!(&code[msg..msg + SMOKE_MESSAGE.len()], SMOKE_MESSAGE);
+        assert_eq!(code[13] as usize, SMOKE_MESSAGE.len());
     }
 
     #[test]
