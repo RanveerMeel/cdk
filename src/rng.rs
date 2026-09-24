@@ -4,10 +4,12 @@
 //!
 //! Prefers the x86 `RDRAND` instruction when CPUID reports it (Intel Ivy Bridge
 //! 2012+ / AMD Zen). When RDRAND is absent (common on QEMU's default `qemu64`
-//! CPU), falls back to a ChaCha20-based CSPRNG seeded from `RDTSC` and prints
-//! a one-time warning — better than `#UD` → double-fault, and adequate for
-//! bringing up capability signing under emulation. Production / real hardware
-//! should expose RDRAND (see `run_qemu.sh`: `-cpu max`).
+//! CPU), falls back to SplitMix64 seeded from `RDTSC` and prints a one-time
+//! warning. **The fallback is not cryptographically secure** — its output is
+//! predictable from the boot timestamp. It exists only so emulated bring-up
+//! does not `#UD`. [`entropy_source`] reports which path is active so key
+//! issuance can flag weak keys. Real hardware exposes RDRAND (and
+//! `run_qemu.sh` passes `-cpu max`).
 //!
 //! ## Host (tests)
 //!
@@ -70,8 +72,9 @@ mod backend {
         }
     }
 
-    // SAFETY: RDRAND (when available) and the seeded software CSPRNG both
-    // satisfy the CryptoRng contract for kernel key issuance.
+    // NOTE: only the RDRAND path is actually cryptographically secure; the
+    // SplitMix64 fallback is not. Callers that generate keys must check
+    // `crate::rng::entropy_source()` (the kernel issuer does and warns).
     impl CryptoRng for KernelRng {}
 
     fn rdrand_available() -> bool {
@@ -81,7 +84,7 @@ mod backend {
     fn soft_next_u64() -> u64 {
         if !RDRAND_WARNED.swap(true, Ordering::Relaxed) {
             crate::println!(
-                "RNG: WARNING — RDRAND unavailable; using software CSPRNG (seed from RDTSC)"
+                "RNG: WARNING — RDRAND unavailable; using INSECURE software fallback (SplitMix64 seeded from RDTSC)"
             );
             // Ensure non-zero seed so SplitMix never stalls at 0.
             let seed = seed_from_tsc() | 1;
@@ -163,6 +166,37 @@ mod backend {
 // ---------------------------------------------------------------------------
 
 pub use backend::KernelRng;
+
+/// Where [`KernelRng`] draws its randomness from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntropySource {
+    /// CPU hardware RNG (`RDRAND`).
+    Hardware,
+    /// Host OS entropy (unit tests).
+    Os,
+    /// Predictable software fallback — not suitable for key generation.
+    InsecureFallback,
+}
+
+impl EntropySource {
+    pub fn is_secure(self) -> bool {
+        !matches!(self, EntropySource::InsecureFallback)
+    }
+}
+
+/// Report the entropy source currently backing [`KernelRng`].
+pub fn entropy_source() -> EntropySource {
+    #[cfg(target_os = "none")]
+    {
+        if crate::cpu::cpuid_has_rdrand() {
+            EntropySource::Hardware
+        } else {
+            EntropySource::InsecureFallback
+        }
+    }
+    #[cfg(not(target_os = "none"))]
+    EntropySource::Os
+}
 
 // ---------------------------------------------------------------------------
 // Unit tests

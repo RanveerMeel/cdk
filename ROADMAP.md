@@ -81,10 +81,10 @@ copies, address-space teardown. See `README.md` for the full list.
 
 | # | Milestone | Status |
 |---|---|---|
-| 1.1 | **Issuer-bound, hybrid post-quantum capability tokens.** A kernel issuer identity (Ed25519 + ML-DSA-65) is generated at boot. Tokens carry a format version, algorithm ID, issuer key ID, and a canonical, domain-separated digest. Verification checks the signature against the **pinned issuer key**, not a key embedded in the token (fixes a forgery hole in the original design, where any self-signed token verified). | 🚧 |
+| 1.1 | **Issuer-bound, hybrid post-quantum capability tokens.** A kernel issuer identity (Ed25519 + ML-DSA-65) is generated at boot. Tokens carry a format version, algorithm ID, issuer key ID, and a canonical, domain-separated digest. Verification checks the signature against the **pinned issuer key**, not a key embedded in the token (fixes a forgery hole in the original design, where any self-signed token verified). | ✅ |
 | 1.2 | **Tamper-evident audit log.** Append-only, hash-chained records (SHA-256/SHA3) of capability issuance, use, denial, and process lifecycle; periodic hybrid-signed checkpoints; console `audit` / `audit-verify`. | ⬜ |
 | 1.3 | **User-fault containment.** Page faults, `#UD`, `#GP`, divide errors from ring 3 terminate the offending process (Zombie + crash code) and return to the kernel instead of taking the machine down. | ⬜ |
-| 1.4 | **Key hygiene.** Zeroize secret keys, keep issuer secrets out of copyable structures, constant-time comparisons, KAT tests against NIST vectors for ML-DSA / ML-KEM. | ⬜ |
+| 1.4 | **Key hygiene.** Zeroize secret keys, keep issuer secrets out of copyable structures, constant-time comparisons, KAT tests against NIST vectors for ML-DSA / ML-KEM, cache verified proofs so hot paths avoid repeated ML-DSA verification. | ⬜ |
 
 ### Phase 2 — Agent runtime
 

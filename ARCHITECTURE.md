@@ -16,32 +16,39 @@ The Cognitive Distributed Kernel (CDK) is a bare-metal kernel targeting x86_64 w
 
 Central registry of kernel objects. All access goes through capability tokens. Owns the scheduler and dispatches execution.
 
-### Capabilities (`src/capability.rs` + `src/rng.rs`)
+### Capabilities (`src/capability.rs`, `src/issuer.rs`, `src/rng.rs`)
 
 Permission tokens bound to a specific object. Supports: Read, Write, Execute, SendMessage, ReceiveMessage, Delete.
 
-#### Ed25519 signing
+#### Issuer-bound hybrid post-quantum proofs (token format v1)
 
-Every capability can optionally carry an Ed25519 signature over a SHA-256 digest:
+At boot the kernel generates one **issuer** identity: an Ed25519 key pair and an ML-DSA-65 (FIPS 204) key pair, from independent RDRAND seeds. Every kernel-issued capability carries a proof signed by that issuer:
 
 ```
-message = SHA-256(object_id_bytes ‖ sorted_permission_tags)
-signature = Ed25519-Sign(signing_key, message)
+digest = SHA-256( "CDK-CAP" ‖ format ‖ algorithm ‖ issuer_id[16]
+                  ‖ u16_le(len(object_id)) ‖ object_id ‖ u8(count) ‖ sorted_permission_tags )
+proof  = { format=1, algorithm=HybridEd25519MlDsa65, issuer_id,
+           Ed25519(digest), ML-DSA-65(digest, context="CDK-CAP-v1") }
 ```
 
 | Detail | Value |
 |---|---|
-| Algorithm | Ed25519 (RFC 8032) — deterministic, no random nonce |
-| Digest | SHA-256 over object ID + permission tag bytes (sorted) |
-| Key size | 32-byte signing key, 32-byte verifying key stored inline |
-| Signature size | 64 bytes stored in `Capability.signature` |
+| Signatures | Ed25519 (64 B) **and** ML-DSA-65 (3,309 B); both must verify |
+| Issuer public keys | 32 B + 1,952 B; `issuer_id = SHA-256("CDK-ISSUER-v1" ‖ keys)[..16]` |
+| Trust anchor | The pinned kernel issuer; tokens naming another issuer fail with `UnknownIssuer` |
+| Downgrade protection | `format` and `algorithm` are inside the signed digest |
+| Foreign issuers | `Capability::verify_with(&IssuerPublic)` (for future multi-node trust) |
 
-`Kernel::check_signature` enforces signature validity on every capability-gated operation: if a signature is present and invalid the operation is rejected with `KernelError::InvalidSignature`.
+Format v0 stored the signer's public key inside the token and accepted any self-signed token, so anyone could mint a capability; v1 verifies only against the pinned issuer. `Kernel::check_signature` enforces a valid proof on every capability-gated operation (`KernelError::InvalidSignature` otherwise). Console: `issuer`, `capsign <id>`, `capverify <id>`.
+
+#### Crypto stack
+
+ML-DSA-65 needs more stack than any kernel stack provides (host measurements: ~280 KiB keygen, ~100 KiB sign, ~66 KiB verify; QEMU peak 323 KiB). All issuer operations switch to a dedicated, pattern-painted 512 KiB stack (`issuer::crypto_stack`) under a lock, so capability checks are safe from any context, including 16 KiB syscall/interrupt stacks. `issuer` reports the peak usage.
 
 #### RNG (`src/rng.rs`)
 
 `KernelRng` implements `rand_core::CryptoRng + RngCore`:
-- **Bare-metal**: RDRAND instruction (retried up to 10 times; panics if exhausted)
+- **Bare-metal**: RDRAND (retried up to 10 times). Without RDRAND it falls back to SplitMix64 seeded from RDTSC, which is **not secure**; `rng::entropy_source()` reports this and the issuer prints a warning that tokens are forgeable.
 - **Host tests**: `rand_core::OsRng` backed by OS entropy
 
 ### Objects (`src/object.rs`)

@@ -140,6 +140,7 @@ const COMMANDS: &[&str] = &[
     "umscanout",
     "capsign",
     "capverify",
+    "issuer",
     "vmmap",
     "vmunmap",
     "vmtranslate",
@@ -607,6 +608,7 @@ fn dispatch(
         "umscanout" => cmd_umscanout(arg1),
         "capsign" => cmd_capsign(arg1, kernel),
         "capverify" => cmd_capverify(arg1, kernel),
+        "issuer" => cmd_issuer(),
         "vmmap" => cmd_vmmap(arg1, arg2, arg3, page_table, frame_alloc, kernel),
         "vmunmap" => cmd_vmunmap(arg1, page_table, kernel),
         "vmtranslate" => cmd_vmtranslate(arg1, page_table),
@@ -698,8 +700,9 @@ fn cmd_help() {
     crate::println!("  dma-translate <phys>  Translate IOVA via IOMMU windows");
     crate::println!("  gpudisp           Show GPU display info");
     crate::println!("  umscanout <id>    Fence + soft-scanout UM region to FB");
-    crate::println!("  capsign <id>      Sign a fresh capability for object <id> and verify it");
-    crate::println!("  capverify <id>    Create + sign + verify a capability for object <id>");
+    crate::println!("  capsign <id>      Issue a hybrid PQ-signed capability for <id> and verify it");
+    crate::println!("  capverify <id>    Show that unsigned, forged, and tampered tokens are rejected");
+    crate::println!("  issuer            Show the kernel capability issuer (Ed25519+ML-DSA-65)");
     crate::println!("  heapinfo          Kernel heap usage (total / used / free)");
     crate::println!("  frames            Physical frame allocator summary");
     crate::println!("  palloc            Allocate one physical frame, print address");
@@ -1059,60 +1062,110 @@ fn cmd_fbinfo() {
     }
 }
 
-/// Sign a fresh capability for the given object ID and immediately verify it.
-///
-/// The signing key is ephemeral — this command demonstrates that signing +
-/// verification works end-to-end. Persistent key management is a future feature.
+/// Issue a capability for `id` under the kernel issuer and verify it.
 fn cmd_capsign(id: &str, kernel: &mut Kernel) {
     if id.is_empty() {
         crate::println!("Usage: capsign <object-id>");
         return;
     }
-    // Build a fresh capability for the object (verifies the ID exists).
-    let obj = kernel.for_each_object_find(id);
-    let obj_ref = match obj {
-        Some(o) => o,
-        None => {
-            crate::println!("Error: object '{}' not found", id);
-            return;
-        }
+    let Some(obj) = kernel.for_each_object_find(id) else {
+        crate::println!("Error: object '{}' not found", id);
+        return;
     };
-    let mut cap = Capability::new(obj_ref);
-    match Kernel::sign_capability(&mut cap) {
-        Ok(_sk) => {
-            crate::println!("Signed capability for '{}'", id);
-            match cap.verify() {
-                Ok(true) => crate::println!("  Signature valid ✓"),
-                Ok(false) => crate::println!("  WARNING: signature not present"),
-                Err(e) => crate::println!("  ERROR: verification failed: {:?}", e),
-            }
-        }
-        Err(e) => crate::println!("Error: signing failed: {:?}", e),
+    let mut cap = Capability::new(obj);
+    if let Err(e) = Kernel::sign_capability(&mut cap) {
+        crate::println!("Error: issuance failed: {:?}", e);
+        return;
+    }
+    let Some(proof) = cap.proof.as_ref() else {
+        crate::println!("Error: issuance produced no proof");
+        return;
+    };
+    crate::print!(
+        "Issued capability for '{}': format=v{} alg={} issuer=",
+        id,
+        proof.format,
+        proof.algorithm.name()
+    );
+    print_hex(&proof.issuer_id);
+    crate::println!(
+        " sig={}+{} bytes",
+        proof.signature.ed25519.len(),
+        proof.signature.mldsa65.len()
+    );
+    match cap.verify() {
+        Ok(true) => crate::println!("  verify: valid (both Ed25519 and ML-DSA-65)"),
+        Ok(false) => crate::println!("  verify: INVALID"),
+        Err(e) => crate::println!("  verify: error {:?}", e),
     }
 }
 
+/// Demonstrate that the kernel rejects every token it did not issue intact.
 fn cmd_capverify(id: &str, kernel: &mut Kernel) {
     if id.is_empty() {
         crate::println!("Usage: capverify <object-id>");
         return;
     }
-    let obj = kernel.for_each_object_find(id);
-    let obj_ref = match obj {
-        Some(o) => o,
-        None => {
-            crate::println!("Error: object '{}' not found", id);
-            return;
-        }
+    let Some(obj) = kernel.for_each_object_find(id) else {
+        crate::println!("Error: object '{}' not found", id);
+        return;
     };
-    // Unsigned capability: verify returns false (kernel gates reject unsigned).
-    let cap = Capability::new(obj_ref);
-    match Kernel::verify_capability(&cap) {
-        Ok(true) => crate::println!("Capability for '{}': signature valid", id),
-        Ok(false) => crate::println!(
-            "Capability for '{}': unsigned (kernel ops would reject)",
-            id
-        ),
-        Err(e) => crate::println!("Capability for '{}': error: {:?}", id, e),
+    let report = |label: &str, cap: &Capability| match Kernel::verify_capability(cap) {
+        Ok(true) => crate::println!("  {:<28} accepted", label),
+        Ok(false) => crate::println!("  {:<28} rejected (no valid proof)", label),
+        Err(e) => crate::println!("  {:<28} rejected ({:?})", label, e),
+    };
+
+    let unsigned = Capability::new(obj);
+    report("unsigned", &unsigned);
+
+    // Self-signed by an attacker-controlled issuer (accepted before format v1).
+    let attacker = crate::issuer::Issuer::generate();
+    let mut forged = Capability::with_permissions(obj, &[crate::capability::Permission::Delete]);
+    let _ = forged.issue_with(&attacker);
+    report("forged (attacker issuer)", &forged);
+
+    let mut issued = Capability::new(obj);
+    let _ = issued.issue();
+    report("kernel-issued", &issued);
+
+    let mut escalated = issued.clone();
+    let _ = escalated
+        .permissions
+        .insert(crate::capability::Permission::Delete);
+    report("kernel-issued + escalated", &escalated);
+}
+
+fn cmd_issuer() {
+    let issuer = crate::issuer::kernel();
+    crate::print!("Issuer id      : ");
+    print_hex(issuer.id());
+    crate::println!();
+    crate::println!("Algorithms     : Ed25519 (RFC 8032) + ML-DSA-65 (FIPS 204), both required");
+    crate::println!(
+        "Public keys    : {} + {} bytes",
+        issuer.public().ed25519.len(),
+        issuer.public().mldsa65.len()
+    );
+    crate::println!(
+        "Entropy source : {:?}{}",
+        issuer.entropy(),
+        if issuer.entropy().is_secure() {
+            ""
+        } else {
+            "  (INSECURE — tokens forgeable)"
+        }
+    );
+    crate::println!(
+        "Crypto stack   : {} KiB peak of {} KiB",
+        crate::issuer::crypto_stack::high_water().div_ceil(1024),
+        crate::issuer::crypto_stack::SIZE / 1024
+    );
+}
+
+fn print_hex(bytes: &[u8]) {
+    for b in bytes {
+        crate::print!("{:02x}", b);
     }
 }
 
