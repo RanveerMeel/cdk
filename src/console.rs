@@ -665,7 +665,7 @@ fn cmd_help() {
     crate::println!("  ls                List programs in the boot ramdisk (size, SHA-256)");
     crate::println!("  spawn <name>      Load a ramdisk program as a Ready process");
     crate::println!("  exec <name> [obj perms]  Load and run a ramdisk program (optionally grant a handle)");
-    crate::println!("  grant <pid> <obj> [perms]  Give a process a capability handle (default send,recv)");
+    crate::println!("  grant <pid> <obj> [perms]  Give a process a capability handle (default send,recv; add ,approval to require a human for each send)");
     crate::println!("  handles <pid>     List a process's capability handles");
     crate::println!("  run-all           Run all Ready processes concurrently (preemptive)");
     crate::println!("  budget [ticks]    Show/set the per-process CPU budget (watchdog)");
@@ -2663,6 +2663,7 @@ fn cmd_ps() {
             crate::process::ProcessState::Running => "Running",
             crate::process::ProcessState::Zombie => "Zombie",
             crate::process::ProcessState::Crashed => "Crashed",
+            crate::process::ProcessState::Blocked => "Blocked",
             crate::process::ProcessState::Killed => "Killed",
         };
         crate::println!(

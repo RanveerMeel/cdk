@@ -39,6 +39,9 @@ pub enum ProcessState {
     Crashed,
     /// Killed by the kernel for exceeding its CPU budget.
     Killed,
+    /// Waiting in a syscall (e.g. for human approval); resumes when
+    /// [`unblock`] delivers the result.
+    Blocked,
 }
 
 /// Saved ring-3 register state. The layout matches the timer entry stubs:
@@ -449,6 +452,40 @@ impl ProcessTable {
         }
     }
 
+    /// Current process → `Blocked` with its registers saved; clears `current`.
+    fn block_current(&mut self, frame: &TrapFrame) -> Option<u32> {
+        let pid = self.current.take()?;
+        if let Some(idx) = self.find(pid) {
+            let p = &mut self.slots[idx];
+            p.frame = *frame;
+            p.state = ProcessState::Blocked;
+        }
+        Some(pid)
+    }
+
+    /// `Blocked` → `Ready`, with `result` returned from its syscall.
+    fn unblock(&mut self, pid: u32, result: u64) -> bool {
+        match self.find(pid) {
+            Some(idx) if self.slots[idx].state == ProcessState::Blocked => {
+                let p = &mut self.slots[idx];
+                p.frame.rax = result;
+                p.state = ProcessState::Ready;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn blocked_scheduled(&self) -> Vec<u32, MAX_PROCESSES> {
+        let mut out = Vec::new();
+        for p in self.slots.iter() {
+            if p.scheduled && p.state == ProcessState::Blocked {
+                let _ = out.push(p.pid);
+            }
+        }
+        out
+    }
+
     /// Current process → `Killed`; clears `current`.
     fn kill_current(&mut self) -> Option<u32> {
         let pid = self.current.take()?;
@@ -620,9 +657,25 @@ pub fn enter(pid: u32) -> Result<ExitStatus, ProcessError> {
 pub fn run_scheduled(which: Select) -> Result<Vec<(u32, ExitStatus), MAX_PROCESSES>, ProcessError> {
     let selected = TABLE.lock().select(which)?;
     loop {
+        // An agent that just blocked for approval returns control here;
+        // ask the human right away rather than after the others finish.
+        if crate::agent::has_pending() {
+            crate::agent::resolve_approvals();
+        }
         let next = TABLE.lock().dispatch_next();
         let Some(proc) = next else {
-            break;
+            // Nothing runnable. Processes waiting on a human get their
+            // decisions now; anything still blocked afterwards has no
+            // pending request and is released with an error.
+            let blocked = TABLE.lock().blocked_scheduled();
+            if blocked.is_empty() {
+                break;
+            }
+            crate::agent::resolve_approvals();
+            for pid in TABLE.lock().blocked_scheduled() {
+                unblock(pid, crate::agent::err(crate::agent::errno::EDENIED));
+            }
+            continue;
         };
         if !proc.started {
             {
@@ -696,6 +749,22 @@ fn load_page_tables(pml4_phys: u64) {
     }
     #[cfg(not(target_os = "none"))]
     let _ = pml4_phys;
+}
+
+/// Park the current process (called from the syscall path with its frame).
+pub fn block_current(frame: &TrapFrame) {
+    TABLE.lock().block_current(frame);
+}
+
+/// Resume a `Blocked` process with `result` as its syscall return value.
+pub fn unblock(pid: u32, result: u64) -> bool {
+    TABLE.lock().unblock(pid, result)
+}
+
+/// Name of process `pid`, if it exists.
+pub fn name_of(pid: u32) -> Option<ProcName> {
+    let t = TABLE.lock();
+    t.find(pid).map(|i| t.slots[i].name)
 }
 
 pub fn current_pid() -> Option<u32> {
@@ -985,6 +1054,35 @@ mod tests {
         assert_eq!(t.dispatch_next().unwrap().pid, 2);
         t.exit_current(8);
         assert_eq!(t.dispatch_next(), None);
+    }
+
+    #[test]
+    fn blocked_process_resumes_with_result() {
+        let mut t = table_with(2);
+        t.select(Select::AllReady).unwrap();
+        t.dispatch_next().unwrap();
+        let mut f = frame(1);
+        f.rip = 0x1234;
+        assert_eq!(t.block_current(&f), Some(1));
+        assert_eq!(t.slots[0].state, ProcessState::Blocked);
+        assert_eq!(t.current, None);
+        // A blocked process is not dispatched; the other one is.
+        assert_eq!(t.dispatch_next().unwrap().pid, 2);
+        t.exit_current(0);
+        assert_eq!(t.dispatch_next(), None);
+        assert_eq!(&t.blocked_scheduled()[..], &[1]);
+        assert!(t.unblock(1, 42));
+        assert!(!t.unblock(1, 42), "only blocked processes can be unblocked");
+        let p = t.dispatch_next().unwrap();
+        assert_eq!((p.pid, p.frame.rax, p.frame.rip), (1, 42, 0x1234));
+        // Blocked processes are not reapable.
+        let mut t2 = table_with(1);
+        t2.start(1).unwrap();
+        t2.block_current(&frame(1));
+        assert_eq!(
+            t2.take_for_reap(1).err(),
+            Some(ProcessError::BadState(ProcessState::Blocked))
+        );
     }
 
     #[test]

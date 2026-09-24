@@ -84,6 +84,10 @@ pub enum Permission {
     SendMessage,
     ReceiveMessage,
     Delete,
+    /// Constraint, not a right: every outbound action through this token
+    /// (currently `send`) waits for a human to approve it. Covered by the
+    /// signature like any permission, and inherited by derived handles.
+    RequiresApproval,
 }
 
 impl Permission {
@@ -96,6 +100,7 @@ impl Permission {
             Permission::SendMessage => 0x04,
             Permission::ReceiveMessage => 0x05,
             Permission::Delete => 0x06,
+            Permission::RequiresApproval => 0x07,
         }
     }
 }
@@ -591,6 +596,7 @@ mod tests {
             Permission::SendMessage.tag(),
             Permission::ReceiveMessage.tag(),
             Permission::Delete.tag(),
+            Permission::RequiresApproval.tag(),
         ];
         let mut seen = heapless::FnvIndexSet::<u8, 16>::new();
         for t in tags {

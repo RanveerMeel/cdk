@@ -60,6 +60,8 @@ pub mod errno {
     pub const ENOSPC: u64 = 6;
     /// The token failed verification.
     pub const ESIG: u64 = 7;
+    /// A human denied the action (approval-gated handle).
+    pub const EDENIED: u64 = 8;
 }
 
 /// Encode an error code as a syscall return value.
@@ -126,17 +128,23 @@ impl HandleTable {
     }
 
     /// Unsigned child of `handle` holding only `mask`'s permissions; errors
-    /// if `mask` asks for anything the parent does not hold.
+    /// if `mask` asks for anything the parent does not hold. The approval
+    /// constraint is never dropped (a child may add it, not remove it).
     pub fn attenuate(&self, handle: u64, mask: u64) -> Result<Capability, HandleError> {
         let parent = self.get(handle)?;
-        if mask & !parent.permission_mask() != 0 {
+        let parent_mask = parent.permission_mask();
+        if mask & !parent_mask & !APPROVAL_BIT != 0 {
             return Err(HandleError::Escalation);
         }
+        let mask = mask | (parent_mask & APPROVAL_BIT);
         let mut child = parent.clone();
         for p in ALL_PERMISSIONS {
             if mask & perm_bit(&p) == 0 {
                 child.remove_permission(&p);
             }
+        }
+        if mask & APPROVAL_BIT != 0 {
+            let _ = child.add_permission(Permission::RequiresApproval);
         }
         Ok(child)
     }
@@ -156,14 +164,18 @@ impl Default for HandleTable {
     }
 }
 
-const ALL_PERMISSIONS: [Permission; 6] = [
+const ALL_PERMISSIONS: [Permission; 7] = [
     Permission::Read,
     Permission::Write,
     Permission::Execute,
     Permission::SendMessage,
     Permission::ReceiveMessage,
     Permission::Delete,
+    Permission::RequiresApproval,
 ];
+
+/// Mask bit of the human-approval constraint.
+pub const APPROVAL_BIT: u64 = 1 << 7;
 
 /// Mask bit for `p` (same encoding as [`Capability::permission_mask`]).
 fn perm_bit(p: &Permission) -> u64 {
@@ -171,7 +183,7 @@ fn perm_bit(p: &Permission) -> u64 {
 }
 
 /// Parse `send,recv,...` (or `all`) into permissions.
-pub fn parse_permissions(spec: &str) -> Option<heapless::Vec<Permission, 6>> {
+pub fn parse_permissions(spec: &str) -> Option<heapless::Vec<Permission, 7>> {
     let mut out = heapless::Vec::new();
     for word in spec.split(',').filter(|w| !w.is_empty()) {
         let p = match word {
@@ -181,10 +193,14 @@ pub fn parse_permissions(spec: &str) -> Option<heapless::Vec<Permission, 6>> {
             "send" => Permission::SendMessage,
             "recv" => Permission::ReceiveMessage,
             "delete" => Permission::Delete,
+            "approval" => Permission::RequiresApproval,
             "all" => {
                 out.clear();
-                for p in ALL_PERMISSIONS {
-                    let _ = out.push(p);
+                for p in ALL_PERMISSIONS
+                    .iter()
+                    .filter(|p| **p != Permission::RequiresApproval)
+                {
+                    let _ = out.push(p.clone());
                 }
                 return Some(out);
             }
@@ -200,10 +216,9 @@ pub fn parse_permissions(spec: &str) -> Option<heapless::Vec<Permission, 6>> {
 /// Short names for a permission mask, e.g. `send,recv`.
 pub fn permission_names(mask: u64) -> heapless::String<48> {
     let mut s = heapless::String::new();
-    for (p, name) in ALL_PERMISSIONS
-        .iter()
-        .zip(["read", "write", "exec", "send", "recv", "delete"])
-    {
+    for (p, name) in ALL_PERMISSIONS.iter().zip([
+        "read", "write", "exec", "send", "recv", "delete", "approval",
+    ]) {
         if mask & perm_bit(p) != 0 {
             if !s.is_empty() {
                 let _ = s.push(',');
@@ -281,6 +296,146 @@ pub fn describe(pid: u32, mut f: impl FnMut(u32, u64, &str)) -> Result<(), Handl
 }
 
 // ---------------------------------------------------------------------------
+// Human approval
+// ---------------------------------------------------------------------------
+
+/// A blocked `send` waiting for a human decision.
+pub struct Pending {
+    pub id: u32,
+    pub pid: u32,
+    pub handle: u64,
+    cap: Capability,
+    payload: heapless::Vec<u8, MAX_MESSAGE>,
+}
+
+impl Pending {
+    pub fn object(&self) -> &str {
+        &self.cap.object_id
+    }
+
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+}
+
+/// Requests queued at most (one per blocked process is the norm).
+pub const MAX_PENDING: usize = 8;
+
+static PENDING: Mutex<heapless::Deque<Pending, MAX_PENDING>> = Mutex::new(heapless::Deque::new());
+static NEXT_REQUEST: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
+
+/// Whether any request is waiting for a human decision.
+pub fn has_pending() -> bool {
+    !PENDING.lock().is_empty()
+}
+
+/// Ask the human at the console about every pending request, apply each
+/// decision, and resume the waiting processes. Returns how many were decided.
+pub fn resolve_approvals() -> usize {
+    resolve_with(prompt_console)
+}
+
+/// Decide every pending request with `decide` (tests use a scripted one).
+pub fn resolve_with(mut decide: impl FnMut(&Pending) -> bool) -> usize {
+    let mut n = 0;
+    loop {
+        // Never hold the queue lock while a human thinks.
+        let Some(req) = PENDING.lock().pop_front() else {
+            break;
+        };
+        let approved = decide(&req);
+        let kind = if approved {
+            EventKind::ApprovalGranted
+        } else {
+            EventKind::ApprovalDenied
+        };
+        audit::record_fmt(
+            kind,
+            format_args!("pid-{}:req-{}:{}", req.pid, req.id, req.object()),
+            req.id as u64,
+        );
+        let result = if approved {
+            match perform_send(req.pid, req.handle, &req.cap, &req.payload) {
+                Ok(v) => v,
+                Err(code) => err(code),
+            }
+        } else {
+            err(errno::EDENIED)
+        };
+        crate::process::unblock(req.pid, result);
+        n += 1;
+    }
+    n
+}
+
+/// Write `bytes` so that nothing an agent sends can move the cursor, clear
+/// the screen, or fake console output: printable ASCII passes through,
+/// everything else (and `"`/`\`) is shown as a `\xNN` escape.
+pub fn write_sanitized(bytes: &[u8], mut out: impl FnMut(&str)) {
+    for &b in bytes {
+        if (0x20..=0x7e).contains(&b) && b != b'"' && b != b'\\' {
+            let s = [b];
+            out(core::str::from_utf8(&s).unwrap_or("?"));
+        } else {
+            let mut hex: heapless::String<4> = heapless::String::new();
+            let _ = core::fmt::write(&mut hex, format_args!("\\x{:02x}", b));
+            out(&hex);
+        }
+    }
+}
+
+fn prompt_console(req: &Pending) -> bool {
+    let name = crate::process::name_of(req.pid);
+    crate::println!();
+    crate::println!("=== HUMAN APPROVAL REQUIRED (request #{}) ===", req.id);
+    crate::println!(
+        "  agent  : pid {} '{}'",
+        req.pid,
+        name.as_ref().map_or("?", |n| n.as_str())
+    );
+    crate::println!(
+        "  action : send {} bytes to {} (handle h{})",
+        req.payload.len(),
+        req.object(),
+        req.handle
+    );
+    crate::print!("  data   : \"");
+    write_sanitized(&req.payload, |s| crate::print!("{}", s));
+    crate::println!("\"");
+    crate::print!("Approve? [y/N] ");
+    let approved = read_decision();
+    crate::println!("  -> {}", if approved { "APPROVED" } else { "DENIED" });
+    approved
+}
+
+/// Read one line from the console; `y`/`yes` (any case) approves.
+fn read_decision() -> bool {
+    #[cfg(target_os = "none")]
+    {
+        let mut line = [0u8; 8];
+        let mut len = 0;
+        loop {
+            let b = crate::serial::read_byte();
+            match b {
+                b'\r' | b'\n' => break,
+                0x08 | 0x7f if len > 0 => len -= 1,
+                0x20..=0x7e if len < line.len() => {
+                    line[len] = b;
+                    len += 1;
+                    crate::serial::write_byte(b);
+                }
+                _ => {}
+            }
+        }
+        crate::println!();
+        let answer = &line[..len];
+        answer.eq_ignore_ascii_case(b"y") || answer.eq_ignore_ascii_case(b"yes")
+    }
+    #[cfg(not(target_os = "none"))]
+    false
+}
+
+// ---------------------------------------------------------------------------
 // Syscalls
 // ---------------------------------------------------------------------------
 
@@ -319,7 +474,11 @@ pub fn syscall(nr: u64, a0: u64, a1: u64, a2: u64) -> u64 {
         SYS_CAP_LIST => sys_cap_list(pid, a0, a1),
         SYS_CAP_DROP => sys_cap_drop(pid, a0),
         SYS_CAP_DERIVE => sys_cap_derive(pid, a0, a1),
-        SYS_SEND => sys_send(pid, a0, a1, a2),
+        // `send` may block for approval; it is dispatched by `sys_send_outcome`.
+        SYS_SEND => match sys_send_outcome(a0, a1, a2) {
+            crate::syscall::Outcome::Return(v) => return v,
+            crate::syscall::Outcome::Block => Err(errno::EINVAL),
+        },
         SYS_RECV => sys_recv(pid, a0, a1, a2),
         _ => Err(errno::EINVAL),
     };
@@ -421,7 +580,56 @@ fn map_kernel_error(pid: u32, handle: u64, what: &str, e: KernelError) -> u64 {
     }
 }
 
-fn sys_send(pid: u32, handle: u64, ptr: u64, len: u64) -> Result<u64, u64> {
+/// `send`, which blocks for a human decision when the handle carries the
+/// approval constraint.
+pub fn sys_send_outcome(handle: u64, ptr: u64, len: u64) -> crate::syscall::Outcome {
+    use crate::syscall::Outcome;
+    let Some(pid) = crate::process::current_pid() else {
+        return Outcome::Return(err(errno::EINVAL));
+    };
+    let (cap, payload) = match prepare_send(pid, handle, ptr, len) {
+        Ok(v) => v,
+        Err(code) => return Outcome::Return(err(code)),
+    };
+    if !cap.has_permission(&Permission::RequiresApproval) {
+        return Outcome::Return(match perform_send(pid, handle, &cap, &payload) {
+            Ok(v) => v,
+            Err(code) => err(code),
+        });
+    }
+    // Only a handle that could send at all may ask; otherwise it is a
+    // plain permission failure, not a request for a human.
+    if !cap.has_permission(&Permission::SendMessage) {
+        audit_denied(pid, handle, "send");
+        return Outcome::Return(err(errno::EPERM));
+    }
+    let id = NEXT_REQUEST.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let object = cap.object_id.clone();
+    let queued = PENDING.lock().push_back(Pending {
+        id,
+        pid,
+        handle,
+        cap,
+        payload,
+    });
+    if queued.is_err() {
+        return Outcome::Return(err(errno::EFULL));
+    }
+    audit::record_fmt(
+        EventKind::ApprovalRequested,
+        format_args!("pid-{}:req-{}:{}", pid, id, object),
+        id as u64,
+    );
+    Outcome::Block
+}
+
+/// Copy the message from user memory and look up the handle.
+fn prepare_send(
+    pid: u32,
+    handle: u64,
+    ptr: u64,
+    len: u64,
+) -> Result<(Capability, heapless::Vec<u8, MAX_MESSAGE>), u64> {
     if len as usize > MAX_MESSAGE {
         return Err(errno::EINVAL);
     }
@@ -433,13 +641,19 @@ fn sys_send(pid: u32, handle: u64, ptr: u64, len: u64) -> Result<u64, u64> {
     let cap = with_table(pid, |t| t.get(handle).cloned())
         .map_err(handle_errno)?
         .map_err(handle_errno)?;
+    let payload = heapless::Vec::from_slice(buf).map_err(|_| errno::EINVAL)?;
+    Ok((cap, payload))
+}
+
+/// Deliver the message through the kernel (re-verifies and permission-checks).
+fn perform_send(pid: u32, handle: u64, cap: &Capability, buf: &[u8]) -> Result<u64, u64> {
     let kernel = kernel().ok_or(errno::EINVAL)?;
     let mut from: heapless::String<16> = heapless::String::new();
     let _ = core::fmt::write(&mut from, format_args!("pid-{}", pid));
     let payload = MessagePayload::Data(heapless::Vec::from_slice(buf).map_err(|_| errno::EINVAL)?);
     let msg = Message::new(&from, &cap.object_id, payload).map_err(|_| errno::EINVAL)?;
     kernel
-        .send_message(&cap, &cap.object_id, msg)
+        .send_message(cap, &cap.object_id, msg)
         .map_err(|e| map_kernel_error(pid, handle, "send", e))?;
     Ok(0)
 }
@@ -470,6 +684,7 @@ fn sys_recv(pid: u32, handle: u64, ptr: u64, len: u64) -> Result<u64, u64> {
 mod tests {
     use super::*;
     use crate::object::KernelObject;
+    extern crate std;
 
     fn cap(perms: &[Permission]) -> Capability {
         let obj = KernelObject::new_compute("agent-test", "normal");
@@ -539,13 +754,83 @@ mod tests {
     }
 
     #[test]
+    fn approval_constraint_is_inherited_never_dropped() {
+        let mut t = HandleTable::new();
+        let gated = t
+            .insert(cap(&[
+                Permission::SendMessage,
+                Permission::RequiresApproval,
+            ]))
+            .unwrap() as u64;
+        // Asking for "send" only still yields a gated child.
+        let child = t.attenuate(gated, SEND).unwrap();
+        assert_eq!(child.permission_mask(), SEND | APPROVAL_BIT);
+        // An ungated handle may add the constraint (that only restricts it).
+        let open = t.insert(cap(&[Permission::SendMessage])).unwrap() as u64;
+        assert_eq!(
+            t.attenuate(open, SEND | APPROVAL_BIT)
+                .unwrap()
+                .permission_mask(),
+            SEND | APPROVAL_BIT
+        );
+        // Rights still can't be added.
+        assert_eq!(
+            t.attenuate(gated, SEND | RECV).err(),
+            Some(HandleError::Escalation)
+        );
+    }
+
+    #[test]
+    fn sanitizer_neutralizes_control_and_quote_bytes() {
+        let mut out = std::string::String::new();
+        write_sanitized(b"pay \x1b[2J\"ok\"\n\\", |s| out.push_str(s));
+        assert_eq!(out, "pay \\x1b[2J\\x22ok\\x22\\x0a\\x5c");
+    }
+
+    #[test]
+    fn denied_requests_resume_with_edenied() {
+        // Queue a request for a pid that is not in the process table; the
+        // decision is still audited and consumed.
+        let obj = KernelObject::new_compute("approval-test", "normal");
+        let c = cap(&[Permission::SendMessage, Permission::RequiresApproval]);
+        let _ = obj;
+        let _ = PENDING.lock().push_back(Pending {
+            id: 77,
+            pid: 4242,
+            handle: 0,
+            cap: c,
+            payload: heapless::Vec::from_slice(b"transfer 5").unwrap(),
+        });
+        let mut seen = std::vec::Vec::new();
+        let n = resolve_with(|req| {
+            seen.push((req.id, req.payload().to_vec()));
+            false
+        });
+        assert_eq!(n, 1);
+        assert_eq!(seen, std::vec![(77, b"transfer 5".to_vec())]);
+        assert!(PENDING.lock().is_empty());
+    }
+
+    #[test]
     fn permission_parsing_and_names() {
         let p = parse_permissions("send,recv").unwrap();
         assert_eq!(
             &p[..],
             &[Permission::SendMessage, Permission::ReceiveMessage]
         );
-        assert_eq!(parse_permissions("all").unwrap().len(), 6);
+        assert_eq!(
+            parse_permissions("all").unwrap().len(),
+            6,
+            "all = every right, no constraint"
+        );
+        assert_eq!(
+            &parse_permissions("send,approval").unwrap()[..],
+            &[Permission::SendMessage, Permission::RequiresApproval]
+        );
+        assert_eq!(
+            permission_names(SEND | APPROVAL_BIT).as_str(),
+            "send,approval"
+        );
         assert_eq!(parse_permissions("send,bogus"), None);
         assert_eq!(parse_permissions(""), None);
         assert_eq!(permission_names(SEND | RECV).as_str(), "send,recv");

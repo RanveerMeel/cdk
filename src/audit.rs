@@ -80,6 +80,13 @@ pub enum EventKind {
     CapDerived = 12,
     /// Process killed for exceeding its CPU budget. `detail` = ticks used.
     ProcessKilled = 13,
+    /// An agent asked for human approval. Subject `pid-N:req-R:object`;
+    /// `detail` = request id.
+    ApprovalRequested = 14,
+    /// A human approved request `detail`.
+    ApprovalGranted = 15,
+    /// A human denied request `detail`.
+    ApprovalDenied = 16,
 }
 
 impl EventKind {
@@ -98,6 +105,9 @@ impl EventKind {
             EventKind::CapGranted => "cap-granted",
             EventKind::CapDerived => "cap-derived",
             EventKind::ProcessKilled => "proc-killed",
+            EventKind::ApprovalRequested => "approval-asked",
+            EventKind::ApprovalGranted => "approval-yes",
+            EventKind::ApprovalDenied => "approval-no",
         }
     }
 }

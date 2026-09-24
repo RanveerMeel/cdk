@@ -186,7 +186,17 @@ Each process carries a saved `TrapFrame` (15 general-purpose registers plus the 
 - A process that exceeds `budget` ticks (default 200 ≈ 10 s) is marked `Killed`, logged as `proc-killed`, and the kernel context resumes, exactly like a crash.
 - `SYS_exit` or a fault resumes the kernel loop, which dispatches the next runnable process until none remain.
 
-Switching only happens at ring-3 interrupt boundaries (syscalls run with interrupts masked by `SFMASK`), so one kernel stack per CPU is enough and no kernel state is ever suspended mid-operation. User programs are soft-float, so no FPU state is switched yet (roadmap 2.6); all agents currently run on the console's CPU (roadmap 2.7), which is also what keeps `agent::with_kernel` sound.
+Switching only happens at ring-3 interrupt boundaries or when a syscall blocks (syscalls run with interrupts masked by `SFMASK`), so one kernel stack per CPU is enough and no kernel state is ever suspended mid-operation. User programs are soft-float, so no FPU state is switched yet (roadmap 2.6); all agents currently run on the console's CPU (roadmap 2.7), which is also what keeps `agent::with_kernel` sound.
+
+### Human-Approval Gates (`src/agent.rs`, `src/syscall.rs`, `src/process.rs`)
+
+`Permission::RequiresApproval` (tag 7) is a *constraint* carried in the signed permission set: an agent can't strip it by forging, and `cap_derive` always carries it into the child (a child may add it but never drop it). `all` grants every right but not the constraint.
+
+**Blocking syscalls.** The syscall entry stub now pushes a complete `TrapFrame` (same layout as the timer stubs) and calls `syscall_entry(&mut frame)`; results go back in `frame.rax` and every other user register is preserved. A handler may instead return `Outcome::Block`: the frame is saved into the process (`Blocked`), and the kernel context resumes the scheduler loop. `process::unblock(pid, result)` later makes it `Ready` with `result` in `rax`, and it resumes via `iretq` right after its `syscall`.
+
+**Flow.** A `send` through a gated handle copies and validates the payload, queues a `Pending` request (id, pid, handle, token, payload), records `approval-asked`, and blocks. The scheduler loop, which regains control as soon as the agent blocks, prompts on the console: agent pid and name, target object, handle, and the payload with every non-printable byte, `"` and `\` escaped as `\xNN` (an agent cannot inject terminal control sequences or fake console text). `y`/`yes` approves: the kernel performs the send through `Kernel::send_message` (re-verifying the token) and returns its result; anything else returns `HumanDenied` (`-8`). Decisions are recorded as `approval-yes` / `approval-no`. Other agents are paused while the human decides.
+
+**Limits.** One console operator, whose identity is not cryptographically bound to the decision; only `send` is gated; requests wait indefinitely (the CPU-budget watchdog does not tick while blocked). Signed operator approvals and multi-party rules are roadmap item 2.8.
 
 ### Native Inference (`user/ml`, `user/models`, `tools/train_demo_model.py`)
 

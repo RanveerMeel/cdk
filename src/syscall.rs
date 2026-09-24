@@ -45,10 +45,51 @@ pub fn init() {
     }
 }
 
-/// Rust dispatcher: `nr` in rax; arguments in rdi, rsi, rdx.
+/// What a syscall handler decided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// Return this value in `rax`.
+    Return(u64),
+    /// Park the calling process (e.g. waiting for human approval); its
+    /// result is delivered later by [`crate::process::unblock`].
+    Block,
+}
+
+/// Rust side of the syscall entry stub. `frame` is the caller's full
+/// register state (number in `rax`; arguments in `rdi`, `rsi`, `rdx`).
 #[no_mangle]
-pub extern "C" fn syscall_dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64) -> u64 {
-    match nr {
+pub extern "C" fn syscall_entry(frame: &mut crate::process::TrapFrame) {
+    match syscall_dispatch(frame.rax, frame.rdi, frame.rsi, frame.rdx) {
+        Outcome::Return(v) => frame.rax = v,
+        Outcome::Block => block_current(frame),
+    }
+}
+
+/// Save the caller's frame into its process, mark it `Blocked`, and resume
+/// the scheduler loop. Does not return (bare metal).
+fn block_current(frame: &mut crate::process::TrapFrame) {
+    #[cfg(target_os = "none")]
+    {
+        if let Some((_, ucode, udata)) = crate::gdt::star_selectors() {
+            frame.cs = ucode.0 as u64;
+            frame.ss = udata.0 as u64;
+        }
+        frame.rflags |= 0x200;
+        crate::process::block_current(frame);
+        if let Some(slot) = resume::take_armed(current_slot()) {
+            unsafe { resume::resume(slot, 0) }
+        }
+        loop {
+            unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)) };
+        }
+    }
+    #[cfg(not(target_os = "none"))]
+    crate::process::block_current(frame);
+}
+
+/// Dispatch syscall `nr` with its arguments.
+pub fn syscall_dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64) -> Outcome {
+    let value = match nr {
         SYS_EXIT => {
             crate::process::mark_exit(arg0);
             crate::println!("Syscall: SYS_exit code={}", arg0);
@@ -68,6 +109,7 @@ pub extern "C" fn syscall_dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64) -> 
             #[cfg(not(target_os = "none"))]
             0
         }
+        crate::agent::SYS_SEND => return crate::agent::sys_send_outcome(arg0, arg1, arg2),
         SYS_WRITE => sys_write(arg0, arg1),
         SYS_GETPID => crate::process::current_pid().map_or(SYSCALL_ERR, |p| p as u64),
         crate::agent::SYS_CAP_LIST..=crate::agent::SYS_RECV => {
@@ -77,7 +119,8 @@ pub extern "C" fn syscall_dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64) -> 
             crate::println!("Syscall: unknown nr={}", nr);
             SYSCALL_ERR
         }
-    }
+    };
+    Outcome::Return(value)
 }
 
 /// Terminate the ring-3 program that raised `fault` and resume the kernel
@@ -171,18 +214,53 @@ core::arch::global_asm!(
         swapgs
         mov gs:[{user_rsp}], rsp
         mov rsp, gs:[{kernel_rsp}]
-        push rcx
+        // Build a full process::TrapFrame (the timer stubs' layout) so a
+        // syscall can block and later resume via iretq. cs/ss are filled in
+        // only if the process blocks. 20 pushes keep RSP 16-byte aligned.
+        push 0
+        push qword ptr gs:[{user_rsp}]
         push r11
-        // SysV args: rdi=nr, rsi=arg0, rdx=arg1, rcx=arg2 (user rax, rdi,
-        // rsi, rdx). rcx (user RIP) is already saved above.
-        mov rcx, rdx
-        mov rdx, rsi
-        mov rsi, rdi
-        mov rdi, rax
-        call syscall_dispatch
+        push 0
+        push rcx
+        push rax
+        push rbx
+        push rcx
+        push rdx
+        push rsi
+        push rdi
+        push rbp
+        push r8
+        push r9
+        push r10
+        push r11
+        push r12
+        push r13
+        push r14
+        push r15
+        mov rdi, rsp
+        cld
+        call syscall_entry
+        pop r15
+        pop r14
+        pop r13
+        pop r12
         pop r11
+        pop r10
+        pop r9
+        pop r8
+        pop rbp
+        pop rdi
+        pop rsi
+        pop rdx
         pop rcx
-        mov rsp, gs:[{user_rsp}]
+        pop rbx
+        pop rax
+        // Interrupt-frame part: rip -> rcx, skip cs, rflags -> r11, then the
+        // user rsp. Interrupts stay masked (SFMASK) until sysretq.
+        pop rcx
+        add rsp, 8
+        pop r11
+        pop rsp
         swapgs
         sysretq
     "#,

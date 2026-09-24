@@ -42,6 +42,8 @@ pub mod perm {
     pub const SEND: u32 = 1 << 4;
     pub const RECV: u32 = 1 << 5;
     pub const DELETE: u32 = 1 << 6;
+    /// Constraint: every send through this handle waits for a human.
+    pub const APPROVAL: u32 = 1 << 7;
 }
 
 /// Errors from capability syscalls.
@@ -61,6 +63,8 @@ pub enum Error {
     NoSpace,
     /// The capability failed verification.
     BadSignature,
+    /// A human denied the action (approval-gated handle).
+    HumanDenied,
     /// Unrecognized error code.
     Other(u64),
 }
@@ -75,6 +79,7 @@ impl Error {
             5 => Error::Empty,
             6 => Error::NoSpace,
             7 => Error::BadSignature,
+            8 => Error::HumanDenied,
             c => Error::Other(c),
         }
     }
@@ -177,7 +182,8 @@ pub fn cap_derive(handle: u32, perms: u32) -> Result<u32, Error> {
     check(unsafe { syscall3(SYS_CAP_DERIVE, handle as u64, perms as u64, 0) }).map(|h| h as u32)
 }
 
-/// Send up to 64 bytes to the handle's object (needs [`perm::SEND`]).
+/// Send up to 64 bytes to the handle's object (needs [`perm::SEND`]). If the
+/// handle carries [`perm::APPROVAL`], this blocks until a human decides.
 pub fn send(handle: u32, msg: &[u8]) -> Result<(), Error> {
     let r = unsafe {
         syscall3(
