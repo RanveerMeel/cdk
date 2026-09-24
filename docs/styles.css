@@ -165,3 +165,113 @@ code {
   color: var(--muted);
   text-align: center;
 }
+
+/* --- Trust-kernel page additions --- */
+
+:root {
+  --ok: #5fd39a;
+  --next: #f0b95c;
+}
+
+strong {
+  color: var(--text);
+}
+
+.narrow {
+  max-width: 760px;
+  margin: 0 0 1.4rem;
+}
+
+.grid.two {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+}
+
+.steps {
+  list-style: none;
+  counter-reset: step;
+  padding: 0;
+  margin: 0 0 1.4rem;
+  display: grid;
+  gap: 0.8rem;
+}
+
+.steps li {
+  counter-increment: step;
+  position: relative;
+  padding: 0.9rem 1rem 0.9rem 3.2rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  color: var(--muted);
+}
+
+.steps li::before {
+  content: counter(step);
+  position: absolute;
+  left: 1rem;
+  top: 0.9rem;
+  width: 1.6rem;
+  height: 1.6rem;
+  border-radius: 50%;
+  background: var(--brand);
+  color: #071225;
+  font-weight: 700;
+  font-size: 0.9rem;
+  display: grid;
+  place-items: center;
+}
+
+.step-title {
+  display: block;
+  color: var(--text);
+  font-weight: 600;
+  margin-bottom: 0.15rem;
+}
+
+.diagram code {
+  font-size: 0.82rem;
+  line-height: 1.35;
+  white-space: pre;
+}
+
+.status-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.6rem;
+}
+
+.status-head::before {
+  content: "";
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 50%;
+}
+
+.status-head.done::before {
+  background: var(--ok);
+}
+
+.status-head.next::before {
+  background: var(--next);
+}
+
+.checklist.todo li {
+  color: var(--muted);
+}
+
+.fineprint {
+  font-size: 0.9rem;
+  margin: 1rem 0 0;
+}
+
+@media (max-width: 520px) {
+  .hero {
+    padding: 3.5rem 0 2.5rem;
+  }
+  .steps li {
+    padding-left: 2.9rem;
+  }
+}
