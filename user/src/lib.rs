@@ -22,6 +22,9 @@
 
 use core::fmt::{self, Write};
 
+/// Integer-only model inference (`CDKLM1`), re-exported from `cdk-ml`.
+pub use cdk_ml as ml;
+
 pub const SYS_EXIT: u64 = 1;
 pub const SYS_WRITE: u64 = 2;
 pub const SYS_CAP_LIST: u64 = 3;

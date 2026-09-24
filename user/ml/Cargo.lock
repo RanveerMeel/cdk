@@ -5,10 +5,3 @@ version = 4
 [[package]]
 name = "cdk-ml"
 version = "0.1.0"
-
-[[package]]
-name = "cdk-user"
-version = "0.1.0"
-dependencies = [
- "cdk-ml",
-]

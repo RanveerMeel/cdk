@@ -9,6 +9,9 @@ publish = false
 [lib]
 path = "src/lib.rs"
 
+[dependencies]
+cdk-ml = { path = "ml" }
+
 [profile.dev]
 panic = "abort"
 

@@ -188,6 +188,12 @@ Each process carries a saved `TrapFrame` (15 general-purpose registers plus the 
 
 Switching only happens at ring-3 interrupt boundaries (syscalls run with interrupts masked by `SFMASK`), so one kernel stack per CPU is enough and no kernel state is ever suspended mid-operation. User programs are soft-float, so no FPU state is switched yet (roadmap 2.6); all agents currently run on the console's CPU (roadmap 2.7), which is also what keeps `agent::with_kernel` sound.
 
+### Native Inference (`user/ml`, `user/models`, `tools/train_demo_model.py`)
+
+`cdk-ml` is a `no_std` crate with no floating point: agents are soft-float and have no FPU state (roadmap 2.6). Models use the `CDKLM1` format — header (magic, feature count ≤ 1024, class count 2–16, feature kind, logit scale), 16-byte labels, i32 biases, i8 weights — and are rejected unless the byte length matches the header exactly. Features are u8 (255 ≙ 1.0); logits are `bias + Σ w·x` in 64-bit accumulators, clamped to i32; `classify` returns argmax and the margin over the runner-up. `text::hashed_trigrams` is a generic featurizer (ASCII-lowercased, non-alphanumerics to spaces, FNV-1a of each 3-byte window, bucket presence).
+
+The demo model is trained by a dependency-free, deterministic Python script that also writes `priority-demo.vectors`: expected integer logits from its own independent implementation of the featurizer and inference. `cdk-ml`'s host tests must reproduce them exactly. Agents embed models with `include_bytes!`, so the `program-loaded` hash covers the model. `tools/build_user_programs.sh` optionally adds prebuilt programs from `CDK_PRIVATE_PROGRAMS_DIR` (must be outside the repo) to a local ramdisk, which is how proprietary models are run without publishing them.
+
 ### Agent Capability Handles (`src/agent.rs`)
 
 Each process gets a table of up to 16 `Capability` tokens when it is spawned; the table is cleared when it is reaped. Tokens stay in kernel memory; programs use the index.

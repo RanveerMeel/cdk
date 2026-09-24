@@ -44,3 +44,9 @@ jobs:
 
       - name: User programs and ramdisk
         run: tools/build_user_programs.sh
+
+      - name: Inference runtime tests
+        run: cd user/ml && cargo test --target x86_64-unknown-linux-gnu
+
+      - name: Demo model is reproducible
+        run: python3 tools/train_demo_model.py && git diff --exit-code user/models

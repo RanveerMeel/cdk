@@ -24,6 +24,24 @@ for src in "$ROOT"/user/src/bin/*.rs; do
     cp "$BIN_DIR/$name" "$STAGE/$name"
 done
 
+# Optional private programs: prebuilt ELF files from a directory OUTSIDE this
+# repository (e.g. proprietary agents with embedded models). They are packed
+# into this build's ramdisk only; nothing from that directory is committed.
+if [ -n "${CDK_PRIVATE_PROGRAMS_DIR:-}" ]; then
+    case "$(realpath "$CDK_PRIVATE_PROGRAMS_DIR")/" in
+        "$ROOT"/*) echo "CDK_PRIVATE_PROGRAMS_DIR must be outside the repository" >&2; exit 1 ;;
+    esac
+    for f in "$CDK_PRIVATE_PROGRAMS_DIR"/*; do
+        [ -f "$f" ] || continue
+        name="$(basename "$f")"
+        if [ -e "$STAGE/$name" ]; then
+            echo "private program '$name' clashes with a public one" >&2
+            exit 1
+        fi
+        cp "$f" "$STAGE/$name"
+    done
+fi
+
 # Reproducible archive: fixed order, owner, and timestamps.
 (cd "$STAGE" && tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner \
     --mtime=@0 -cf "$OUT" -- *)

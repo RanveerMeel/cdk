@@ -576,7 +576,7 @@ fn dispatch(
         "ps" => cmd_ps(),
         "reap" => cmd_reap(arg1, frame_alloc),
         "irq-route" => cmd_irq_route(arg1, arg2),
-        "send" => cmd_send(arg1, arg2, kernel),
+        "send" => cmd_send(arg1, line.splitn(3, ' ').nth(2).unwrap_or(""), kernel),
         "recv" => cmd_recv(arg1, kernel),
         "delete" => cmd_delete(arg1, kernel, mem_graph),
         "mem" => cmd_mem(mem_graph),

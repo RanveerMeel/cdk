@@ -1,0 +1,10 @@
+[package]
+name = "cdk-ml"
+version = "0.1.0"
+edition = "2021"
+description = "Integer-only model format and inference for CDK agents (no_std)"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+path = "src/lib.rs"

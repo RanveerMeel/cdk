@@ -1,0 +1,15 @@
+# text<TAB>label<TAB>integer logits (from tools/train_demo_model.py)
+weekly report attached for review	ROUTINE	97423,-97423
+lunch menu for friday	ROUTINE	92068,-92068
+reminder: team meeting next tuesday	ROUTINE	117313,-117313
+please find the minutes from today	ROUTINE	93343,-93343
+monthly newsletter and photos	ROUTINE	105073,-105073
+meeting notes from tuesday	ROUTINE	43873,-43873
+office closed friday for the holiday	ROUTINE	167293,-167293
+thanks, the slides look good	ROUTINE	23473,-23473
+new documentation for the api	ROUTINE	35713,-35713
+URGENT: production server down!	URGENT	-93062,93062
+login broken, respond now	URGENT	-74447,74447
+database outage, call immediately	URGENT	-95102,95102
+critical: payment errors right now	URGENT	-96887,96887
+emergency in the server room	URGENT	-37982,37982
