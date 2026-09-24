@@ -78,6 +78,8 @@ pub enum EventKind {
     /// Process derived a weaker handle. Subject `pid-N:hP->hC:object`;
     /// `detail` = the child's permission bitmask.
     CapDerived = 12,
+    /// Process killed for exceeding its CPU budget. `detail` = ticks used.
+    ProcessKilled = 13,
 }
 
 impl EventKind {
@@ -95,6 +97,7 @@ impl EventKind {
             EventKind::ProgramLoaded => "program-loaded",
             EventKind::CapGranted => "cap-granted",
             EventKind::CapDerived => "cap-derived",
+            EventKind::ProcessKilled => "proc-killed",
         }
     }
 }

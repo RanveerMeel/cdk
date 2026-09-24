@@ -146,12 +146,13 @@
                 <li>Key hygiene: zeroized keys, scrubbed crypto stack, zero-on-free heap, known-answer tests</li>
                 <li>Rust agent programs loaded from a boot ramdisk, each traced to its SHA-256 in the audit log</li>
                 <li>Per-agent capability handles: agents can only derive weaker handles, never stronger ones</li>
+                <li>Preemptive scheduling of agents with a CPU-budget watchdog for runaway agents</li>
               </ul>
             </div>
             <div>
               <h3 class="status-head next">Next on the roadmap</h3>
               <ul class="checklist todo">
-                <li>Preemptive scheduling of agents and human-approval gates</li>
+                <li>Human-approval gates; agents on every CPU</li>
                 <li>Hybrid X25519 + ML-KEM-768 channel to Linux; MCP gateway</li>
                 <li>Native CPU inference demo; ARM64 port</li>
               </ul>

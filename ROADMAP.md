@@ -93,9 +93,11 @@ copies, address-space teardown. See `README.md` for the full list.
 |---|---|---|
 | 2.1 | **Programs from the boot ramdisk.** User programs written in Rust (`user/`, static ET_EXEC at the user base, large code model) are packed into a reproducible `ustar` ramdisk; the kernel parses it strictly (checksums, bounds), loads programs with a 64 KiB stack plus guard page, and records each image's SHA-256 in the audit log. Console `ls`, `spawn`, `exec`. | ✅ |
 | 2.2 | **Agents hold capability handles.** Per-process table of kernel-held tokens referenced by index; syscalls `cap_list`, `cap_drop`, `cap_derive` (attenuation only, re-issued with hybrid PQ signatures), `send`/`recv` to the handle's object; every use re-verified and permission-checked; grants, derivations, and denials audit-logged. Console `grant`, `handles`, `exec <prog> <obj> <perms>`. | ✅ |
-| 2.3 | Preemptive scheduling of user processes; per-process FPU/SSE/AVX state (XSAVE) so user code can run vectorized inference. | ⬜ |
+| 2.3 | **Preemptive scheduling of agents (one CPU).** Timer entry stubs save full register frames; round-robin switching at ring-3 interrupt boundaries (100 ms slice); per-process CPU budget watchdog (10 s default) kills runaway agents; `run-all`, `budget`, `slice`, `getpid`. | ✅ |
 | 2.4 | **Native CPU inference demo:** run the SecureGuard int8 scam classifier inside a CDK process. | ⬜ |
 | 2.5 | Human-approval capabilities: an action tagged consequential blocks until an approval token is presented on the console / approval channel. | ⬜ |
+| 2.6 | Per-process FPU/SSE/AVX state (`XSAVE`) so agents can run vectorized code; today user programs are soft-float. | ⬜ |
+| 2.7 | Agents on every CPU: per-CPU run queues and proper kernel locking in place of the console lending its kernel reference to syscalls. | ⬜ |
 
 ### Phase 3 — Connected agents
 

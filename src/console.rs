@@ -89,6 +89,9 @@ const COMMANDS: &[&str] = &[
     "exec",
     "grant",
     "handles",
+    "run-all",
+    "budget",
+    "slice",
     "elf-spawn",
     "elf-run",
     "elf-smoke",
@@ -564,6 +567,9 @@ fn dispatch(
         "exec" => cmd_spawn(arg1, arg2, arg3, page_table, frame_alloc, kernel, true),
         "grant" => cmd_grant(arg1, arg2, arg3, kernel),
         "handles" => cmd_handles(arg1),
+        "run-all" => cmd_run_all(kernel),
+        "budget" => cmd_budget(arg1),
+        "slice" => cmd_slice(arg1),
         "elf-spawn" => cmd_elf_spawn(arg1, page_table, frame_alloc, kernel, false),
         "elf-run" => cmd_elf_run(arg1, kernel),
         "elf-smoke" => cmd_elf_spawn(arg1, page_table, frame_alloc, kernel, true),
@@ -661,6 +667,9 @@ fn cmd_help() {
     crate::println!("  exec <name> [obj perms]  Load and run a ramdisk program (optionally grant a handle)");
     crate::println!("  grant <pid> <obj> [perms]  Give a process a capability handle (default send,recv)");
     crate::println!("  handles <pid>     List a process's capability handles");
+    crate::println!("  run-all           Run all Ready processes concurrently (preemptive)");
+    crate::println!("  budget [ticks]    Show/set the per-process CPU budget (watchdog)");
+    crate::println!("  slice [ticks]     Show/set the time slice before preemption");
     crate::println!("  elf-spawn [prog]  Load a built-in program (hello|ud|pf|gp|de) as Ready");
     crate::println!("  elf-run <pid>     Run a Ready process until it exits");
     crate::println!("  elf-smoke [prog]  Load and run a built-in program (ud/pf/gp/de crash it)");
@@ -2583,17 +2592,61 @@ fn cmd_handles(pid_str: &str) {
 }
 
 fn run_process(pid: u32, kernel: &mut Kernel) {
-    use crate::process::ExitStatus;
     match crate::agent::with_kernel(kernel, || crate::process::enter(pid)) {
-        Ok(ExitStatus::Exited(code)) => crate::println!("elf: pid={} exited code={}", pid, code),
-        Ok(ExitStatus::Crashed(fault)) => crate::println!(
+        Ok(status) => print_exit_status(pid, status),
+        Err(e) => crate::println!("elf-run failed: {:?}", e),
+    }
+}
+
+fn print_exit_status(pid: u32, status: crate::process::ExitStatus) {
+    use crate::process::ExitStatus;
+    match status {
+        ExitStatus::Exited(code) => crate::println!("elf: pid={} exited code={}", pid, code),
+        ExitStatus::Crashed(fault) => crate::println!(
             "elf: pid={} CRASHED ({}) exit={} — kernel unaffected",
             pid,
             fault.name(),
             fault.exit_code()
         ),
-        Err(e) => crate::println!("elf-run failed: {:?}", e),
+        ExitStatus::Killed { ticks } => crate::println!(
+            "elf: pid={} KILLED by watchdog after {} ticks — kernel unaffected",
+            pid,
+            ticks
+        ),
     }
+}
+
+/// Run every `Ready` process concurrently under the preemptive scheduler.
+fn cmd_run_all(kernel: &mut Kernel) {
+    let result = crate::agent::with_kernel(kernel, || {
+        crate::process::run_scheduled(crate::process::Select::AllReady)
+    });
+    match result {
+        Ok(results) if results.is_empty() => crate::println!("run-all: no Ready processes"),
+        Ok(results) => {
+            for (pid, status) in results {
+                print_exit_status(pid, status);
+            }
+        }
+        Err(e) => crate::println!("run-all failed: {:?}", e),
+    }
+}
+
+fn cmd_budget(n: &str) {
+    if let Some(ticks) = parse_u32(n) {
+        crate::process::set_budget_ticks(ticks as u64);
+    }
+    crate::println!(
+        "budget: {} ticks per process (watchdog kills beyond this)",
+        crate::process::budget_ticks()
+    );
+}
+
+fn cmd_slice(n: &str) {
+    if let Some(ticks) = parse_u32(n) {
+        crate::process::set_slice_ticks(ticks as u64);
+    }
+    crate::println!("slice: {} ticks before preemption", crate::process::slice_ticks());
 }
 
 fn cmd_ps() {
@@ -2602,7 +2655,7 @@ fn cmd_ps() {
         crate::println!("ps: (no processes)");
         return;
     }
-    crate::println!("PID   NAME         STATE     EXIT  ENTRY          CR3");
+    crate::println!("PID   NAME         STATE     EXIT  TICKS    SWITCHES CR3");
     for p in procs.iter() {
         let state = match p.state {
             crate::process::ProcessState::Free => "Free",
@@ -2610,14 +2663,16 @@ fn cmd_ps() {
             crate::process::ProcessState::Running => "Running",
             crate::process::ProcessState::Zombie => "Zombie",
             crate::process::ProcessState::Crashed => "Crashed",
+            crate::process::ProcessState::Killed => "Killed",
         };
         crate::println!(
-            "{:<5} {:<12} {:<9} {:<5} {:#014x} {:#x}",
+            "{:<5} {:<12} {:<9} {:<5} {:<8} {:<8} {:#x}",
             p.pid,
             p.name.as_str(),
             state,
             p.exit_code,
-            p.entry,
+            p.ticks_used,
+            p.switches,
             p.pml4_phys
         );
     }

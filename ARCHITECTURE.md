@@ -177,6 +177,17 @@ Boot sequence: serial init → **framebuffer init** → interrupts → frame all
 
 **Loading.** At boot the kernel adopts the ramdisk from `BootInfo`. The tar parser treats it as untrusted: header checksums are verified, sizes are bounds-checked, names must be short printable ASCII without a ustar prefix, non-regular entries are skipped, and parsing stops at the first malformed header. `spawn`/`exec` hash the image (SHA-256), load it with `elf::load_image` (segments capped at 16 MiB, all inside the user region), map a 64 KiB stack whose lower neighbour page stays unmapped as a guard, and record `program-loaded` (`pid-N:name`, first 8 hash bytes) in the audit log.
 
+### Preemptive Agent Scheduling (`src/process.rs`, `src/interrupts.rs`, `src/syscall.rs`)
+
+Each process carries a saved `TrapFrame` (15 general-purpose registers plus the CPU interrupt frame). The PIT and local-APIC timer vectors use full-register assembly entry stubs instead of `x86-interrupt` handlers: they push every register (the stack then *is* a `TrapFrame`), call `timer_dispatch`, and pop whatever the frame holds afterwards.
+
+- `process::run_scheduled` (console `run-all`, or `elf-run` for one pid) marks the selected `Ready` processes and dispatches one: `syscall::run_frame` writes its frame to the top of the CPU's kernel stack and `cdk_user_enter` pops every register and `iretq`s into it.
+- On each timer interrupt from ring 3, `on_user_tick` charges the running process a tick. After `slice` ticks (default 2 ≈ 100 ms; the BSP LAPIC timer runs at 20 Hz), it saves the interrupted frame into that process, copies the next runnable process's frame over the stack frame, loads its `CR3`, and the stub's `iretq` resumes the new process (round-robin). A never-run process borrows the ring-3 selectors from the interrupted one.
+- A process that exceeds `budget` ticks (default 200 ≈ 10 s) is marked `Killed`, logged as `proc-killed`, and the kernel context resumes, exactly like a crash.
+- `SYS_exit` or a fault resumes the kernel loop, which dispatches the next runnable process until none remain.
+
+Switching only happens at ring-3 interrupt boundaries (syscalls run with interrupts masked by `SFMASK`), so one kernel stack per CPU is enough and no kernel state is ever suspended mid-operation. User programs are soft-float, so no FPU state is switched yet (roadmap 2.6); all agents currently run on the console's CPU (roadmap 2.7), which is also what keeps `agent::with_kernel` sound.
+
 ### Agent Capability Handles (`src/agent.rs`)
 
 Each process gets a table of up to 16 `Capability` tokens when it is spawned; the table is cleared when it is reaped. Tokens stay in kernel memory; programs use the index.
@@ -191,7 +202,7 @@ Each process gets a table of up to 16 `Capability` tokens when it is spawned; th
 
 Errors return as `-(code)`: 1 bad handle, 2 denied, 3 invalid, 4 queue full, 5 empty, 6 table full, 7 bad signature. `send`/`recv` go through `Kernel::send_message`/`receive_message`, so every use re-verifies the hybrid proof (usually a verified-proof cache hit) and checks the permission. Grants (`cap-granted`), derivations (`cap-derived`), and denials (`cap-rejected`, reason 4) are audit-logged. The syscall entry stub now passes a third argument (`rdx`). User writes (`recv`, `cap_list`) use `copy_to_user`, which requires every destination page to be user-accessible and writable before writing anything.
 
-**Kernel access from syscalls.** The console holds the kernel lock while a program runs, so syscalls can't take it. `agent::with_kernel` lends the console's `&mut Kernel` to the syscall layer for the duration of `process::enter`; this is sound because the program runs synchronously on the console's CPU until it exits. Preemptive user scheduling (roadmap 2.3) must replace this.
+**Kernel access from syscalls.** The console holds the kernel lock while a program runs, so syscalls can't take it. `agent::with_kernel` lends the console's `&mut Kernel` to the syscall layer for the duration of `process::enter`; this is sound because the program runs synchronously on the console's CPU until it exits. This remains sound with preemptive scheduling because every agent still runs on the console's CPU and preemption only switches between ring-3 programs; running agents on other CPUs (roadmap 2.7) must replace it with proper locking.
 
 ### Audit Log (`src/audit.rs`)
 

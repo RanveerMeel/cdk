@@ -185,9 +185,15 @@ pub fn init() {
         }
 
         // Hardware interrupts — IDT indexed by u8 in x86_64 0.15
-        idt[TIMER_INTERRUPT_ID].set_handler_fn(timer_handler);
+        // Timer vectors use full-register entry stubs so the user scheduler
+        // can switch processes by rewriting the saved frame.
+        unsafe {
+            idt[TIMER_INTERRUPT_ID]
+                .set_handler_addr(x86_64::VirtAddr::new(cdk_timer_entry as *const () as u64));
+            idt[LOCAL_APIC_TIMER_INTERRUPT_ID]
+                .set_handler_addr(x86_64::VirtAddr::new(cdk_lapic_timer_entry as *const () as u64));
+        }
         idt[KEYBOARD_INTERRUPT_ID].set_handler_fn(keyboard_handler);
-        idt[LOCAL_APIC_TIMER_INTERRUPT_ID].set_handler_fn(local_apic_timer_handler);
         idt[RESCHEDULE_INTERRUPT_ID].set_handler_fn(reschedule_ipi_handler);
         idt[TLB_SHOOTDOWN_INTERRUPT_ID].set_handler_fn(tlb_shootdown_ipi_handler);
 
@@ -383,13 +389,94 @@ extern "x86-interrupt" fn double_fault_handler(
 // Hardware interrupt handlers
 // ---------------------------------------------------------------------------
 
-extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
-    // fetch_add is atomic and lock-free — safe to call inside an ISR.
-    let tick = TICKS.fetch_add(1, AtomicOrdering::Relaxed) + 1;
-    // EOI before the hook so the PIC can accept the next interrupt
-    // while the preemption callback runs.
-    unsafe { send_eoi(0) };
-    call_preempt_hook(tick);
+// Full-register entry stubs for the timer vectors. They save every GPR so
+// the stack holds a `process::TrapFrame` (GPRs + CPU interrupt frame), call
+// `timer_dispatch`, and restore whatever the frame then contains — which, if
+// the user scheduler switched processes, is another process.
+//
+// Stack alignment: the CPU aligns RSP to 16 before pushing its 5-word frame
+// (40 bytes); 15 pushes (120 bytes) make 160, so RSP is 16-aligned at `call`.
+core::arch::global_asm!(
+    r#"
+    .macro CDK_TIMER_ENTRY name, vector
+    .global \name
+    .type \name, @function
+    \name:
+        push rax
+        push rbx
+        push rcx
+        push rdx
+        push rsi
+        push rdi
+        push rbp
+        push r8
+        push r9
+        push r10
+        push r11
+        push r12
+        push r13
+        push r14
+        push r15
+        mov rdi, rsp
+        mov esi, \vector
+        cld
+        call {dispatch}
+        pop r15
+        pop r14
+        pop r13
+        pop r12
+        pop r11
+        pop r10
+        pop r9
+        pop r8
+        pop rbp
+        pop rdi
+        pop rsi
+        pop rdx
+        pop rcx
+        pop rbx
+        pop rax
+        iretq
+    .endm
+
+    CDK_TIMER_ENTRY cdk_timer_entry, {pit}
+    CDK_TIMER_ENTRY cdk_lapic_timer_entry, {lapic}
+    "#,
+    dispatch = sym timer_dispatch,
+    pit = const TIMER_INTERRUPT_ID as u32,
+    lapic = const LOCAL_APIC_TIMER_INTERRUPT_ID as u32,
+);
+
+unsafe extern "C" {
+    fn cdk_timer_entry();
+    fn cdk_lapic_timer_entry();
+}
+
+/// Rust side of the timer entry stubs: run the tick bookkeeping, then, if
+/// the interrupt arrived from ring 3, let the user scheduler charge the
+/// process and possibly switch or kill it.
+extern "C" fn timer_dispatch(frame: &mut crate::process::TrapFrame, vector: u32) {
+    if vector == TIMER_INTERRUPT_ID as u32 {
+        // fetch_add is atomic and lock-free — safe to call inside an ISR.
+        let tick = TICKS.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+        // EOI before the hook so the PIC can accept the next interrupt
+        // while the preemption callback runs.
+        unsafe { send_eoi(0) };
+        call_preempt_hook(tick);
+    } else {
+        // Local APIC timer is per-core, so we read the APIC ID to route
+        // runtime service to the currently interrupted CPU.
+        let apic_id = current_local_apic_id();
+        unsafe { local_apic_eoi() };
+        call_local_apic_tick_hook(apic_id);
+    }
+    if frame.from_user() {
+        if let crate::process::TickAction::Kill { pid, ticks } =
+            crate::process::on_user_tick(frame)
+        {
+            crate::syscall::abort_user_killed(pid, ticks);
+        }
+    }
 }
 
 extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
@@ -398,14 +485,6 @@ extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
     // its output buffer is drained).
     let _scancode: u8 = unsafe { inb(0x60) };
     unsafe { send_eoi(1) };
-}
-
-extern "x86-interrupt" fn local_apic_timer_handler(_stack_frame: InterruptStackFrame) {
-    // Local APIC timer is per-core, so we read the APIC ID to route
-    // runtime service to the currently interrupted CPU.
-    let apic_id = current_local_apic_id();
-    unsafe { local_apic_eoi() };
-    call_local_apic_tick_hook(apic_id);
 }
 
 extern "x86-interrupt" fn reschedule_ipi_handler(_stack_frame: InterruptStackFrame) {
@@ -424,7 +503,7 @@ extern "x86-interrupt" fn tlb_shootdown_ipi_handler(_stack_frame: InterruptStack
 /// AP's local APIC timer is not yet delivering hardware IRQs.
 ///
 /// Prefer [`crate::local_apic::arm_current_core_runtime_timer`] on the AP so
-/// [`local_apic_timer_handler`] drives runtime instead.
+/// the local APIC timer entry stub drives runtime instead.
 pub fn inject_local_apic_timer_tick(apic_id: u32) {
     call_local_apic_tick_hook(apic_id);
 }

@@ -13,7 +13,7 @@ Heavy AI inference (GPUs, CUDA) runs on Linux next to CDK; CDK is the control pl
 
 ## Status
 
-**Early development preview — not for production use.** CDK boots on bare metal (QEMU) with SMP, preemptive scheduling, ring-3 processes in isolated address spaces, and an interactive serial console. The quantum-safe trust core (Phase 1 of the [roadmap](ROADMAP.md)) is being built now: Phase 1 is done. In Phase 2 (agent runtime), Rust agent programs load from the boot ramdisk and act only through kernel-held capability handles; preemptive scheduling of agents is next. Interfaces can still change quickly.
+**Early development preview — not for production use.** CDK boots on bare metal (QEMU) with SMP, preemptive scheduling, ring-3 processes in isolated address spaces, and an interactive serial console. The quantum-safe trust core (Phase 1 of the [roadmap](ROADMAP.md)) is being built now: Phase 1 is done. In Phase 2 (agent runtime), Rust agent programs load from the boot ramdisk, act only through kernel-held capability handles, and run concurrently under a preemptive scheduler with a CPU-budget watchdog. Interfaces can still change quickly.
 
 ### Editions
 
@@ -30,6 +30,8 @@ CDK is **open core**. This repository — the kernel, the capability model, the 
 **User Programs from a Boot Ramdisk** — Programs in `user/` are ordinary `no_std` Rust (`cdk_user` provides `_start`, syscalls, `println!`). `run_qemu.sh` builds them, packs a reproducible `ustar` ramdisk, and the bootloader loads it next to the kernel. The kernel parses the archive strictly, maps each program at its linked address with a 64 KiB stack and an unmapped guard page, and logs the image's SHA-256 (`program-loaded`) so every process can be traced to the exact binary that ran.
 
 **Agent Capability Handles** — Each process holds up to 16 capabilities in a kernel-side table and refers to them only by index, so tokens can't be forged, copied, or leaked. Syscalls `cap_list`, `cap_drop`, `cap_derive` (a new handle may only *drop* permissions, and is re-issued with hybrid post-quantum signatures), `send` and `recv` (to the handle's object). Every use is re-verified and permission-checked; grants, derivations, and denials land in the audit log. Demo agents: `agent` checks every rule, `intruder` (no grants) is blocked on all 19 attempts.
+
+**Preemptive Agent Scheduling** — Agents that never yield still share the CPU: the timer entry stubs save every register, and after each 100 ms slice the kernel switches to the next runnable agent (round-robin). A per-agent CPU budget watchdog kills runaway agents (`proc-killed` in the audit log). Try `spawn spin`, `spawn spin`, `spawn hog`, `run-all`.
 
 **Tamper-Evident Audit Log** — Capability issuance, every capability check (accepted or rejected, with reason), and process spawn/start/exit/reap are appended to a SHA-256 hash chain bound to the kernel issuer. Every 64 records the issuer signs the chain head (Ed25519 + ML-DSA-65). Editing, deleting, reordering, or truncating records is detected, and rewriting the whole chain cannot reproduce the signed checkpoints. Console: `audit`, `audit-verify`, `audit-checkpoint`.
 
@@ -183,10 +185,13 @@ cargo check --features virtio-hw
 | `exec <name> [obj perms]` | Load and run a ramdisk program, optionally granting one handle first (`exec agent obj-2 send,recv`, `exec intruder`) |
 | `grant <pid> <obj> [perms]` | Give a process a kernel-issued capability handle (`send,recv` by default; `read,write,exec,send,recv,delete` or `all`) |
 | `handles <pid>` | List a process's handles |
+| `run-all` | Run every `Ready` process concurrently under the preemptive scheduler |
+| `budget [ticks]` | Show/set the per-process CPU budget; the watchdog kills a process that exceeds it (default 200 ticks ≈ 10 s) |
+| `slice [ticks]` | Show/set the time slice before preemption (default 2 ticks ≈ 100 ms) |
 | `elf-spawn [prog]` | Load a built-in program as a `Ready` process: `hello` (default), or crash tests `ud`, `pf`, `gp`, `de` |
 | `elf-run <pid>` | Run a `Ready` process in ring 3 until it calls `SYS_exit` |
 | `elf-smoke [prog]` | `elf-spawn` + `elf-run` in one step (`elf-smoke pf` shows a contained page fault) |
-| `ps` | List processes (Ready / Running / Zombie / Crashed) |
+| `ps` | List processes (Ready / Running / Zombie / Crashed / Killed) with ticks used and preemptions |
 | `reap <pid>` | Free a `Ready`/`Zombie`/`Crashed` process and its address space |
 | `user-smoke` | Minimal ring-3 round trip (enter, `SYS_exit`, return) |
 | `issuer` | Kernel capability issuer: id, algorithms, entropy source, crypto-stack peak |
@@ -288,6 +293,7 @@ The full plan — phases, milestones, and editions — is in [ROADMAP.md](ROADMA
 - [x] Key hygiene: zeroized keys and seeds, scrubbed crypto stack, zero-on-free heap, RFC 8032 / IETF ML-DSA known-answer tests, verified-proof cache — roadmap milestone 1.4
 - [x] Rust user programs loaded from a boot ramdisk, with SHA-256 provenance in the audit log — roadmap milestone 2.1
 - [x] Per-agent capability handles: grant, list, derive (attenuate only), drop, send/recv — every use verified and audited — roadmap milestone 2.2
+- [x] Preemptive round-robin scheduling of agents on one CPU, with a CPU-budget watchdog — roadmap milestone 2.3
 - [x] Framebuffer text rendering (8×16 bitmap font, RGB/BGR/U8 pixel formats, auto-scroll)
 - [x] Network stack integration (loopback interfaces, capability-gated send/recv, object bridge routing, bindings, pump telemetry)
 - [x] External network transport (virtio-net MMIO bring-up path + non-loopback external interfaces via `eth0` default external backend and adapter-based transports)

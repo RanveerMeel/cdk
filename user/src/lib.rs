@@ -29,6 +29,7 @@ pub const SYS_CAP_DROP: u64 = 4;
 pub const SYS_CAP_DERIVE: u64 = 5;
 pub const SYS_SEND: u64 = 6;
 pub const SYS_RECV: u64 = 7;
+pub const SYS_GETPID: u64 = 8;
 
 /// Permission bits in a capability mask (bit = kernel permission tag).
 pub mod perm {
@@ -197,6 +198,11 @@ pub fn recv(handle: u32, buf: &mut [u8]) -> Result<usize, Error> {
         )
     };
     check(r).map(|n| n as usize)
+}
+
+/// This process's id.
+pub fn getpid() -> u32 {
+    unsafe { syscall3(SYS_GETPID, 0, 0, 0) as u32 }
 }
 
 /// Write bytes to the kernel console. Returns the number written, or `None`
