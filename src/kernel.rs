@@ -122,7 +122,7 @@ impl Kernel {
         let mut cap = Capability::new(&obj);
         // Kernel-issued tokens are always signed; unsigned caps are rejected
         // by check_signature on privileged paths.
-        let _ = Self::sign_capability(&mut cap);
+        let _ = cap.issue();
         let id = obj.id.clone();
         let _ = self.objects.insert(id, obj);
         let _ = self
@@ -131,22 +131,19 @@ impl Kernel {
         cap
     }
 
-    /// Sign a capability with a freshly-generated Ed25519 key.
-    ///
-    /// Returns the 32-byte signing key (secret — caller must store it) and
-    /// updates the capability in place with the signature + verifying key.
-    pub fn sign_capability(cap: &mut Capability) -> Result<[u8; 32], CapabilityError> {
-        let (sk, _vk) = Capability::generate_key();
-        cap.sign(&sk)?;
-        Ok(sk)
+    /// Issue `cap` under the kernel issuer (hybrid Ed25519 + ML-DSA-65).
+    pub fn sign_capability(cap: &mut Capability) -> Result<(), CapabilityError> {
+        cap.issue()
     }
 
-    /// Verify a capability's Ed25519 signature.
+    /// Verify a capability against the kernel issuer.
     ///
-    /// Returns `Ok(true)` when valid, `Ok(false)` when unsigned,
-    /// `Err` when the stored key or signature bytes are malformed.
+    /// Returns `Ok(true)` when valid, `Ok(false)` when unsigned or the
+    /// signature does not verify, `Err` for a foreign issuer or unknown format.
     pub fn verify_capability(cap: &Capability) -> Result<bool, CapabilityError> {
-        cap.verify()
+        let result = cap.verify();
+        Self::audit_verification(cap, &result);
+        result
     }
 
     pub fn execute(&mut self, cap: &Capability) -> KernelResult<()> {
@@ -841,17 +838,38 @@ impl Kernel {
         Ok(obj.pop_message())
     }
 
-    /// Require a valid Ed25519 signature on `cap`.
+    /// Require a valid kernel-issued proof on `cap`.
     ///
-    /// Unsigned tokens and tokens whose signature does not verify both map to
+    /// Unsigned, forged, foreign-issuer, and tampered tokens all map to
     /// [`KernelError::InvalidSignature`]. Privileged kernel entry points call
     /// this before checking permissions or looking up objects.
     fn check_signature(cap: &Capability) -> KernelResult<()> {
-        match cap.verify() {
+        let result = cap.verify();
+        Self::audit_verification(cap, &result);
+        match result {
             Ok(true) => Ok(()),
             Ok(false) => Err(KernelError::InvalidSignature),
             Err(_) => Err(KernelError::InvalidSignature),
         }
+    }
+
+    /// Record the outcome of a capability check in the audit log.
+    fn audit_verification(cap: &Capability, result: &Result<bool, CapabilityError>) {
+        use crate::audit::{reject_reason, EventKind};
+        let (kind, detail) = match result {
+            Ok(true) => (EventKind::CapAccepted, cap.permission_mask()),
+            Ok(false) => (EventKind::CapRejected, reject_reason::INVALID_SIGNATURE),
+            Err(CapabilityError::UnknownIssuer) => {
+                (EventKind::CapRejected, reject_reason::UNKNOWN_ISSUER)
+            }
+            Err(CapabilityError::UnsupportedFormat) => {
+                (EventKind::CapRejected, reject_reason::UNSUPPORTED_FORMAT)
+            }
+            Err(CapabilityError::PermissionSetFull) => {
+                (EventKind::CapRejected, reject_reason::INVALID_SIGNATURE)
+            }
+        };
+        crate::audit::record(kind, &cap.object_id, detail);
     }
 
     fn map_net_error(_err: NetError) -> KernelError {
@@ -1104,7 +1122,7 @@ mod tests {
     /// Build a signed capability with an explicit permission set (tests only).
     fn signed_perms(obj: &KernelObject, perms: &[Permission]) -> Capability {
         let mut cap = Capability::with_permissions(obj, perms);
-        cap.sign_ephemeral().unwrap();
+        cap.issue().unwrap();
         cap
     }
 
@@ -1172,7 +1190,7 @@ mod tests {
         // Create a signed capability for an object that was never registered.
         let obj = make_obj("ghost", "normal");
         let mut cap = Capability::new(&obj);
-        cap.sign_ephemeral().unwrap();
+        cap.issue().unwrap();
         let result = k.execute(&cap);
         assert!(matches!(result, Err(KernelError::ObjectNotFound)));
     }
@@ -1283,7 +1301,7 @@ mod tests {
         let k = Kernel::new();
         let obj = make_obj("ghost", "normal");
         let mut cap = Capability::new(&obj);
-        cap.sign_ephemeral().unwrap();
+        cap.issue().unwrap();
         assert!(matches!(
             k.validate_capability(&cap),
             Err(KernelError::InvalidCapability)
@@ -1309,7 +1327,7 @@ mod tests {
 
         cap.remove_permission(&Permission::ReceiveMessage);
         // Mutation clears the signature — re-sign so permission denial is tested.
-        cap.sign_ephemeral().unwrap();
+        cap.issue().unwrap();
         let denied = k.network_receive(&cap, &mut net, "lo");
         assert!(matches!(denied, Err(KernelError::PermissionDenied)));
 

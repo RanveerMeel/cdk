@@ -1,6 +1,10 @@
 //! Interrupt Descriptor Table (IDT) setup.
 //!
 //! Handlers implemented here:
+//!   - CPU exceptions (#DE #OF #BR #UD #NM #NP #SS #GP #PF #MF #AC #XM #BP):
+//!     a fault raised in ring 3 terminates the offending process and returns
+//!     to the kernel (see [`crate::syscall::abort_user`]); a fault in kernel
+//!     mode prints diagnostics and halts the CPU
 //!   - Double-fault  (runs on IST slot 0 — guaranteed clean stack)
 //!   - PIT timer     (IRQ 0, mapped to vector 0x20 after PIC remapping)
 //!   - PS/2 keyboard (IRQ 1, mapped to vector 0x21 after PIC remapping)
@@ -158,8 +162,19 @@ pub fn init() {
         let mut idt = InterruptDescriptorTable::new();
 
         // CPU exceptions
+        idt.divide_error.set_handler_fn(divide_error_handler);
         idt.breakpoint.set_handler_fn(breakpoint_handler);
+        idt.overflow.set_handler_fn(overflow_handler);
+        idt.bound_range_exceeded.set_handler_fn(bound_range_handler);
+        idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
+        idt.device_not_available.set_handler_fn(device_not_available_handler);
+        idt.segment_not_present.set_handler_fn(segment_not_present_handler);
+        idt.stack_segment_fault.set_handler_fn(stack_segment_handler);
+        idt.general_protection_fault.set_handler_fn(general_protection_handler);
         idt.page_fault.set_handler_fn(page_fault_handler);
+        idt.x87_floating_point.set_handler_fn(x87_floating_point_handler);
+        idt.alignment_check.set_handler_fn(alignment_check_handler);
+        idt.simd_floating_point.set_handler_fn(simd_floating_point_handler);
 
         // Double-fault on its own IST stack so a stack overflow doesn't
         // cause a triple-fault before we can print the error.
@@ -184,7 +199,7 @@ pub fn init() {
     // Enable hardware interrupts.
     x86_64::instructions::interrupts::enable();
 
-    crate::println!("IDT loaded — double-fault, timer, keyboard, LAPIC, reschedule, TLB handlers active");
+    crate::println!("IDT loaded — CPU exceptions (ring-3 faults contained), double-fault, timer, keyboard, LAPIC, reschedule, TLB handlers active");
 }
 
 /// Reload the IDT on an application processor (same table as the BSP).
@@ -289,7 +304,57 @@ unsafe fn send_eoi(irq: u8) {
 // Exception handlers
 // ---------------------------------------------------------------------------
 
+/// Route a CPU exception. Faults raised in ring 3 terminate the offending
+/// process and resume the kernel; faults in kernel mode are fatal.
+fn handle_exception(vector: u8, frame: &InterruptStackFrame, error_code: u64, addr: u64) -> ! {
+    let fault = crate::process::UserFault {
+        vector,
+        error_code,
+        rip: frame.instruction_pointer.as_u64(),
+        addr,
+    };
+    if frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
+        crate::syscall::abort_user(fault);
+    }
+    crate::println!("EXCEPTION: {} in kernel mode", fault.name());
+    crate::println!("  rip={:#x} addr={:#x} error_code={:#x}", fault.rip, addr, error_code);
+    crate::println!("{:#?}", frame);
+    loop {
+        x86_64::instructions::interrupts::disable();
+        x86_64::instructions::hlt();
+    }
+}
+
+macro_rules! exception_handler {
+    ($name:ident, $vector:expr) => {
+        extern "x86-interrupt" fn $name(frame: InterruptStackFrame) {
+            handle_exception($vector, &frame, 0, 0);
+        }
+    };
+    ($name:ident, $vector:expr, error_code) => {
+        extern "x86-interrupt" fn $name(frame: InterruptStackFrame, error_code: u64) {
+            handle_exception($vector, &frame, error_code, 0);
+        }
+    };
+}
+
+exception_handler!(divide_error_handler, 0);
+exception_handler!(overflow_handler, 4);
+exception_handler!(bound_range_handler, 5);
+exception_handler!(invalid_opcode_handler, 6);
+exception_handler!(device_not_available_handler, 7);
+exception_handler!(segment_not_present_handler, 11, error_code);
+exception_handler!(stack_segment_handler, 12, error_code);
+exception_handler!(general_protection_handler, 13, error_code);
+exception_handler!(x87_floating_point_handler, 16);
+exception_handler!(alignment_check_handler, 17, error_code);
+exception_handler!(simd_floating_point_handler, 19);
+
 extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
+    if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
+        handle_exception(3, &stack_frame, 0, 0);
+    }
+    // Kernel `int3`: report and continue.
     crate::println!("EXCEPTION: BREAKPOINT\n{:#?}", stack_frame);
 }
 
@@ -301,13 +366,7 @@ extern "x86-interrupt" fn page_fault_handler(
     unsafe {
         core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack));
     }
-    crate::println!("EXCEPTION: PAGE FAULT");
-    crate::println!("  Accessed address: {:#x}", cr2);
-    crate::println!("  Error code: {:?}", error_code);
-    crate::println!("{:#?}", stack_frame);
-    loop {
-        x86_64::instructions::hlt();
-    }
+    handle_exception(14, &stack_frame, error_code.bits(), cr2);
 }
 
 extern "x86-interrupt" fn double_fault_handler(

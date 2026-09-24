@@ -1,6 +1,27 @@
 # Contributing to CDK
 
-Thanks for helping improve CDK.
+Thanks for helping improve CDK — an open-source, quantum-safe agent trust
+kernel. Read [ROADMAP.md](ROADMAP.md) to see where the project is heading and
+which milestones are open.
+
+## Before your first contribution
+
+1. **Sign the CLA.** All contributions are accepted under the
+   [CDK Contributor License Agreement](CLA.md). In your first pull request,
+   comment:
+
+   ```text
+   I have read the CDK Contributor License Agreement (CLA.md, version 1.0) and I hereby sign it.
+   ```
+
+   You keep your copyright. The CLA lets the project also ship your code in
+   commercial editions, and guarantees it stays available here under
+   Apache-2.0.
+2. **Sign off every commit** with `git commit -s` (Developer Certificate of
+   Origin).
+3. **Report vulnerabilities privately** — see [SECURITY.md](SECURITY.md).
+   Never open a public issue for a security bug.
+4. **Never submit classified, export-restricted, or confidential material.**
 
 ## Contribution Workflow
 
@@ -21,15 +42,28 @@ Thanks for helping improve CDK.
 Run these before requesting review:
 
 ```bash
-cargo check --target x86_64-unknown-none
-./run_qemu.sh
+cargo build                        # kernel, debug
+cargo build --release --bin cdk    # kernel, release
+cargo check --features virtio-hw   # hardware probe paths
+cargo test-host                    # host unit tests
+./run_qemu.sh                      # boot and exercise your change at the cdk> prompt
 ```
 
-If your change touches host tools, also run:
+CI runs the first four on every pull request.
 
-```bash
-cargo check
-```
+## Security-sensitive changes
+
+Changes to capabilities, cryptography, syscalls, paging, or parsers of
+untrusted input (ELF, tokens) need extra care:
+
+- Cryptography stays public and in this repository. Use reviewed
+  implementations (RustCrypto) rather than hand-rolled primitives.
+- Keep post-quantum usage **hybrid** (classical + PQC; both must verify) and
+  record an algorithm identifier in every new format.
+- Add negative tests: tampered data, wrong keys, truncated input, and
+  out-of-range pointers must all be rejected.
+- Never compare secrets or MACs with `==` on slices; use constant-time
+  comparison.
 
 ## Pull Request Expectations
 

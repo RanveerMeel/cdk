@@ -294,6 +294,23 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         cdk::println!("Heap: WARNING — skipped (no physical memory map offset)");
     }
 
+    // Kernel capability issuer (hybrid Ed25519 + ML-DSA-65). Needs the heap.
+    {
+        let issuer = cdk::issuer::init();
+        cdk::print!("Issuer: Ed25519+ML-DSA-65 id=");
+        for b in issuer.id() {
+            cdk::print!("{:02x}", b);
+        }
+        cdk::println!(" entropy={:?}", issuer.entropy());
+        if !issuer.entropy().is_secure() {
+            cdk::println!(
+                "Issuer: WARNING — keys derived from insecure fallback RNG; tokens are forgeable. Use a CPU with RDRAND."
+            );
+        }
+        // Tamper-evident audit log, bound to this issuer.
+        cdk::audit::init();
+    }
+
     // Adopt the bootloader page tables (do not replace CR3) and identity-map
     // the AP trampoline page (+ LAPIC MMIO when not using x2APIC).
     let cr3 = {

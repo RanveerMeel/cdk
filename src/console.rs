@@ -140,6 +140,12 @@ const COMMANDS: &[&str] = &[
     "umscanout",
     "capsign",
     "capverify",
+    "issuer",
+    "capbench",
+    "audit",
+    "audit-verify",
+    "audit-checkpoint",
+    "audit-demo-tamper",
     "vmmap",
     "vmunmap",
     "vmtranslate",
@@ -548,9 +554,9 @@ fn dispatch(
         "yield" => cmd_yield(arg1, kernel),
         "run" => cmd_run_next(kernel),
         "user-smoke" => cmd_user_smoke(page_table, frame_alloc),
-        "elf-spawn" => cmd_elf_spawn(page_table, frame_alloc, false),
+        "elf-spawn" => cmd_elf_spawn(arg1, page_table, frame_alloc, false),
         "elf-run" => cmd_elf_run(arg1),
-        "elf-smoke" => cmd_elf_spawn(page_table, frame_alloc, true),
+        "elf-smoke" => cmd_elf_spawn(arg1, page_table, frame_alloc, true),
         "ps" => cmd_ps(),
         "reap" => cmd_reap(arg1, frame_alloc),
         "irq-route" => cmd_irq_route(arg1, arg2),
@@ -607,6 +613,12 @@ fn dispatch(
         "umscanout" => cmd_umscanout(arg1),
         "capsign" => cmd_capsign(arg1, kernel),
         "capverify" => cmd_capverify(arg1, kernel),
+        "issuer" => cmd_issuer(),
+        "capbench" => cmd_capbench(arg1, arg2, kernel),
+        "audit" => cmd_audit(arg1),
+        "audit-verify" => cmd_audit_verify(),
+        "audit-checkpoint" => cmd_audit_checkpoint(),
+        "audit-demo-tamper" => cmd_audit_demo_tamper(arg1),
         "vmmap" => cmd_vmmap(arg1, arg2, arg3, page_table, frame_alloc, kernel),
         "vmunmap" => cmd_vmunmap(arg1, page_table, kernel),
         "vmtranslate" => cmd_vmtranslate(arg1, page_table),
@@ -634,11 +646,11 @@ fn cmd_help() {
     crate::println!("  run               Manually dispatch next task (ignores preemption)");
     crate::println!("  running           Show the currently running task");
     crate::println!("  user-smoke        Ring-3 smoke test (syscall exit, returns)");
-    crate::println!("  elf-spawn         Load smoke ELF into process table (Ready)");
+    crate::println!("  elf-spawn [prog]  Load a built-in program (hello|ud|pf|gp|de) as Ready");
     crate::println!("  elf-run <pid>     Run a Ready process until it exits");
-    crate::println!("  elf-smoke         Load smoke ELF and run it");
+    crate::println!("  elf-smoke [prog]  Load and run a built-in program (ud/pf/gp/de crash it)");
     crate::println!("  ps                List processes");
-    crate::println!("  reap <pid>        Free a Ready/Zombie process and its memory");
+    crate::println!("  reap <pid>        Free a Ready/Zombie/Crashed process and its memory");
     crate::println!("  irq-route <irq> <apic>  Route IOAPIC IRQ affinity");
     crate::println!("  send <id> <text>  Send a text message to an object");
     crate::println!("  recv <id>         Receive next message from an object");
@@ -698,8 +710,14 @@ fn cmd_help() {
     crate::println!("  dma-translate <phys>  Translate IOVA via IOMMU windows");
     crate::println!("  gpudisp           Show GPU display info");
     crate::println!("  umscanout <id>    Fence + soft-scanout UM region to FB");
-    crate::println!("  capsign <id>      Sign a fresh capability for object <id> and verify it");
-    crate::println!("  capverify <id>    Create + sign + verify a capability for object <id>");
+    crate::println!("  capsign <id>      Issue a hybrid PQ-signed capability for <id> and verify it");
+    crate::println!("  capverify <id>    Show that unsigned, forged, and tampered tokens are rejected");
+    crate::println!("  issuer            Show the kernel capability issuer (Ed25519+ML-DSA-65)");
+    crate::println!("  capbench <id> [n] Time n capability checks, uncached vs cached");
+    crate::println!("  audit [n]         Show the last n audit records (default 12)");
+    crate::println!("  audit-verify      Verify the audit hash chain and signed checkpoints");
+    crate::println!("  audit-checkpoint  Sign a checkpoint over the audit log now");
+    crate::println!("  audit-demo-tamper <seq>  DEMO: corrupt one record to show detection");
     crate::println!("  heapinfo          Kernel heap usage (total / used / free)");
     crate::println!("  frames            Physical frame allocator summary");
     crate::println!("  palloc            Allocate one physical frame, print address");
@@ -1059,60 +1077,254 @@ fn cmd_fbinfo() {
     }
 }
 
-/// Sign a fresh capability for the given object ID and immediately verify it.
-///
-/// The signing key is ephemeral — this command demonstrates that signing +
-/// verification works end-to-end. Persistent key management is a future feature.
+/// Issue a capability for `id` under the kernel issuer and verify it.
 fn cmd_capsign(id: &str, kernel: &mut Kernel) {
     if id.is_empty() {
         crate::println!("Usage: capsign <object-id>");
         return;
     }
-    // Build a fresh capability for the object (verifies the ID exists).
-    let obj = kernel.for_each_object_find(id);
-    let obj_ref = match obj {
-        Some(o) => o,
-        None => {
-            crate::println!("Error: object '{}' not found", id);
-            return;
-        }
+    let Some(obj) = kernel.for_each_object_find(id) else {
+        crate::println!("Error: object '{}' not found", id);
+        return;
     };
-    let mut cap = Capability::new(obj_ref);
-    match Kernel::sign_capability(&mut cap) {
-        Ok(_sk) => {
-            crate::println!("Signed capability for '{}'", id);
-            match cap.verify() {
-                Ok(true) => crate::println!("  Signature valid ✓"),
-                Ok(false) => crate::println!("  WARNING: signature not present"),
-                Err(e) => crate::println!("  ERROR: verification failed: {:?}", e),
-            }
-        }
-        Err(e) => crate::println!("Error: signing failed: {:?}", e),
+    let mut cap = Capability::new(obj);
+    if let Err(e) = Kernel::sign_capability(&mut cap) {
+        crate::println!("Error: issuance failed: {:?}", e);
+        return;
+    }
+    let Some(proof) = cap.proof.as_ref() else {
+        crate::println!("Error: issuance produced no proof");
+        return;
+    };
+    crate::print!(
+        "Issued capability for '{}': format=v{} alg={} issuer=",
+        id,
+        proof.format,
+        proof.algorithm.name()
+    );
+    print_hex(&proof.issuer_id);
+    crate::println!(
+        " sig={}+{} bytes",
+        proof.signature.ed25519.len(),
+        proof.signature.mldsa65.len()
+    );
+    match cap.verify() {
+        Ok(true) => crate::println!("  verify: valid (both Ed25519 and ML-DSA-65)"),
+        Ok(false) => crate::println!("  verify: INVALID"),
+        Err(e) => crate::println!("  verify: error {:?}", e),
     }
 }
 
+/// Demonstrate that the kernel rejects every token it did not issue intact.
 fn cmd_capverify(id: &str, kernel: &mut Kernel) {
     if id.is_empty() {
         crate::println!("Usage: capverify <object-id>");
         return;
     }
-    let obj = kernel.for_each_object_find(id);
-    let obj_ref = match obj {
-        Some(o) => o,
-        None => {
-            crate::println!("Error: object '{}' not found", id);
-            return;
+    let Some(obj) = kernel.for_each_object_find(id) else {
+        crate::println!("Error: object '{}' not found", id);
+        return;
+    };
+    let report = |label: &str, cap: &Capability| match Kernel::verify_capability(cap) {
+        Ok(true) => crate::println!("  {:<28} accepted", label),
+        Ok(false) => crate::println!("  {:<28} rejected (no valid proof)", label),
+        Err(e) => crate::println!("  {:<28} rejected ({:?})", label, e),
+    };
+
+    let unsigned = Capability::new(obj);
+    report("unsigned", &unsigned);
+
+    // Self-signed by an attacker-controlled issuer (accepted before format v1).
+    let attacker = crate::issuer::Issuer::generate();
+    let mut forged = Capability::with_permissions(obj, &[crate::capability::Permission::Delete]);
+    let _ = forged.issue_with(&attacker);
+    report("forged (attacker issuer)", &forged);
+
+    let mut issued = Capability::new(obj);
+    let _ = issued.issue();
+    report("kernel-issued", &issued);
+
+    let mut escalated = issued.clone();
+    let _ = escalated
+        .permissions
+        .insert(crate::capability::Permission::Delete);
+    report("kernel-issued + escalated", &escalated);
+}
+
+fn cmd_issuer() {
+    let issuer = crate::issuer::kernel();
+    crate::print!("Issuer id      : ");
+    print_hex(issuer.id());
+    crate::println!();
+    crate::println!("Algorithms     : Ed25519 (RFC 8032) + ML-DSA-65 (FIPS 204), both required");
+    crate::println!(
+        "Public keys    : {} + {} bytes",
+        issuer.public().ed25519.len(),
+        issuer.public().mldsa65.len()
+    );
+    crate::println!(
+        "Entropy source : {:?}{}",
+        issuer.entropy(),
+        if issuer.entropy().is_secure() {
+            ""
+        } else {
+            "  (INSECURE — tokens forgeable)"
+        }
+    );
+    crate::println!(
+        "Crypto stack   : {} KiB peak of {} KiB, {} bytes residue (scrubbed after every use)",
+        crate::issuer::crypto_stack::high_water().div_ceil(1024),
+        crate::issuer::crypto_stack::SIZE / 1024,
+        crate::issuer::crypto_stack::residue()
+    );
+    let (hits, misses, entries) = crate::capability::verify_cache::stats();
+    crate::println!(
+        "Verify cache   : {} hits, {} misses, {}/{} entries",
+        hits,
+        misses,
+        entries,
+        crate::capability::verify_cache::CAPACITY
+    );
+}
+
+/// Time capability verification with and without the verified-proof cache.
+fn cmd_capbench(id: &str, n_str: &str, kernel: &mut Kernel) {
+    let Some(obj) = kernel.for_each_object_find(id) else {
+        crate::println!("Usage: capbench <object-id> [n]  (object not found)");
+        return;
+    };
+    let n = if n_str.is_empty() {
+        20
+    } else {
+        match parse_u32(n_str) {
+            Some(n) if n > 0 => n as u64,
+            _ => {
+                crate::println!("Usage: capbench <object-id> [n]");
+                return;
+            }
         }
     };
-    // Unsigned capability: verify returns false (kernel gates reject unsigned).
-    let cap = Capability::new(obj_ref);
-    match Kernel::verify_capability(&cap) {
-        Ok(true) => crate::println!("Capability for '{}': signature valid", id),
-        Ok(false) => crate::println!(
-            "Capability for '{}': unsigned (kernel ops would reject)",
-            id
+    let mut cap = Capability::new(obj);
+    if cap.issue().is_err() {
+        crate::println!("capbench: issuance failed");
+        return;
+    }
+    let time = |f: &dyn Fn() -> bool| {
+        let start = crate::cpu::rdtsc();
+        let mut ok = true;
+        for _ in 0..n {
+            ok &= f();
+        }
+        ((crate::cpu::rdtsc() - start) / n, ok)
+    };
+    let (uncached, ok1) = time(&|| cap.verify_uncached() == Ok(true));
+    let _ = cap.verify(); // warm the cache
+    let (cached, ok2) = time(&|| cap.verify() == Ok(true));
+    crate::println!(
+        "capbench: {} checks each — uncached {} kcycles/check, cached {} kcycles/check ({}x){}",
+        n,
+        uncached / 1000,
+        cached / 1000,
+        if cached > 0 { uncached / cached } else { 0 },
+        if ok1 && ok2 { "" } else { "  (VERIFY FAILED)" }
+    );
+}
+
+fn cmd_audit(n_str: &str) {
+    let n = if n_str.is_empty() {
+        12
+    } else {
+        match parse_u32(n_str) {
+            Some(n) => n as usize,
+            None => {
+                crate::println!("Usage: audit [n]");
+                return;
+            }
+        }
+    };
+    crate::audit::with_log(|log| {
+        crate::println!("SEQ    TSC(M)    EVENT         SUBJECT          DETAIL   HASH");
+        let skip = log.records().len().saturating_sub(n);
+        for r in log.records().skip(skip) {
+            crate::print!(
+                "{:<6} {:<9} {:<13} {:<16} ",
+                r.seq,
+                r.tsc / 1_000_000,
+                r.kind.name(),
+                r.subject.as_str()
+            );
+            if r.kind == crate::audit::EventKind::ProcessSpawned {
+                crate::print!("{:#x} ", r.detail);
+            } else {
+                crate::print!("{:<8} ", r.detail);
+            }
+            print_hex(&r.hash[..6]);
+            crate::println!();
+        }
+        let ckpt = log.checkpoints().last().map(|c| c.seq);
+        match ckpt {
+            Some(seq) => crate::println!(
+                "next_seq={} latest signed checkpoint covers seq {}",
+                log.next_seq(),
+                seq
+            ),
+            None => crate::println!("next_seq={} no signed checkpoint yet", log.next_seq()),
+        }
+    });
+}
+
+fn cmd_audit_verify() {
+    match crate::audit::verify() {
+        Ok(r) => {
+            crate::println!(
+                "audit: OK — {} records (seq {}..{}), {} evicted, {} checkpoint(s) valid",
+                r.records,
+                r.first_seq.unwrap_or(0),
+                r.last_seq.unwrap_or(0),
+                r.evicted,
+                r.checkpoints
+            );
+            match r.latest_checkpoint {
+                Some(seq) => crate::println!(
+                    "       signed through seq {}; {} newer record(s) hash-chained only",
+                    seq,
+                    r.unsigned_tail
+                ),
+                None => crate::println!("       no signed checkpoint yet (run audit-checkpoint)"),
+            }
+        }
+        Err(e) => crate::println!("audit: TAMPERING DETECTED — {:?}", e),
+    }
+}
+
+fn cmd_audit_checkpoint() {
+    match crate::audit::checkpoint_now() {
+        Some(seq) => crate::println!(
+            "audit: checkpoint signed (Ed25519+ML-DSA-65) through seq {}",
+            seq
         ),
-        Err(e) => crate::println!("Capability for '{}': error: {:?}", id, e),
+        None => crate::println!("audit: log is empty"),
+    }
+}
+
+fn cmd_audit_demo_tamper(seq_str: &str) {
+    let Some(seq) = parse_u32(seq_str) else {
+        crate::println!("Usage: audit-demo-tamper <seq>");
+        return;
+    };
+    if crate::audit::demo_tamper(seq as u64) {
+        crate::println!(
+            "audit: DEMO — flipped one bit in record {} (hashes untouched); run audit-verify",
+            seq
+        );
+    } else {
+        crate::println!("audit: record {} is not retained", seq);
+    }
+}
+
+fn print_hex(bytes: &[u8]) {
+    for b in bytes {
+        crate::print!("{:02x}", b);
     }
 }
 
@@ -2190,18 +2402,24 @@ fn cmd_user_smoke(
 }
 
 fn cmd_elf_spawn(
+    program: &str,
     page_table: &mut Option<PageTableManager>,
     frame_alloc: &mut FrameAllocator,
     run: bool,
 ) {
+    let Some(program) = crate::elf::SmokeProgram::parse(program) else {
+        crate::println!("Unknown program '{}'. Choose: hello ud pf gp de", program);
+        return;
+    };
     let Some(pt) = page_table.as_mut() else {
         crate::println!("Page table not initialised.");
         return;
     };
-    match crate::process::spawn_smoke_elf(pt, frame_alloc) {
+    match crate::process::spawn_smoke_elf(pt, frame_alloc, program) {
         Ok(proc) => {
             crate::println!(
-                "elf: spawned pid={} entry={:#x} stack={:#x} cr3={:#x}",
+                "elf: spawned '{}' pid={} entry={:#x} stack={:#x} cr3={:#x}",
+                program.name(),
                 proc.pid,
                 proc.entry,
                 proc.stack_top,
@@ -2224,8 +2442,15 @@ fn cmd_elf_run(pid_str: &str) {
 }
 
 fn run_process(pid: u32) {
+    use crate::process::ExitStatus;
     match crate::process::enter(pid) {
-        Ok(code) => crate::println!("elf: pid={} exited code={}", pid, code),
+        Ok(ExitStatus::Exited(code)) => crate::println!("elf: pid={} exited code={}", pid, code),
+        Ok(ExitStatus::Crashed(fault)) => crate::println!(
+            "elf: pid={} CRASHED ({}) exit={} — kernel unaffected",
+            pid,
+            fault.name(),
+            fault.exit_code()
+        ),
         Err(e) => crate::println!("elf-run failed: {:?}", e),
     }
 }
@@ -2243,6 +2468,7 @@ fn cmd_ps() {
             crate::process::ProcessState::Ready => "Ready",
             crate::process::ProcessState::Running => "Running",
             crate::process::ProcessState::Zombie => "Zombie",
+            crate::process::ProcessState::Crashed => "Crashed",
         };
         crate::println!(
             "{:<5} {:<9} {:<5} {:#014x} {:#x}",

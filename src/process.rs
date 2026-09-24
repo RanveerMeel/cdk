@@ -2,14 +2,16 @@
 //!
 //! Lifecycle: [`spawn_smoke_elf`] loads a program and records it `Ready`;
 //! [`enter`] runs it in ring 3 (`Running`) until `SYS_exit` marks it
-//! `Zombie` and control returns to the caller; [`reap`] frees its address
-//! space and slot. Console `elf-spawn` / `elf-run` / `ps` / `reap` drive this.
+//! `Zombie` — or a CPU exception marks it `Crashed` — and control returns to
+//! the caller; [`reap`] frees its address space and slot. Console
+//! `elf-spawn` / `elf-run` / `ps` / `reap` drive this.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use heapless::Vec;
 use spin::Mutex;
 
 use crate::allocator::FrameAllocator;
+use crate::audit::{self, EventKind};
 use crate::elf::{self, ElfError};
 use crate::paging::{AddressSpace, PageTableManager};
 
@@ -24,6 +26,60 @@ pub enum ProcessState {
     Running,
     /// Exited; address space still allocated until reaped.
     Zombie,
+    /// Killed by a CPU exception; address space kept until reaped.
+    Crashed,
+}
+
+/// Offset added to the exception vector to form a crashed process's exit
+/// code (Unix shells use 128 + signal the same way).
+pub const CRASH_EXIT_BASE: u64 = 128;
+
+/// A CPU exception raised by user code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UserFault {
+    pub vector: u8,
+    /// Hardware error code (0 for exceptions without one).
+    pub error_code: u64,
+    /// Faulting instruction.
+    pub rip: u64,
+    /// Faulting address (`CR2`) for page faults, otherwise 0.
+    pub addr: u64,
+}
+
+impl UserFault {
+    /// Mnemonic and description of the exception vector.
+    pub fn name(&self) -> &'static str {
+        match self.vector {
+            0 => "#DE divide error",
+            1 => "#DB debug",
+            3 => "#BP breakpoint",
+            4 => "#OF overflow",
+            5 => "#BR bound range exceeded",
+            6 => "#UD invalid opcode",
+            7 => "#NM device not available",
+            11 => "#NP segment not present",
+            12 => "#SS stack-segment fault",
+            13 => "#GP general protection",
+            14 => "#PF page fault",
+            16 => "#MF x87 floating-point",
+            17 => "#AC alignment check",
+            19 => "#XM SIMD floating-point",
+            _ => "CPU exception",
+        }
+    }
+
+    pub fn exit_code(&self) -> u64 {
+        CRASH_EXIT_BASE + self.vector as u64
+    }
+}
+
+/// How a process left ring 3.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExitStatus {
+    /// Called `SYS_exit(code)`.
+    Exited(u64),
+    /// Killed by a CPU exception.
+    Crashed(UserFault),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,6 +90,8 @@ pub struct Process {
     pub entry: u64,
     pub stack_top: u64,
     pub pml4_phys: u64,
+    /// Set when the process is `Crashed`.
+    pub fault: Option<UserFault>,
 }
 
 impl Process {
@@ -45,6 +103,7 @@ impl Process {
             entry: 0,
             stack_top: 0,
             pml4_phys: 0,
+            fault: None,
         }
     }
 }
@@ -99,6 +158,7 @@ impl ProcessTable {
             entry,
             stack_top,
             pml4_phys,
+            fault: None,
         };
         Ok(self.slots[idx])
     }
@@ -119,23 +179,45 @@ impl ProcessTable {
     }
 
     /// Current process → `Zombie` with `code`; clears `current`.
-    fn exit_current(&mut self, code: u64) {
-        let Some(pid) = self.current.take() else {
-            return;
-        };
+    /// Returns the pid that exited.
+    fn exit_current(&mut self, code: u64) -> Option<u32> {
+        let pid = self.current.take()?;
         if let Some(idx) = self.find(pid) {
             self.slots[idx].state = ProcessState::Zombie;
             self.slots[idx].exit_code = code;
         }
+        Some(pid)
     }
 
-    /// Remove a `Ready` or `Zombie` process, returning it so the caller can
+    /// Current process → `Crashed` with `fault`; clears `current`.
+    /// Returns the pid that crashed.
+    fn crash_current(&mut self, fault: UserFault) -> Option<u32> {
+        let pid = self.current.take()?;
+        if let Some(idx) = self.find(pid) {
+            let p = &mut self.slots[idx];
+            p.state = ProcessState::Crashed;
+            p.exit_code = fault.exit_code();
+            p.fault = Some(fault);
+        }
+        Some(pid)
+    }
+
+    fn status(&self, pid: u32) -> Option<ExitStatus> {
+        let p = &self.slots[self.find(pid)?];
+        match (p.state, p.fault) {
+            (ProcessState::Crashed, Some(f)) => Some(ExitStatus::Crashed(f)),
+            (ProcessState::Zombie, _) => Some(ExitStatus::Exited(p.exit_code)),
+            _ => None,
+        }
+    }
+
+    /// Remove a `Ready`, `Zombie`, or `Crashed` process, returning it so the caller can
     /// free its address space.
     fn take_for_reap(&mut self, pid: u32) -> Result<Process, ProcessError> {
         let idx = self.find(pid).ok_or(ProcessError::NotFound)?;
         let p = self.slots[idx];
         match p.state {
-            ProcessState::Ready | ProcessState::Zombie => {
+            ProcessState::Ready | ProcessState::Zombie | ProcessState::Crashed => {
                 self.slots[idx] = Process::free_slot();
                 Ok(p)
             }
@@ -147,30 +229,40 @@ impl ProcessTable {
 static TABLE: Mutex<ProcessTable> = Mutex::new(ProcessTable::new());
 static NEXT_PID: AtomicU32 = AtomicU32::new(1);
 
-/// Load the built-in smoke ELF into a new address space and record it `Ready`.
+/// Load a built-in test program into a new address space and record it `Ready`.
 pub fn spawn_smoke_elf(
     kernel_pt: &PageTableManager,
     fa: &mut FrameAllocator,
+    program: elf::SmokeProgram,
 ) -> Result<Process, ProcessError> {
-    let (aspace, entry, stack_top) = elf::load_smoke(kernel_pt, fa).map_err(ProcessError::Elf)?;
+    let (aspace, entry, stack_top) =
+        elf::load_smoke(kernel_pt, fa, program).map_err(ProcessError::Elf)?;
     let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
     let inserted = TABLE
         .lock()
         .insert(pid, entry, stack_top, aspace.pml4_phys());
-    if inserted.is_err() {
-        aspace.destroy(fa);
+    match inserted {
+        Ok(_) => audit::record_fmt(
+            EventKind::ProcessSpawned,
+            format_args!("pid-{}", pid),
+            entry,
+        ),
+        Err(_) => {
+            aspace.destroy(fa);
+        }
     }
     inserted
 }
 
-/// Run a `Ready` process in ring 3 until it exits; returns its exit code.
+/// Run a `Ready` process in ring 3 until it exits or crashes.
 ///
-/// The process stays in the table as a `Zombie` until [`reap`]ed.
-pub fn enter(pid: u32) -> Result<u64, ProcessError> {
+/// The process stays in the table (`Zombie` or `Crashed`) until [`reap`]ed.
+pub fn enter(pid: u32) -> Result<ExitStatus, ProcessError> {
     let proc = TABLE.lock().start(pid)?;
+    audit::record_fmt(EventKind::ProcessStarted, format_args!("pid-{}", pid), 0);
     // TABLE must not be held here: SYS_exit takes it from the syscall path.
     match crate::syscall::run_user(proc.entry, proc.stack_top, proc.pml4_phys) {
-        Ok(code) => Ok(code),
+        Ok(code) => Ok(TABLE.lock().status(pid).unwrap_or(ExitStatus::Exited(code))),
         Err(e) => {
             // Never reached ring 3: put it back so it can be retried or reaped.
             let mut t = TABLE.lock();
@@ -189,15 +281,36 @@ pub fn current_pid() -> Option<u32> {
 
 /// Called from `SYS_exit`: mark the current process `Zombie`.
 pub fn mark_exit(code: u64) {
-    TABLE.lock().exit_current(code);
+    let exited = TABLE.lock().exit_current(code);
+    if let Some(pid) = exited {
+        audit::record_fmt(EventKind::ProcessExited, format_args!("pid-{}", pid), code);
+    }
 }
 
-/// Free a `Ready` or `Zombie` process's address space and slot.
+/// Called from a CPU exception handler for a fault raised in ring 3: mark the
+/// current process `Crashed` and record it in the audit log.
+pub fn mark_crashed(fault: UserFault) {
+    let crashed = TABLE.lock().crash_current(fault);
+    if let Some(pid) = crashed {
+        audit::record_fmt(
+            EventKind::ProcessCrashed,
+            format_args!("pid-{}", pid),
+            fault.vector as u64,
+        );
+    }
+}
+
+/// Free a `Ready`, `Zombie`, or `Crashed` process's address space and slot.
 ///
 /// Returns `(exit_code, frames_freed)`.
 pub fn reap(pid: u32, fa: &mut FrameAllocator) -> Result<(u64, usize), ProcessError> {
     let p = TABLE.lock().take_for_reap(pid)?;
     let freed = AddressSpace::from_pml4_phys(p.pml4_phys).destroy(fa);
+    audit::record_fmt(
+        EventKind::ProcessReaped,
+        format_args!("pid-{}", pid),
+        freed as u64,
+    );
     Ok((p.exit_code, freed))
 }
 
@@ -278,6 +391,54 @@ mod tests {
         assert_eq!(t.insert(99, 0, 0, 0), Err(ProcessError::Full));
         t.take_for_reap(1).unwrap();
         t.insert(99, 0, 0, 0).unwrap();
+    }
+
+    #[test]
+    fn crash_marks_process_and_is_reapable() {
+        let mut t = ProcessTable::new();
+        t.insert(5, 0, 0, 0x5000).unwrap();
+        t.start(5).unwrap();
+        let fault = UserFault {
+            vector: 14,
+            error_code: 4,
+            rip: 0x8000400000,
+            addr: 0,
+        };
+        assert_eq!(t.crash_current(fault), Some(5));
+        assert_eq!(t.current, None);
+        assert_eq!(t.slots[0].state, ProcessState::Crashed);
+        assert_eq!(t.slots[0].exit_code, 142);
+        assert_eq!(t.status(5), Some(ExitStatus::Crashed(fault)));
+        assert_eq!(
+            t.start(5),
+            Err(ProcessError::BadState(ProcessState::Crashed))
+        );
+        let p = t.take_for_reap(5).unwrap();
+        assert_eq!(p.fault, Some(fault));
+    }
+
+    #[test]
+    fn exit_status_reports_normal_exit() {
+        let mut t = ProcessTable::new();
+        t.insert(6, 0, 0, 0).unwrap();
+        t.start(6).unwrap();
+        t.exit_current(19);
+        assert_eq!(t.status(6), Some(ExitStatus::Exited(19)));
+    }
+
+    #[test]
+    fn fault_names_cover_common_vectors() {
+        let f = |vector| UserFault {
+            vector,
+            error_code: 0,
+            rip: 0,
+            addr: 0,
+        };
+        assert_eq!(f(0).name(), "#DE divide error");
+        assert_eq!(f(6).name(), "#UD invalid opcode");
+        assert_eq!(f(13).name(), "#GP general protection");
+        assert_eq!(f(14).name(), "#PF page fault");
+        assert_eq!(f(0).exit_code(), 128);
     }
 
     #[test]

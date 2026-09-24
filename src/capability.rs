@@ -1,45 +1,80 @@
 //! Capability tokens for kernel objects.
 //!
 //! Each token records which [`Permission`]s the holder has on a given object
-//! and carries an Ed25519 signature over a SHA-256 digest of the token
-//! contents. Privileged kernel entry points reject unsigned tokens — a
-//! capability must be signed before it can authorize execute / IPC / network /
-//! delete operations.
+//! and carries a [`CapabilityProof`]: a hybrid **Ed25519 + ML-DSA-65**
+//! (FIPS 204) signature made by the kernel [`Issuer`](crate::issuer::Issuer).
+//! Privileged kernel entry points reject tokens without a valid proof.
 //!
-//! ## Signing model
+//! ## Trust model
+//!
+//! Verification checks the proof against the **pinned kernel issuer**, never
+//! against a key carried inside the token. (Format v0 embedded the signer's
+//! public key and accepted any self-signed token, so anyone could mint a
+//! capability. v1 closes that hole.) Tokens from other issuers — e.g. other
+//! CDK nodes — are verified explicitly with [`Capability::verify_with`].
+//!
+//! ## Token format v1
 //!
 //! ```text
-//! message = SHA-256(object_id_bytes ‖ sorted_permission_bytes)
-//! signature = Ed25519-Sign(signing_key, message)
+//! digest = SHA-256( "CDK-CAP" ‖ format ‖ algorithm ‖ issuer_id[16]
+//!                   ‖ u16_le(len(object_id)) ‖ object_id
+//!                   ‖ u8(count) ‖ sorted_permission_tags )
+//! proof  = { format, algorithm, issuer_id, Ed25519(digest), ML-DSA-65(digest, ctx="CDK-CAP-v1") }
 //! ```
 //!
-//! The verifying (public) key is stored inline in the token so verification
-//! is self-contained.  There is no PKI or certificate chain — capabilities are
-//! issued by the kernel and verified by the kernel.
+//! Both signatures must verify. `format` and `algorithm` are covered by the
+//! digest, so a token cannot be downgraded to a weaker algorithm.
 //!
-//! ## Key generation
+//! ## Verified-proof cache
 //!
-//! `Capability::generate_key()` draws entropy from [`crate::rng::KernelRng`]
-//! (RDRAND on bare-metal, OS entropy on host). [`Capability::sign_ephemeral`]
-//! and [`crate::kernel::Kernel::register_object`] use that path so newly
-//! issued tokens are signed at creation.
+//! ML-DSA verification is the expensive part of every capability check, and
+//! agents present the same tokens repeatedly. [`verify_cache`] remembers
+//! proofs that verified against the kernel issuer, keyed by
+//! `SHA-256("CDK-CAP-CACHE" ‖ digest ‖ ed25519_sig ‖ mldsa65_sig)`, so a hit
+//! requires a byte-identical token and proof. Only successes are cached, and
+//! the kernel issuer never changes within a boot; when revocation arrives,
+//! revoking must call [`verify_cache::clear`].
 
 use core::str::FromStr;
 use heapless::FnvIndexSet;
 use heapless::String;
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use rand_core::RngCore;
 use sha2::{Digest, Sha256};
 
-use crate::rng::KernelRng;
+use crate::issuer::{self, HybridSignature, Issuer, IssuerId, IssuerPublic, SigDomain};
 
 const MAX_PERMISSIONS: usize = 16;
 const MAX_ID_LEN: usize = 64;
 
-// Ed25519 signature is 64 bytes, verifying key is 32 bytes.
-const SIG_LEN: usize = 64;
-const KEY_LEN: usize = 32;
+/// Current capability token format.
+pub const TOKEN_FORMAT_V1: u8 = 1;
+const TOKEN_DOMAIN: &[u8] = b"CDK-CAP";
+
+/// Signature algorithm recorded in a token (crypto agility: new algorithms
+/// get new identifiers; verifiers reject identifiers they do not know).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SignatureAlgorithm {
+    /// Ed25519 and ML-DSA-65; both must verify.
+    HybridEd25519MlDsa65 = 0x01,
+}
+
+impl SignatureAlgorithm {
+    pub fn name(self) -> &'static str {
+        match self {
+            SignatureAlgorithm::HybridEd25519MlDsa65 => "Ed25519+ML-DSA-65",
+        }
+    }
+}
+
+/// Issuer-signed proof attached to a capability.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapabilityProof {
+    pub format: u8,
+    pub algorithm: SignatureAlgorithm,
+    pub issuer_id: IssuerId,
+    pub signature: HybridSignature,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Permission {
@@ -69,28 +104,23 @@ impl Permission {
 pub struct Capability {
     pub object_id: String<MAX_ID_LEN>,
     pub permissions: FnvIndexSet<Permission, MAX_PERMISSIONS>,
-    /// Ed25519 signature over the SHA-256 digest of this token.
-    pub signature: Option<[u8; SIG_LEN]>,
-    /// Ed25519 verifying (public) key of the signer.
-    pub signer_key: Option<[u8; KEY_LEN]>,
+    /// Issuer signature; `None` until [`issue`](Self::issue)d.
+    pub proof: Option<CapabilityProof>,
 }
 
 impl Capability {
     /// Create a new unsigned capability with the default permission set
     /// (Read, Execute, SendMessage, ReceiveMessage).
     pub fn new(obj: &crate::object::KernelObject) -> Self {
-        let mut perms = FnvIndexSet::new();
-        let _ = perms.insert(Permission::Read);
-        let _ = perms.insert(Permission::Execute);
-        let _ = perms.insert(Permission::SendMessage);
-        let _ = perms.insert(Permission::ReceiveMessage);
-
-        Self {
-            object_id: String::from_str(&obj.id).unwrap_or_default(),
-            permissions: perms,
-            signature: None,
-            signer_key: None,
-        }
+        Self::with_permissions(
+            obj,
+            &[
+                Permission::Read,
+                Permission::Execute,
+                Permission::SendMessage,
+                Permission::ReceiveMessage,
+            ],
+        )
     }
 
     /// Create a new unsigned capability with a caller-supplied permission set.
@@ -103,83 +133,113 @@ impl Capability {
         Self {
             object_id: String::from_str(&obj.id).unwrap_or_default(),
             permissions: perms,
-            signature: None,
-            signer_key: None,
+            proof: None,
         }
     }
 
     // -----------------------------------------------------------------------
-    // Key generation
+    // Issuance
     // -----------------------------------------------------------------------
 
-    /// Generate a fresh Ed25519 signing key using the kernel RNG.
+    /// Sign this capability with the kernel issuer and record it in the
+    /// audit log.
     ///
-    /// Returns `(signing_key_bytes, verifying_key_bytes)`.  The signing key
-    /// must be kept secret; only the verifying key is stored in the capability.
-    pub fn generate_key() -> ([u8; 32], [u8; KEY_LEN]) {
-        let mut seed = [0u8; 32];
-        KernelRng.fill_bytes(&mut seed);
-        let signing_key = SigningKey::from_bytes(&seed);
-        (seed, signing_key.verifying_key().to_bytes())
-    }
-
-    // -----------------------------------------------------------------------
-    // Signing
-    // -----------------------------------------------------------------------
-
-    /// Sign this capability with the provided Ed25519 signing key bytes.
-    ///
-    /// Stores the signature and the corresponding verifying key in the token.
-    /// Calling this a second time overwrites the previous signature.
-    pub fn sign(&mut self, signing_key_bytes: &[u8; 32]) -> Result<(), CapabilityError> {
-        let signing_key = SigningKey::from_bytes(signing_key_bytes);
-        let msg = self.signable_message();
-        let sig: Signature = signing_key.sign(&msg);
-        self.signature = Some(sig.to_bytes());
-        self.signer_key = Some(signing_key.verifying_key().to_bytes());
+    /// Calling this again replaces the previous proof.
+    pub fn issue(&mut self) -> Result<(), CapabilityError> {
+        self.issue_with(issuer::kernel())?;
+        crate::audit::record(
+            crate::audit::EventKind::CapIssued,
+            &self.object_id,
+            self.permission_mask(),
+        );
         Ok(())
     }
 
-    /// Sign this capability with a freshly generated ephemeral Ed25519 key.
-    ///
-    /// Convenience for kernel-issued tokens where the signing key is not
-    /// retained beyond issuance (the verifying key is stored in the token).
-    pub fn sign_ephemeral(&mut self) -> Result<(), CapabilityError> {
-        let (sk, _) = Self::generate_key();
-        self.sign(&sk)
+    /// Sign this capability with a specific issuer.
+    pub fn issue_with(&mut self, issuer: &Issuer) -> Result<(), CapabilityError> {
+        let algorithm = SignatureAlgorithm::HybridEd25519MlDsa65;
+        let digest = self.signable_digest(TOKEN_FORMAT_V1, algorithm, issuer.id());
+        self.proof = Some(CapabilityProof {
+            format: TOKEN_FORMAT_V1,
+            algorithm,
+            issuer_id: *issuer.id(),
+            signature: issuer.sign(SigDomain::Capability, &digest),
+        });
+        Ok(())
     }
 
-    /// Whether this token currently carries a signature blob.
+    /// Whether this token currently carries a proof.
     pub fn is_signed(&self) -> bool {
-        self.signature.is_some() && self.signer_key.is_some()
+        self.proof.is_some()
     }
 
-    /// Verify the token's signature.
+    // -----------------------------------------------------------------------
+    // Verification
+    // -----------------------------------------------------------------------
+
+    /// Verify the token against the kernel issuer.
     ///
-    /// Returns `Ok(true)` when the signature is present and valid,
-    /// `Ok(false)` when no signature has been set, and `Err` when the
-    /// stored key or signature bytes are malformed.
+    /// Returns `Ok(true)` when the proof is valid, `Ok(false)` when there is
+    /// no proof or the signature does not verify, and `Err` when the token
+    /// names another issuer or an unsupported format.
     pub fn verify(&self) -> Result<bool, CapabilityError> {
-        let sig_bytes = match self.signature {
-            Some(s) => s,
-            None => return Ok(false),
-        };
-        let key_bytes = match self.signer_key {
-            Some(k) => k,
-            None => return Ok(false),
-        };
+        let kernel = issuer::kernel();
+        self.verify_by(kernel.id(), |digest, sig| {
+            let key = verify_cache::key(digest, sig);
+            if verify_cache::lookup(&key) {
+                return true;
+            }
+            let ok = kernel.verify(SigDomain::Capability, digest, sig);
+            if ok {
+                verify_cache::insert(key);
+            }
+            ok
+        })
+    }
 
-        let verifying_key =
-            VerifyingKey::from_bytes(&key_bytes).map_err(|_| CapabilityError::InvalidKey)?;
-        let signature = Signature::from_bytes(&sig_bytes);
-        let msg = self.signable_message();
+    /// Verify against the kernel issuer, bypassing the cache (benchmarks).
+    pub fn verify_uncached(&self) -> Result<bool, CapabilityError> {
+        let kernel = issuer::kernel();
+        self.verify_by(kernel.id(), |digest, sig| {
+            kernel.verify(SigDomain::Capability, digest, sig)
+        })
+    }
 
-        Ok(verifying_key.verify(&msg, &signature).is_ok())
+    /// Verify the token against an explicitly trusted issuer public key.
+    pub fn verify_with(&self, issuer: &IssuerPublic) -> Result<bool, CapabilityError> {
+        self.verify_by(&issuer.id, |digest, sig| {
+            issuer.verify(SigDomain::Capability, digest, sig)
+        })
+    }
+
+    fn verify_by(
+        &self,
+        trusted: &IssuerId,
+        check: impl FnOnce(&[u8; 32], &HybridSignature) -> bool,
+    ) -> Result<bool, CapabilityError> {
+        let Some(proof) = &self.proof else {
+            return Ok(false);
+        };
+        if proof.format != TOKEN_FORMAT_V1 {
+            return Err(CapabilityError::UnsupportedFormat);
+        }
+        if proof.issuer_id != *trusted {
+            return Err(CapabilityError::UnknownIssuer);
+        }
+        let digest = self.signable_digest(proof.format, proof.algorithm, &proof.issuer_id);
+        Ok(check(&digest, &proof.signature))
     }
 
     // -----------------------------------------------------------------------
     // Permission management
     // -----------------------------------------------------------------------
+
+    /// Bitmask of held permissions (bit = permission tag), for audit records.
+    pub fn permission_mask(&self) -> u64 {
+        self.permissions
+            .iter()
+            .fold(0u64, |mask, p| mask | (1u64 << p.tag()))
+    }
 
     pub fn has_permission(&self, perm: &Permission) -> bool {
         self.permissions.contains(perm)
@@ -189,34 +249,34 @@ impl Capability {
         if self.permissions.insert(perm).is_err() {
             return Err(CapabilityError::PermissionSetFull);
         }
-        // Permission set changed — any prior signature no longer covers the token.
-        self.clear_signature();
+        // Permission set changed — the proof no longer covers the token.
+        self.proof = None;
         Ok(())
     }
 
     pub fn remove_permission(&mut self, perm: &Permission) {
         self.permissions.remove(perm);
-        self.clear_signature();
-    }
-
-    fn clear_signature(&mut self) {
-        self.signature = None;
-        self.signer_key = None;
+        self.proof = None;
     }
 
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
 
-    /// Build the canonical byte sequence that is hashed before signing.
-    ///
-    /// Format: `SHA-256(object_id_bytes ‖ sorted_permission_tags)`
-    ///
-    /// Permission tags are sorted so the digest is deterministic regardless
-    /// of insertion order.
-    fn signable_message(&self) -> [u8; 32] {
+    /// Canonical, domain-separated digest covered by the proof (see module docs).
+    fn signable_digest(
+        &self,
+        format: u8,
+        algorithm: SignatureAlgorithm,
+        issuer_id: &IssuerId,
+    ) -> [u8; 32] {
         let mut hasher = Sha256::new();
-        hasher.update(self.object_id.as_bytes());
+        hasher.update(TOKEN_DOMAIN);
+        hasher.update([format, algorithm as u8]);
+        hasher.update(issuer_id);
+        let id = self.object_id.as_bytes();
+        hasher.update((id.len() as u16).to_le_bytes());
+        hasher.update(id);
 
         // Sort permission tags for a canonical, order-independent digest.
         let mut tags: heapless::Vec<u8, MAX_PERMISSIONS> = heapless::Vec::new();
@@ -224,6 +284,7 @@ impl Capability {
             let _ = tags.push(p.tag());
         }
         tags.sort_unstable();
+        hasher.update([tags.len() as u8]);
         hasher.update(&tags);
 
         let result = hasher.finalize();
@@ -234,14 +295,92 @@ impl Capability {
 }
 
 // ---------------------------------------------------------------------------
+// Verified-proof cache
+// ---------------------------------------------------------------------------
+
+/// Cache of proofs that verified against the kernel issuer (see module docs).
+pub mod verify_cache {
+    use sha2::{Digest, Sha256};
+    use spin::Mutex;
+
+    use crate::issuer::HybridSignature;
+
+    /// Entries kept; the oldest is replaced first.
+    pub const CAPACITY: usize = 64;
+    const DOMAIN: &[u8] = b"CDK-CAP-CACHE";
+
+    pub type Key = [u8; 32];
+
+    struct Cache {
+        keys: [Key; CAPACITY],
+        len: usize,
+        next: usize,
+        hits: u64,
+        misses: u64,
+    }
+
+    static CACHE: Mutex<Cache> = Mutex::new(Cache {
+        keys: [[0; 32]; CAPACITY],
+        len: 0,
+        next: 0,
+        hits: 0,
+        misses: 0,
+    });
+
+    /// Cache key: binds the full signed digest and both signatures.
+    pub fn key(digest: &[u8; 32], sig: &HybridSignature) -> Key {
+        let mut h = Sha256::new();
+        h.update(DOMAIN);
+        h.update(digest);
+        h.update(sig.ed25519);
+        h.update(&sig.mldsa65[..]);
+        h.finalize().into()
+    }
+
+    pub fn lookup(key: &Key) -> bool {
+        let mut c = CACHE.lock();
+        let hit = c.keys[..c.len].iter().any(|k| k == key);
+        if hit {
+            c.hits += 1;
+        } else {
+            c.misses += 1;
+        }
+        hit
+    }
+
+    pub fn insert(key: Key) {
+        let mut c = CACHE.lock();
+        let slot = c.next;
+        c.keys[slot] = key;
+        c.next = (slot + 1) % CAPACITY;
+        c.len = (c.len + 1).min(CAPACITY);
+    }
+
+    /// Forget every cached proof (call on revocation or issuer change).
+    pub fn clear() {
+        let mut c = CACHE.lock();
+        c.len = 0;
+        c.next = 0;
+    }
+
+    /// `(hits, misses, entries)`.
+    pub fn stats() -> (u64, u64, usize) {
+        let c = CACHE.lock();
+        (c.hits, c.misses, c.len)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapabilityError {
-    InvalidKey,
-    InvalidSignature,
     PermissionSetFull,
+    /// The proof names an issuer the verifier does not trust.
+    UnknownIssuer,
+    /// The proof uses a token format this kernel does not understand.
+    UnsupportedFormat,
 }
 
 // ---------------------------------------------------------------------------
@@ -251,10 +390,16 @@ pub enum CapabilityError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::issuer::Issuer;
     use crate::object::KernelObject;
+    use crate::rng::EntropySource;
 
     fn dummy_obj(name: &str) -> KernelObject {
         KernelObject::new_compute(name, "normal")
+    }
+
+    fn attacker() -> Issuer {
+        Issuer::from_seeds(&[0xAA; 32], &[0xBB; 32], EntropySource::Os)
     }
 
     #[test]
@@ -293,31 +438,6 @@ mod tests {
     }
 
     #[test]
-    fn verify_returns_false_without_signature() {
-        let cap = Capability::new(&dummy_obj("x"));
-        assert_eq!(cap.verify().unwrap(), false);
-        assert!(!cap.is_signed());
-    }
-
-    #[test]
-    fn sign_ephemeral_marks_token_signed() {
-        let mut cap = Capability::new(&dummy_obj("eph"));
-        cap.sign_ephemeral().unwrap();
-        assert!(cap.is_signed());
-        assert_eq!(cap.verify().unwrap(), true);
-    }
-
-    #[test]
-    fn permission_mutation_clears_signature() {
-        let mut cap = Capability::new(&dummy_obj("mut"));
-        cap.sign_ephemeral().unwrap();
-        assert!(cap.is_signed());
-        cap.add_permission(Permission::Delete).unwrap();
-        assert!(!cap.is_signed());
-        assert_eq!(cap.verify().unwrap(), false);
-    }
-
-    #[test]
     fn capability_object_id_matches_object() {
         let obj = dummy_obj("myobj");
         let id = obj.id.clone();
@@ -326,70 +446,140 @@ mod tests {
     }
 
     #[test]
-    fn sign_and_verify_roundtrip() {
-        let mut cap = Capability::new(&dummy_obj("signed"));
-        let (sk, _vk) = Capability::generate_key();
-        cap.sign(&sk).unwrap();
-        assert!(cap.signature.is_some());
-        assert!(cap.signer_key.is_some());
-        assert_eq!(cap.verify().unwrap(), true);
+    fn unsigned_token_does_not_verify() {
+        let cap = Capability::new(&dummy_obj("x"));
+        assert_eq!(cap.verify(), Ok(false));
+        assert!(!cap.is_signed());
     }
 
     #[test]
-    fn verify_fails_after_permission_change() {
-        let mut cap = Capability::new(&dummy_obj("tampered"));
-        let (sk, _vk) = Capability::generate_key();
-        cap.sign(&sk).unwrap();
-        assert_eq!(cap.verify().unwrap(), true);
+    fn issued_token_verifies_with_hybrid_proof() {
+        let mut cap = Capability::new(&dummy_obj("issued"));
+        cap.issue().unwrap();
+        let proof = cap.proof.as_ref().unwrap();
+        assert_eq!(proof.format, TOKEN_FORMAT_V1);
+        assert_eq!(proof.algorithm, SignatureAlgorithm::HybridEd25519MlDsa65);
+        assert_eq!(&proof.issuer_id, issuer::kernel().id());
+        assert_eq!(cap.verify(), Ok(true));
+    }
 
-        // Add a permission post-signing — signature is cleared (must re-sign).
+    /// Regression test for the v0 forgery hole: a token signed by any key
+    /// other than the kernel issuer must be rejected.
+    #[test]
+    fn self_signed_token_is_rejected() {
+        let mut forged = Capability::with_permissions(&dummy_obj("victim"), &[Permission::Delete]);
+        forged.issue_with(&attacker()).unwrap();
+        assert_eq!(forged.verify(), Err(CapabilityError::UnknownIssuer));
+
+        // Relabelling the forged proof with the kernel issuer id does not help.
+        forged.proof.as_mut().unwrap().issuer_id = *issuer::kernel().id();
+        assert_eq!(forged.verify(), Ok(false));
+    }
+
+    #[test]
+    fn foreign_issuer_verifies_only_when_trusted_explicitly() {
+        let other = attacker();
+        let mut cap = Capability::new(&dummy_obj("remote"));
+        cap.issue_with(&other).unwrap();
+        assert_eq!(cap.verify_with(other.public()), Ok(true));
+        assert_eq!(
+            cap.verify_with(issuer::kernel().public()),
+            Err(CapabilityError::UnknownIssuer)
+        );
+    }
+
+    #[test]
+    fn permission_mutation_clears_proof() {
+        let mut cap = Capability::new(&dummy_obj("mut"));
+        cap.issue().unwrap();
         cap.add_permission(Permission::Delete).unwrap();
         assert!(!cap.is_signed());
-        assert_eq!(cap.verify().unwrap(), false);
+        assert_eq!(cap.verify(), Ok(false));
     }
 
     #[test]
-    fn verify_fails_after_signature_corruption() {
-        let mut cap = Capability::new(&dummy_obj("corrupt"));
-        let (sk, _vk) = Capability::generate_key();
-        cap.sign(&sk).unwrap();
+    fn tampering_with_fields_invalidates_proof() {
+        let mut cap = Capability::with_permissions(&dummy_obj("t"), &[Permission::Read]);
+        cap.issue().unwrap();
 
-        // Flip one bit in the signature.
-        if let Some(ref mut sig) = cap.signature {
-            sig[0] ^= 0x01;
-        }
-        assert_eq!(cap.verify().unwrap(), false);
+        // Escalate permissions behind the API's back.
+        let mut escalated = cap.clone();
+        let _ = escalated.permissions.insert(Permission::Delete);
+        assert_eq!(escalated.verify(), Ok(false));
+
+        // Point the token at another object.
+        let mut retargeted = cap.clone();
+        retargeted.object_id = String::from_str("obj-999").unwrap();
+        assert_eq!(retargeted.verify(), Ok(false));
     }
 
     #[test]
-    fn different_keys_produce_different_signatures() {
-        let obj = dummy_obj("multi-key");
-        let mut cap1 = Capability::new(&obj);
-        let mut cap2 = Capability::new(&obj);
+    fn both_signature_halves_are_checked() {
+        let mut cap = Capability::new(&dummy_obj("halves"));
+        cap.issue().unwrap();
 
-        let (sk1, _) = Capability::generate_key();
-        let (sk2, _) = Capability::generate_key();
-        cap1.sign(&sk1).unwrap();
-        cap2.sign(&sk2).unwrap();
+        let mut bad_ed = cap.clone();
+        bad_ed.proof.as_mut().unwrap().signature.ed25519[5] ^= 1;
+        assert_eq!(bad_ed.verify(), Ok(false));
 
-        assert_ne!(cap1.signature, cap2.signature);
-        // Each verifies with its own key.
-        assert_eq!(cap1.verify().unwrap(), true);
-        assert_eq!(cap2.verify().unwrap(), true);
+        let mut bad_ml = cap.clone();
+        bad_ml.proof.as_mut().unwrap().signature.mldsa65[5] ^= 1;
+        assert_eq!(bad_ml.verify(), Ok(false));
     }
 
     #[test]
-    fn sign_is_deterministic_for_same_key() {
-        // Ed25519 (RFC 8032) — same key + same message must produce identical
-        // signatures.  Clone a single capability so both sides share the same
-        // object_id and permission set.
-        let mut cap1 = Capability::new(&dummy_obj("det"));
-        let mut cap2 = cap1.clone();
-        let (sk, _) = Capability::generate_key();
-        cap1.sign(&sk).unwrap();
-        cap2.sign(&sk).unwrap();
-        assert_eq!(cap1.object_id, cap2.object_id);
-        assert_eq!(cap1.signature, cap2.signature);
+    fn verified_proofs_are_cached_but_tampering_still_fails() {
+        let mut cap = Capability::with_permissions(&dummy_obj("cache"), &[Permission::Read]);
+        cap.issue().unwrap();
+        let digest = cap.signable_digest(
+            TOKEN_FORMAT_V1,
+            SignatureAlgorithm::HybridEd25519MlDsa65,
+            issuer::kernel().id(),
+        );
+        let key = verify_cache::key(&digest, &cap.proof.as_ref().unwrap().signature);
+
+        assert_eq!(cap.verify(), Ok(true)); // populates the cache
+        assert!(verify_cache::lookup(&key));
+        assert_eq!(cap.verify(), Ok(true)); // served from the cache
+
+        // A cached token with escalated permissions has a different digest.
+        let mut escalated = cap.clone();
+        let _ = escalated.permissions.insert(Permission::Delete);
+        assert_eq!(escalated.verify(), Ok(false));
+
+        // Same digest, corrupted signature: different key, full check fails.
+        let mut corrupted = cap.clone();
+        corrupted.proof.as_mut().unwrap().signature.mldsa65[9] ^= 1;
+        assert_eq!(corrupted.verify(), Ok(false));
+
+        // Cached and uncached paths agree.
+        assert_eq!(cap.verify_uncached(), Ok(true));
+        assert_eq!(corrupted.verify_uncached(), Ok(false));
+    }
+
+    #[test]
+    fn unsupported_format_is_rejected() {
+        let mut cap = Capability::new(&dummy_obj("fmt"));
+        cap.issue().unwrap();
+        cap.proof.as_mut().unwrap().format = 99;
+        assert_eq!(cap.verify(), Err(CapabilityError::UnsupportedFormat));
+    }
+
+    #[test]
+    fn digest_is_order_independent_and_length_prefixed() {
+        let obj = dummy_obj("d");
+        let a = Capability::with_permissions(&obj, &[Permission::Read, Permission::Write]);
+        let b = Capability::with_permissions(&obj, &[Permission::Write, Permission::Read]);
+        let alg = SignatureAlgorithm::HybridEd25519MlDsa65;
+        let id = [7u8; 16];
+        assert_eq!(
+            a.signable_digest(1, alg, &id),
+            b.signable_digest(1, alg, &id)
+        );
+        assert_ne!(
+            a.signable_digest(1, alg, &id),
+            a.signable_digest(2, alg, &id)
+        );
     }
 
     #[test]

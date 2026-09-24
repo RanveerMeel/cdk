@@ -1,18 +1,33 @@
-# CDK — Cognitive Distributed Kernel
+# CDK — Quantum-Safe Agent Trust Kernel
 
-**Website:** [https://ranveermeel.github.io/cdk/](https://ranveermeel.github.io/cdk/) _(GitHub Pages)_
+**Website:** [https://ranveermeel.github.io/cdk/](https://ranveermeel.github.io/cdk/) _(GitHub Pages)_ · **Plan:** [ROADMAP.md](ROADMAP.md) · **Security:** [SECURITY.md](SECURITY.md)
 
-A **bare-metal operating system kernel** written in Rust, designed around capability-based security, intent-driven scheduling, and distributed-first architecture.
+CDK (Cognitive Distributed Kernel) is an open-source, bare-metal Rust kernel for running **AI agents under kernel-enforced, cryptographically provable permissions**, built on **post-quantum cryptography** from the start.
+
+- **Agents are isolated processes.** An agent can only reach an object, tool, model, or network endpoint if it holds a capability for it.
+- **Capabilities are issued and verified by the kernel**, signed with hybrid **Ed25519 + ML-DSA-65 (FIPS 204)**, so they can't be forged by classical or future quantum attackers.
+- **Every consequential action is provable** through a tamper-evident, hash-chained audit log with signed checkpoints.
+- **Humans stay in control:** consequential actions require a human-approval capability, enforced by the kernel *(planned)*.
+
+Heavy AI inference (GPUs, CUDA) runs on Linux next to CDK; CDK is the control plane that decides which agent may use which model and records it. See [ROADMAP.md](ROADMAP.md) for the architecture and milestones.
 
 ## Status
 
-**Early development preview.** CDK boots on bare metal (QEMU), exposes an interactive serial console, and includes foundational scheduling, capability, networking, and multicore scaffolding. Interfaces can still change quickly while core subsystems stabilize.
+**Early development preview — not for production use.** CDK boots on bare metal (QEMU) with SMP, preemptive scheduling, ring-3 processes in isolated address spaces, and an interactive serial console. The quantum-safe trust core (Phase 1 of the [roadmap](ROADMAP.md)) is being built now: hybrid post-quantum capability tokens, the signed audit log, user-fault containment, and key hygiene are done; the agent runtime (Phase 2) is next. Interfaces can still change quickly.
+
+### Editions
+
+CDK is **open core**. This repository — the kernel, the capability model, the agent runtime, and *all* cryptography — is Apache-2.0. Commercial editions for regulated sectors (finance, defense) add hardware integrations (QKD, HSMs), certified builds, sector policy packs, and support; see [ROADMAP.md § Editions](ROADMAP.md#5-editions).
 
 ## Features
 
 **Bare-Metal Execution** — Boots on x86_64 hardware (or QEMU) with no OS underneath. Built with `#![no_std]` and `bootloader_api` 0.11.
 
-**Capability-Based Security** — Every operation requires a cryptographic capability token. No global root, no ambient authority.
+**Capability-Based Security** — Every operation requires a capability token issued by the kernel. No global root, no ambient authority.
+
+**Quantum-Safe Capability Tokens** — Tokens are signed by a boot-time kernel issuer with hybrid Ed25519 + ML-DSA-65 (FIPS 204); both must verify, and only the pinned issuer is trusted, so self-signed or tampered tokens are rejected. Post-quantum operations run on a dedicated 512 KiB crypto stack. Console: `issuer`, `capsign`, `capverify`.
+
+**Tamper-Evident Audit Log** — Capability issuance, every capability check (accepted or rejected, with reason), and process spawn/start/exit/reap are appended to a SHA-256 hash chain bound to the kernel issuer. Every 64 records the issuer signs the chain head (Ed25519 + ML-DSA-65). Editing, deleting, reordering, or truncating records is detected, and rewriting the whole chain cannot reproduce the signed checkpoints. Console: `audit`, `audit-verify`, `audit-checkpoint`.
 
 **Message-Passing IPC** — Objects communicate via typed messages (Data, Text, Command, Request/Response) through per-object queues.
 
@@ -70,7 +85,7 @@ A **bare-metal operating system kernel** written in Rust, designed around capabi
 
 **CPU Hardening + Ring-3 Foundation (M7–M14)** — Quiet LAPIC/IPI logging with cooperative `yield`/`complete`; contiguous-frame heap; GS-base `PerCpu`; kernel `CpuContext` switch; BSP `lapic-local`; x2APIC (xAPIC fallback); MADT IOAPIC + `irq-route`; user GDT + SCE/`user-smoke`; ELF64 loader and minimal process table.
 
-**User Processes** — Each process gets its own PML4 that shares kernel mappings; user pages live only in a dedicated PML4 slot (`0x80_0000_0000`, 512 GiB) so they never touch kernel page tables. `SYS_exit` restores the kernel context that entered ring 3, so `elf-run` returns to the console; `SYS_write(ptr, len)` copies from user memory after checking every page is user-mapped; `reap` frees the address space.
+**User Processes** — Each process gets its own PML4 that shares kernel mappings; user pages live only in a dedicated PML4 slot (`0x80_0000_0000`, 512 GiB) so they never touch kernel page tables. `SYS_exit` restores the kernel context that entered ring 3, so `elf-run` returns to the console; a CPU exception in ring 3 does the same, marking the process `Crashed` instead of taking the kernel down; `SYS_write(ptr, len)` copies from user memory after checking every page is user-mapped; `reap` frees the address space.
 
 **GPU Foundation** — Virtio-gpu 2D command packing, soft scanout/resource/flush into the boot framebuffer, modern virtio-pci capability parse + control virtqueue under `virtio-hw`, console `gpuinfo` / `gpusmoke`.
 
@@ -159,12 +174,20 @@ cargo check --features virtio-hw
 | `run` | Manually dispatch next task from the scheduler queue |
 | `running` | Show the currently running (preempted) task |
 | `timeslice` | Show the preemptive time-slice length in ticks |
-| `elf-spawn` | Load the built-in smoke ELF as a `Ready` process |
+| `elf-spawn [prog]` | Load a built-in program as a `Ready` process: `hello` (default), or crash tests `ud`, `pf`, `gp`, `de` |
 | `elf-run <pid>` | Run a `Ready` process in ring 3 until it calls `SYS_exit` |
-| `elf-smoke` | `elf-spawn` + `elf-run` in one step |
-| `ps` | List processes (Ready / Running / Zombie) |
-| `reap <pid>` | Free a `Ready`/`Zombie` process and its address space |
+| `elf-smoke [prog]` | `elf-spawn` + `elf-run` in one step (`elf-smoke pf` shows a contained page fault) |
+| `ps` | List processes (Ready / Running / Zombie / Crashed) |
+| `reap <pid>` | Free a `Ready`/`Zombie`/`Crashed` process and its address space |
 | `user-smoke` | Minimal ring-3 round trip (enter, `SYS_exit`, return) |
+| `issuer` | Kernel capability issuer: id, algorithms, entropy source, crypto-stack peak |
+| `capsign <id>` | Issue a hybrid post-quantum capability for an object and verify it |
+| `capverify <id>` | Show unsigned, forged, and escalated tokens being rejected |
+| `capbench <id> [n]` | Time *n* capability checks without and with the verified-proof cache |
+| `audit [n]` | Last *n* audit records (default 12) |
+| `audit-verify` | Verify the audit hash chain and every signed checkpoint |
+| `audit-checkpoint` | Sign a checkpoint over the log now |
+| `audit-demo-tamper <seq>` | Demo only: corrupt one record so `audit-verify` can show detection |
 | `send <id> <text>` | Send a text message to an object |
 | `recv <id>` | Pop next message from an object |
 | `delete <id>` | Remove an object |
@@ -242,12 +265,18 @@ Deployment:
 
 ## Roadmap
 
+The full plan — phases, milestones, and editions — is in [ROADMAP.md](ROADMAP.md). Phase 0 (kernel foundation) is complete:
+
 - [x] Wire up `BootInfo` and a physical frame allocator
 - [x] Set up IDT with double-fault, timer, and keyboard handlers
 - [x] Timer-driven preemptive scheduling (50 ms time slice, round-robin re-queue)
 - [x] 4-level x86_64 page-table manager (map / unmap / translate, lazy interior allocation)
 - [x] Kernel heap allocator (`#[global_allocator]`, linked-list, 2 MiB reserved at boot)
 - [x] Ed25519 capability signing (RDRAND on bare-metal, OsRng on host; SHA-256 message digest)
+- [x] Issuer-bound hybrid post-quantum capability tokens (Ed25519 + ML-DSA-65, format v1) — roadmap milestone 1.1
+- [x] Tamper-evident audit log with hybrid-signed checkpoints — roadmap milestone 1.2
+- [x] User-fault containment: a crashing ring-3 program is terminated, audit-logged, and the kernel keeps running — roadmap milestone 1.3
+- [x] Key hygiene: zeroized keys and seeds, scrubbed crypto stack, zero-on-free heap, RFC 8032 / IETF ML-DSA known-answer tests, verified-proof cache — roadmap milestone 1.4
 - [x] Framebuffer text rendering (8×16 bitmap font, RGB/BGR/U8 pixel formats, auto-scroll)
 - [x] Network stack integration (loopback interfaces, capability-gated send/recv, object bridge routing, bindings, pump telemetry)
 - [x] External network transport (virtio-net MMIO bring-up path + non-loopback external interfaces via `eth0` default external backend and adapter-based transports)
@@ -265,6 +294,8 @@ Deployment:
 
 This project welcomes external contributions. Please follow these baseline rules:
 
+- Sign the [Contributor License Agreement](CLA.md) in your first pull request and sign off commits (`git commit -s`).
+- Report security issues privately ([SECURITY.md](SECURITY.md)), never in public issues.
 - Open an issue first for large changes so design direction can be aligned early.
 - Keep pull requests focused. One concern per PR is preferred.
 - Include tests or a clear validation procedure for behavioral changes.
@@ -325,7 +356,10 @@ git push -u origin HEAD
 
 ## License
 
-CDK is licensed under the **Apache License 2.0**.
+The open-source edition of CDK is licensed under the **Apache License 2.0**.
 
-- Full license text: `LICENSE`
-- Third-party attribution notes: `NOTICE`
+- Full license text: [`LICENSE`](LICENSE)
+- Attribution and trademark notes: [`NOTICE`](NOTICE)
+- Contributions are accepted under the [Contributor License Agreement](CLA.md) — you keep your copyright, and your code stays available here under Apache-2.0
+- Vulnerability reporting: [`SECURITY.md`](SECURITY.md)
+- Intended use: defensive and protective computing with human oversight — see [ROADMAP.md § Responsible use](ROADMAP.md#6-responsible-use)

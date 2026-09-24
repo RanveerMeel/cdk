@@ -1,10 +1,17 @@
 CDK (Cognitive Distributed Kernel)
-Copyright 2026 CDK contributors
+Copyright 2026 The CDK Authors
 
-This product includes third-party software components under their own licenses.
-Primary dependencies and their upstream license terms should be consulted in:
+The open-source edition of CDK is licensed under the Apache License,
+Version 2.0 (see LICENSE). Contributions are accepted under the CDK
+Contributor License Agreement (see CLA.md).
+
+This product includes third-party software components under their own
+licenses, including the RustCrypto implementations of ML-DSA (FIPS 204),
+SHA-2, and Ed25519. Primary dependencies and their
+upstream license terms should be consulted in:
 
 - Cargo.toml / Cargo.lock
 - Dependency source repositories on crates.io
 
-No additional trademark rights are granted by this notice.
+No trademark rights in the name "CDK" or related logos are granted by this
+notice or by the Apache License.

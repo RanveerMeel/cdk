@@ -16,32 +16,54 @@ The Cognitive Distributed Kernel (CDK) is a bare-metal kernel targeting x86_64 w
 
 Central registry of kernel objects. All access goes through capability tokens. Owns the scheduler and dispatches execution.
 
-### Capabilities (`src/capability.rs` + `src/rng.rs`)
+### Capabilities (`src/capability.rs`, `src/issuer.rs`, `src/rng.rs`)
 
 Permission tokens bound to a specific object. Supports: Read, Write, Execute, SendMessage, ReceiveMessage, Delete.
 
-#### Ed25519 signing
+#### Issuer-bound hybrid post-quantum proofs (token format v1)
 
-Every capability can optionally carry an Ed25519 signature over a SHA-256 digest:
+At boot the kernel generates one **issuer** identity: an Ed25519 key pair and an ML-DSA-65 (FIPS 204) key pair, from independent RDRAND seeds. Every kernel-issued capability carries a proof signed by that issuer:
 
 ```
-message = SHA-256(object_id_bytes ‖ sorted_permission_tags)
-signature = Ed25519-Sign(signing_key, message)
+digest = SHA-256( "CDK-CAP" ‖ format ‖ algorithm ‖ issuer_id[16]
+                  ‖ u16_le(len(object_id)) ‖ object_id ‖ u8(count) ‖ sorted_permission_tags )
+proof  = { format=1, algorithm=HybridEd25519MlDsa65, issuer_id,
+           Ed25519(digest), ML-DSA-65(digest, context="CDK-CAP-v1") }
 ```
 
 | Detail | Value |
 |---|---|
-| Algorithm | Ed25519 (RFC 8032) — deterministic, no random nonce |
-| Digest | SHA-256 over object ID + permission tag bytes (sorted) |
-| Key size | 32-byte signing key, 32-byte verifying key stored inline |
-| Signature size | 64 bytes stored in `Capability.signature` |
+| Signatures | Ed25519 (64 B) **and** ML-DSA-65 (3,309 B); both must verify |
+| Issuer public keys | 32 B + 1,952 B; `issuer_id = SHA-256("CDK-ISSUER-v1" ‖ keys)[..16]` |
+| Trust anchor | The pinned kernel issuer; tokens naming another issuer fail with `UnknownIssuer` |
+| Downgrade protection | `format` and `algorithm` are inside the signed digest |
+| Foreign issuers | `Capability::verify_with(&IssuerPublic)` (for future multi-node trust) |
 
-`Kernel::check_signature` enforces signature validity on every capability-gated operation: if a signature is present and invalid the operation is rejected with `KernelError::InvalidSignature`.
+Format v0 stored the signer's public key inside the token and accepted any self-signed token, so anyone could mint a capability; v1 verifies only against the pinned issuer. `Kernel::check_signature` enforces a valid proof on every capability-gated operation (`KernelError::InvalidSignature` otherwise). Console: `issuer`, `capsign <id>`, `capverify <id>`.
+
+#### Crypto stack
+
+ML-DSA-65 needs more stack than any kernel stack provides (host measurements: ~280 KiB keygen, ~100 KiB sign, ~66 KiB verify; QEMU peak 323 KiB). All issuer operations switch to a dedicated, pattern-painted 512 KiB stack (`issuer::crypto_stack`) under a lock, so capability checks are safe from any context, including 16 KiB syscall/interrupt stacks. `issuer` reports the peak usage.
+
+#### Key hygiene
+
+| Measure | Where |
+|---|---|
+| Secret keys zeroized on drop | `ed25519-dalek` and `ml-dsa` built with their `zeroize` features; RNG seeds and the ML-DSA seed array are wiped explicitly after key generation |
+| Secrets stay in one place | `Issuer` is neither `Clone` nor `Debug`; only `IssuerPublic` is copyable |
+| No stack residue | The crypto stack is re-painted over the used region after every operation (`issuer` shows peak usage and residue, which is 0) |
+| No heap residue | The kernel allocator zeroes every block on free (volatile writes via `zeroize`), covering ML-DSA's heap-boxed intermediates |
+| Constant time | CDK code makes no secret-dependent comparisons; signature arithmetic and checks are inside `ed25519-dalek` and `ml-dsa` |
+| Known-answer tests | Ed25519: RFC 8032 §7.1 TEST 2 and 3 (also reproduced with OpenSSL). ML-DSA-65: key generation from seed `00..1f` reproduces the IETF LAMPS example public key. NIST ACVP signing/verification vectors are roadmap item 1.5. |
+
+#### Verified-proof cache
+
+`Capability::verify` keeps the last 64 proofs that verified against the kernel issuer, keyed by `SHA-256("CDK-CAP-CACHE" ‖ digest ‖ both signatures)`, so a hit requires a byte-identical token and proof. Only successes are cached; the issuer is fixed per boot, and revocation (when added) must call `verify_cache::clear()`. In QEMU a full hybrid check costs ~5.6 M cycles and a cached one ~0.2 M (`capbench`). `verify_uncached` bypasses the cache.
 
 #### RNG (`src/rng.rs`)
 
 `KernelRng` implements `rand_core::CryptoRng + RngCore`:
-- **Bare-metal**: RDRAND instruction (retried up to 10 times; panics if exhausted)
+- **Bare-metal**: RDRAND (retried up to 10 times). Without RDRAND it falls back to SplitMix64 seeded from RDTSC, which is **not secure**; `rng::entropy_source()` reports this and the issuer prints a warning that tokens are forgeable.
 - **Host tests**: `rand_core::OsRng` backed by OS entropy
 
 ### Objects (`src/object.rs`)
@@ -112,7 +134,9 @@ The `FrameSource` trait decouples the walker from the concrete allocator, enabli
 
 ### User Processes (`src/process.rs`, `src/syscall.rs`, `src/elf.rs`)
 
-Lifecycle: `elf-spawn` loads an ELF into a new address space → `Ready`; `elf-run` → `Running`; `SYS_exit` → `Zombie`; `reap` frees the address space and slot.
+Lifecycle: `elf-spawn` loads an ELF into a new address space → `Ready`; `elf-run` → `Running`; `SYS_exit` → `Zombie`, or a CPU exception → `Crashed`; `reap` frees the address space and slot.
+
+**Fault containment.** Every exception vector a ring-3 program can raise (`#DE #OF #BR #UD #NM #NP #SS #GP #PF #MF #AC #XM`, and `#BP` from user mode) has a handler that checks the saved code segment's privilege level. For a ring-3 fault, `syscall::abort_user` swaps GS back to the kernel base (interrupt gates don't `swapgs`), marks the process `Crashed` with exit code 128 + vector, records `proc-crashed` in the audit log, and restores the kernel context saved by `run_user`, so `elf-run` reports the crash and the console continues. Kernel-mode faults print the vector, RIP, faulting address and error code, then halt the CPU instead of escalating to a double fault. Built-in crash programs (`elf-smoke ud|pf|gp|de`) exercise the path.
 
 `syscall::run_user` saves the caller's callee-saved registers, `RSP`, `RFLAGS` and `CR3` in a per-CPU slot, loads the process `CR3`, and `iretq`s into ring 3. On `SYS_exit` the syscall path restores that context, so `run_user` simply returns the exit code — the console keeps running. Syscalls: `SYS_exit(code)` (1) and `SYS_write(ptr, len)` (2, up to 1024 bytes, returns the byte count or `-1`).
 
@@ -146,6 +170,25 @@ Pixel-level text renderer that displays kernel output directly on the QEMU graph
 | Thread safety | Global `FRAMEBUFFER: spin::Mutex<Option<Framebuffer>>`; `try_lock` used in the print path to avoid deadlocks |
 
 Boot sequence: serial init → **framebuffer init** → interrupts → frame allocator → heap → page tables → console.
+
+### Audit Log (`src/audit.rs`)
+
+A tamper-evident record of security-relevant events: capability issuance (`cap-issued`), every capability check (`cap-accepted`, or `cap-rejected` with a reason code: 1 invalid signature, 2 unknown issuer, 3 unsupported format), and process `spawned` / `started` / `exited` / `reaped`.
+
+```
+genesis = SHA-256("CDK-AUDIT-GENESIS-v1" ‖ issuer_id)
+hash[n] = SHA-256("CDK-AUDIT-REC-v1" ‖ hash[n-1] ‖ seq ‖ tsc ‖ kind ‖ u8(len) ‖ subject ‖ detail)
+ckpt    = Ed25519 + ML-DSA-65 over SHA-256("CDK-AUDIT-CKPT-v1" ‖ issuer_id ‖ seq ‖ hash[seq])
+```
+
+| Detail | Value |
+|---|---|
+| Storage | Ring of 1,024 records; when full, the oldest is evicted and its hash becomes the verification anchor |
+| Checkpoints | Signed automatically every 64 records (and on `audit-checkpoint`); last 8 kept |
+| Timestamps | CPU TSC (lock-free, monotonic, not wall-clock) |
+| Signing domain | `SigDomain::AuditCheckpoint` (ML-DSA context `CDK-AUDIT-v1`), so capability signatures can't be replayed as checkpoints |
+
+`audit-verify` recomputes the chain and verifies every checkpoint: edited, deleted, reordered, or truncated records are detected, and code that rewrites the whole chain cannot reproduce the signed checkpoints without the issuer's secret keys. Records after the newest checkpoint are hash-chained only (reported as the unsigned tail). The log and checkpoints currently live only in kernel memory; exporting checkpoints off the machine (roadmap Phase 3) is what makes the log verifiable after a full kernel compromise.
 
 ### Serial Console (`src/console.rs`)
 
