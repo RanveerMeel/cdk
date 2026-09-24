@@ -1,0 +1,43 @@
+name: Build and Test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins nightly + rust-src/llvm-tools and the bare-metal target;
+      # rustup installs them on first cargo invocation.
+      - name: Install toolchain
+        run: rustup show
+
+      - name: Cache cargo artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Build kernel (debug)
+        run: cargo build
+
+      - name: Build kernel (release)
+        run: cargo build --release --bin cdk
+
+      - name: Check virtio-hw feature
+        run: cargo check --features virtio-hw
+
+      - name: Host unit tests
+        run: cargo test-host
