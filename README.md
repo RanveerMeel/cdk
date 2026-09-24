@@ -1,12 +1,23 @@
-# CDK — Cognitive Distributed Kernel
+# CDK — Quantum-Safe Agent Trust Kernel
 
-**Website:** [https://ranveermeel.github.io/cdk/](https://ranveermeel.github.io/cdk/) _(GitHub Pages)_
+**Website:** [https://ranveermeel.github.io/cdk/](https://ranveermeel.github.io/cdk/) _(GitHub Pages)_ · **Plan:** [ROADMAP.md](ROADMAP.md) · **Security:** [SECURITY.md](SECURITY.md)
 
-A **bare-metal operating system kernel** written in Rust, designed around capability-based security, intent-driven scheduling, and distributed-first architecture.
+CDK (Cognitive Distributed Kernel) is an open-source, bare-metal Rust kernel for running **AI agents under kernel-enforced, cryptographically provable permissions**, built on **post-quantum cryptography** from the start.
+
+- **Agents are isolated processes.** An agent can only reach an object, tool, model, or network endpoint if it holds a capability for it.
+- **Capabilities are issued and verified by the kernel**, signed with hybrid **Ed25519 + ML-DSA-65 (FIPS 204)**, so they can't be forged by classical or future quantum attackers.
+- **Every consequential action is provable** through a tamper-evident, signed audit log *(planned)*.
+- **Humans stay in control:** consequential actions require a human-approval capability, enforced by the kernel *(planned)*.
+
+Heavy AI inference (GPUs, CUDA) runs on Linux next to CDK; CDK is the control plane that decides which agent may use which model and records it. See [ROADMAP.md](ROADMAP.md) for the architecture and milestones.
 
 ## Status
 
-**Early development preview.** CDK boots on bare metal (QEMU), exposes an interactive serial console, and includes foundational scheduling, capability, networking, and multicore scaffolding. Interfaces can still change quickly while core subsystems stabilize.
+**Early development preview — not for production use.** CDK boots on bare metal (QEMU) with SMP, preemptive scheduling, ring-3 processes in isolated address spaces, and an interactive serial console. The quantum-safe trust core (Phase 1 of the [roadmap](ROADMAP.md)) is being built now. Interfaces can still change quickly.
+
+### Editions
+
+CDK is **open core**. This repository — the kernel, the capability model, the agent runtime, and *all* cryptography — is Apache-2.0. Commercial editions for regulated sectors (finance, defense) add hardware integrations (QKD, HSMs), certified builds, sector policy packs, and support; see [ROADMAP.md § Editions](ROADMAP.md#5-editions).
 
 ## Features
 
@@ -242,6 +253,8 @@ Deployment:
 
 ## Roadmap
 
+The full plan — phases, milestones, and editions — is in [ROADMAP.md](ROADMAP.md). Phase 0 (kernel foundation) is complete:
+
 - [x] Wire up `BootInfo` and a physical frame allocator
 - [x] Set up IDT with double-fault, timer, and keyboard handlers
 - [x] Timer-driven preemptive scheduling (50 ms time slice, round-robin re-queue)
@@ -265,6 +278,8 @@ Deployment:
 
 This project welcomes external contributions. Please follow these baseline rules:
 
+- Sign the [Contributor License Agreement](CLA.md) in your first pull request and sign off commits (`git commit -s`).
+- Report security issues privately ([SECURITY.md](SECURITY.md)), never in public issues.
 - Open an issue first for large changes so design direction can be aligned early.
 - Keep pull requests focused. One concern per PR is preferred.
 - Include tests or a clear validation procedure for behavioral changes.
@@ -325,7 +340,10 @@ git push -u origin HEAD
 
 ## License
 
-CDK is licensed under the **Apache License 2.0**.
+The open-source edition of CDK is licensed under the **Apache License 2.0**.
 
-- Full license text: `LICENSE`
-- Third-party attribution notes: `NOTICE`
+- Full license text: [`LICENSE`](LICENSE)
+- Attribution and trademark notes: [`NOTICE`](NOTICE)
+- Contributions are accepted under the [Contributor License Agreement](CLA.md) — you keep your copyright, and your code stays available here under Apache-2.0
+- Vulnerability reporting: [`SECURITY.md`](SECURITY.md)
+- Intended use: defensive and protective computing with human oversight — see [ROADMAP.md § Responsible use](ROADMAP.md#6-responsible-use)
