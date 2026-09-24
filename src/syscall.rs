@@ -43,9 +43,9 @@ pub fn init() {
     }
 }
 
-/// Rust dispatcher: `nr` in rax, `arg0` in rdi, `arg1` in rsi.
+/// Rust dispatcher: `nr` in rax; arguments in rdi, rsi, rdx.
 #[no_mangle]
-pub extern "C" fn syscall_dispatch(nr: u64, arg0: u64, arg1: u64) -> u64 {
+pub extern "C" fn syscall_dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64) -> u64 {
     match nr {
         SYS_EXIT => {
             crate::process::mark_exit(arg0);
@@ -67,6 +67,9 @@ pub extern "C" fn syscall_dispatch(nr: u64, arg0: u64, arg1: u64) -> u64 {
             0
         }
         SYS_WRITE => sys_write(arg0, arg1),
+        crate::agent::SYS_CAP_LIST..=crate::agent::SYS_RECV => {
+            crate::agent::syscall(nr, arg0, arg1, arg2)
+        }
         _ => {
             crate::println!("Syscall: unknown nr={}", nr);
             SYSCALL_ERR
@@ -122,7 +125,8 @@ fn sys_write(ptr: u64, len: u64) -> u64 {
     len
 }
 
-fn current_cr3() -> u64 {
+/// Physical address of the active page-table root.
+pub fn current_cr3() -> u64 {
     #[cfg(target_os = "none")]
     {
         let cr3: u64;
@@ -153,6 +157,9 @@ core::arch::global_asm!(
         mov rsp, gs:[{kernel_rsp}]
         push rcx
         push r11
+        // SysV args: rdi=nr, rsi=arg0, rdx=arg1, rcx=arg2 (user rax, rdi,
+        // rsi, rdx). rcx (user RIP) is already saved above.
+        mov rcx, rdx
         mov rdx, rsi
         mov rsi, rdi
         mov rdi, rax

@@ -13,7 +13,7 @@ Heavy AI inference (GPUs, CUDA) runs on Linux next to CDK; CDK is the control pl
 
 ## Status
 
-**Early development preview — not for production use.** CDK boots on bare metal (QEMU) with SMP, preemptive scheduling, ring-3 processes in isolated address spaces, and an interactive serial console. The quantum-safe trust core (Phase 1 of the [roadmap](ROADMAP.md)) is being built now: Phase 1 is done, and Phase 2 (agent runtime) has started: user programs written in Rust now load from the boot ramdisk. Per-agent capability handles are next. Interfaces can still change quickly.
+**Early development preview — not for production use.** CDK boots on bare metal (QEMU) with SMP, preemptive scheduling, ring-3 processes in isolated address spaces, and an interactive serial console. The quantum-safe trust core (Phase 1 of the [roadmap](ROADMAP.md)) is being built now: Phase 1 is done. In Phase 2 (agent runtime), Rust agent programs load from the boot ramdisk and act only through kernel-held capability handles; preemptive scheduling of agents is next. Interfaces can still change quickly.
 
 ### Editions
 
@@ -28,6 +28,8 @@ CDK is **open core**. This repository — the kernel, the capability model, the 
 **Quantum-Safe Capability Tokens** — Tokens are signed by a boot-time kernel issuer with hybrid Ed25519 + ML-DSA-65 (FIPS 204); both must verify, and only the pinned issuer is trusted, so self-signed or tampered tokens are rejected. Post-quantum operations run on a dedicated 512 KiB crypto stack. Console: `issuer`, `capsign`, `capverify`.
 
 **User Programs from a Boot Ramdisk** — Programs in `user/` are ordinary `no_std` Rust (`cdk_user` provides `_start`, syscalls, `println!`). `run_qemu.sh` builds them, packs a reproducible `ustar` ramdisk, and the bootloader loads it next to the kernel. The kernel parses the archive strictly, maps each program at its linked address with a 64 KiB stack and an unmapped guard page, and logs the image's SHA-256 (`program-loaded`) so every process can be traced to the exact binary that ran.
+
+**Agent Capability Handles** — Each process holds up to 16 capabilities in a kernel-side table and refers to them only by index, so tokens can't be forged, copied, or leaked. Syscalls `cap_list`, `cap_drop`, `cap_derive` (a new handle may only *drop* permissions, and is re-issued with hybrid post-quantum signatures), `send` and `recv` (to the handle's object). Every use is re-verified and permission-checked; grants, derivations, and denials land in the audit log. Demo agents: `agent` checks every rule, `intruder` (no grants) is blocked on all 19 attempts.
 
 **Tamper-Evident Audit Log** — Capability issuance, every capability check (accepted or rejected, with reason), and process spawn/start/exit/reap are appended to a SHA-256 hash chain bound to the kernel issuer. Every 64 records the issuer signs the chain head (Ed25519 + ML-DSA-65). Editing, deleting, reordering, or truncating records is detected, and rewriting the whole chain cannot reproduce the signed checkpoints. Console: `audit`, `audit-verify`, `audit-checkpoint`.
 
@@ -178,7 +180,9 @@ cargo check --features virtio-hw
 | `timeslice` | Show the preemptive time-slice length in ticks |
 | `ls` | List programs in the boot ramdisk with size and SHA-256 prefix |
 | `spawn <name>` | Load a ramdisk program as a `Ready` process |
-| `exec <name>` | Load and run a ramdisk program (`exec hello`, `exec checksum`, `exec overflow`) |
+| `exec <name> [obj perms]` | Load and run a ramdisk program, optionally granting one handle first (`exec agent obj-2 send,recv`, `exec intruder`) |
+| `grant <pid> <obj> [perms]` | Give a process a kernel-issued capability handle (`send,recv` by default; `read,write,exec,send,recv,delete` or `all`) |
+| `handles <pid>` | List a process's handles |
 | `elf-spawn [prog]` | Load a built-in program as a `Ready` process: `hello` (default), or crash tests `ud`, `pf`, `gp`, `de` |
 | `elf-run <pid>` | Run a `Ready` process in ring 3 until it calls `SYS_exit` |
 | `elf-smoke [prog]` | `elf-spawn` + `elf-run` in one step (`elf-smoke pf` shows a contained page fault) |
@@ -283,6 +287,7 @@ The full plan — phases, milestones, and editions — is in [ROADMAP.md](ROADMA
 - [x] User-fault containment: a crashing ring-3 program is terminated, audit-logged, and the kernel keeps running — roadmap milestone 1.3
 - [x] Key hygiene: zeroized keys and seeds, scrubbed crypto stack, zero-on-free heap, RFC 8032 / IETF ML-DSA known-answer tests, verified-proof cache — roadmap milestone 1.4
 - [x] Rust user programs loaded from a boot ramdisk, with SHA-256 provenance in the audit log — roadmap milestone 2.1
+- [x] Per-agent capability handles: grant, list, derive (attenuate only), drop, send/recv — every use verified and audited — roadmap milestone 2.2
 - [x] Framebuffer text rendering (8×16 bitmap font, RGB/BGR/U8 pixel formats, auto-scroll)
 - [x] Network stack integration (loopback interfaces, capability-gated send/recv, object bridge routing, bindings, pump telemetry)
 - [x] External network transport (virtio-net MMIO bring-up path + non-loopback external interfaces via `eth0` default external backend and adapter-based transports)

@@ -329,6 +329,7 @@ fn register(
     };
     match inserted {
         Ok(proc) => {
+            let _ = crate::agent::create_table(pid);
             audit::record_fmt(
                 EventKind::ProcessSpawned,
                 format_args!("pid-{}", pid),
@@ -394,6 +395,7 @@ pub fn mark_crashed(fault: UserFault) {
 /// Returns `(exit_code, frames_freed)`.
 pub fn reap(pid: u32, fa: &mut FrameAllocator) -> Result<(u64, usize), ProcessError> {
     let p = TABLE.lock().take_for_reap(pid)?;
+    crate::agent::destroy_table(pid);
     let freed = AddressSpace::from_pml4_phys(p.pml4_phys).destroy(fa);
     audit::record_fmt(
         EventKind::ProcessReaped,

@@ -87,8 +87,8 @@ pub enum Permission {
 }
 
 impl Permission {
-    /// Stable byte tag used in the signable message digest.
-    fn tag(&self) -> u8 {
+    /// Stable byte tag used in the signable message digest and permission masks.
+    pub fn tag(&self) -> u8 {
         match self {
             Permission::Read => 0x01,
             Permission::Write => 0x02,

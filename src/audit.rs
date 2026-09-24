@@ -72,6 +72,12 @@ pub enum EventKind {
     /// Program image loaded. Subject `pid-N:name`; `detail` = first 8 bytes
     /// of the image's SHA-256 (big-endian).
     ProgramLoaded = 10,
+    /// Capability handle given to a process. Subject `pid-N:hH:object`;
+    /// `detail` = permission bitmask.
+    CapGranted = 11,
+    /// Process derived a weaker handle. Subject `pid-N:hP->hC:object`;
+    /// `detail` = the child's permission bitmask.
+    CapDerived = 12,
 }
 
 impl EventKind {
@@ -87,6 +93,8 @@ impl EventKind {
             EventKind::ProcessReaped => "proc-reaped",
             EventKind::ProcessCrashed => "proc-crashed",
             EventKind::ProgramLoaded => "program-loaded",
+            EventKind::CapGranted => "cap-granted",
+            EventKind::CapDerived => "cap-derived",
         }
     }
 }
@@ -99,6 +107,8 @@ pub mod reject_reason {
     pub const UNKNOWN_ISSUER: u64 = 2;
     /// Unsupported token format.
     pub const UNSUPPORTED_FORMAT: u64 = 3;
+    /// Valid token, but it lacks the permission (or a derive tried to add one).
+    pub const PERMISSION_DENIED: u64 = 4;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

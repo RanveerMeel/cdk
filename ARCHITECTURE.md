@@ -177,6 +177,22 @@ Boot sequence: serial init → **framebuffer init** → interrupts → frame all
 
 **Loading.** At boot the kernel adopts the ramdisk from `BootInfo`. The tar parser treats it as untrusted: header checksums are verified, sizes are bounds-checked, names must be short printable ASCII without a ustar prefix, non-regular entries are skipped, and parsing stops at the first malformed header. `spawn`/`exec` hash the image (SHA-256), load it with `elf::load_image` (segments capped at 16 MiB, all inside the user region), map a 64 KiB stack whose lower neighbour page stays unmapped as a guard, and record `program-loaded` (`pid-N:name`, first 8 hash bytes) in the audit log.
 
+### Agent Capability Handles (`src/agent.rs`)
+
+Each process gets a table of up to 16 `Capability` tokens when it is spawned; the table is cleared when it is reaped. Tokens stay in kernel memory; programs use the index.
+
+| nr | Syscall | Arguments | Result |
+|---|---|---|---|
+| 3 | `cap_list` | `buf, max` | handle count; writes `{u32 handle, u32 perms}` entries |
+| 4 | `cap_drop` | `handle` | 0 |
+| 5 | `cap_derive` | `handle, mask` | new handle, holding only `mask` (must be a subset; the parent is re-verified first) |
+| 6 | `send` | `handle, ptr, len ≤ 64` | 0; message goes to the handle's object, `from = pid-N` |
+| 7 | `recv` | `handle, ptr, len` | bytes copied from the next message |
+
+Errors return as `-(code)`: 1 bad handle, 2 denied, 3 invalid, 4 queue full, 5 empty, 6 table full, 7 bad signature. `send`/`recv` go through `Kernel::send_message`/`receive_message`, so every use re-verifies the hybrid proof (usually a verified-proof cache hit) and checks the permission. Grants (`cap-granted`), derivations (`cap-derived`), and denials (`cap-rejected`, reason 4) are audit-logged. The syscall entry stub now passes a third argument (`rdx`). User writes (`recv`, `cap_list`) use `copy_to_user`, which requires every destination page to be user-accessible and writable before writing anything.
+
+**Kernel access from syscalls.** The console holds the kernel lock while a program runs, so syscalls can't take it. `agent::with_kernel` lends the console's `&mut Kernel` to the syscall layer for the duration of `process::enter`; this is sound because the program runs synchronously on the console's CPU until it exits. Preemptive user scheduling (roadmap 2.3) must replace this.
+
 ### Audit Log (`src/audit.rs`)
 
 A tamper-evident record of security-relevant events: capability issuance (`cap-issued`), every capability check (`cap-accepted`, or `cap-rejected` with a reason code: 1 invalid signature, 2 unknown issuer, 3 unsupported format), and process `spawned` / `started` / `exited` / `reaped`.

@@ -330,6 +330,8 @@ pub enum PagingError {
     UserSlotInUse,
     /// The page is mapped but not accessible from ring 3.
     NotUserAccessible,
+    /// The user page is mapped read-only.
+    NotWritable,
 }
 
 pub type PagingResult<T> = Result<T, PagingError>;
@@ -603,6 +605,54 @@ impl PageTableManager {
             done += n;
         }
         Ok(())
+    }
+
+    /// Copy `data` into user memory at `virt`.
+    ///
+    /// Every destination page must be user-accessible **and writable**; all
+    /// pages are checked before any byte is written, so a failed copy leaves
+    /// user memory untouched. Writes go through the physical-memory mapping.
+    pub fn copy_to_user(&self, virt: u64, data: &[u8]) -> PagingResult<()> {
+        if !is_user_range(virt, data.len() as u64) {
+            return Err(PagingError::OutsideUserRegion);
+        }
+        let mut page = virt & !(PAGE_SIZE - 1);
+        let end = virt + data.len() as u64;
+        while page < end {
+            self.translate_user_writable(page)?;
+            page += PAGE_SIZE;
+        }
+        let mut done = 0usize;
+        while done < data.len() {
+            let addr = virt + done as u64;
+            let page_off = (addr & (PAGE_SIZE - 1)) as usize;
+            let n = (PAGE_SIZE as usize - page_off).min(data.len() - done);
+            let phys = self.translate_user_writable(addr & !(PAGE_SIZE - 1))?;
+            // SAFETY: phys is a mapped, writable user frame; page_off + n <= PAGE_SIZE.
+            unsafe {
+                let dst = crate::phys_mem::phys_to_mut_ptr::<u8>(phys).add(page_off);
+                core::ptr::copy_nonoverlapping(data[done..].as_ptr(), dst, n);
+            }
+            done += n;
+        }
+        Ok(())
+    }
+
+    /// [`translate_user`](Self::translate_user) that also requires the leaf
+    /// entry to be writable.
+    pub fn translate_user_writable(&self, virt: u64) -> PagingResult<u64> {
+        let phys = self.translate_user(virt)?;
+        let idx = VirtIndices::from_u64(virt);
+        let pdpt = self.descend(self.pml4_phys, idx.pml4)?;
+        let pd = self.descend(pdpt, idx.pdpt)?;
+        let pt = self.descend(pd, idx.pd)?;
+        // SAFETY: pt is a valid table frame reached by the walk above.
+        let entry = unsafe { &*Self::entry_ptr(pt, idx.pt) };
+        if entry.flags().contains(X86Flags::WRITABLE) {
+            Ok(phys)
+        } else {
+            Err(PagingError::NotWritable)
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1274,6 +1324,42 @@ mod tests {
         );
         assert_eq!(
             aspace.tables().copy_from_user(VA1, &mut out),
+            Err(PagingError::OutsideUserRegion)
+        );
+    }
+
+    #[test]
+    fn copy_to_user_requires_writable_user_pages_and_is_all_or_nothing() {
+        let (_k, mut aspace, mut alloc) = user_space();
+        let rw = alloc_phys(&mut alloc);
+        let ro = alloc_phys(&mut alloc);
+        aspace.map_user(UVA, rw, MapFlags::user_rw(), &mut alloc).unwrap();
+        aspace
+            .map_user(UVA + PAGE_SIZE, ro, MapFlags::user_rx(), &mut alloc)
+            .unwrap();
+
+        aspace.tables().copy_to_user(UVA + 10, b"ok").unwrap();
+        let mut back = [0u8; 2];
+        aspace.tables().copy_from_user(UVA + 10, &mut back).unwrap();
+        assert_eq!(&back, b"ok");
+
+        // Spans into the read-only page: rejected, and the writable part is untouched.
+        assert_eq!(
+            aspace.tables().copy_to_user(UVA + PAGE_SIZE - 2, b"abcd"),
+            Err(PagingError::NotWritable)
+        );
+        aspace
+            .tables()
+            .copy_from_user(UVA + PAGE_SIZE - 2, &mut back)
+            .unwrap();
+        assert_eq!(back, [0, 0]);
+
+        assert_eq!(
+            aspace.tables().copy_to_user(UVA + 2 * PAGE_SIZE, b"x"),
+            Err(PagingError::NotMapped)
+        );
+        assert_eq!(
+            aspace.tables().copy_to_user(VA1, b"x"),
             Err(PagingError::OutsideUserRegion)
         );
     }
