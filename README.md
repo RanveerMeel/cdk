@@ -68,7 +68,7 @@ A **bare-metal operating system kernel** written in Rust, designed around capabi
 
 **SMP Roadmap Reset (M1–M6)** — Unblocked 2-vCPU bring-up (`-smp 2`, Kernel lock released before INIT/SIPI, lock-free AP ready mailbox); ACPI MADT CPU discovery with fallback topology; slot-based `percpu` maps; contexts stay running until completed; global scheduler usable without Kernel lock; TLB shootdown ACK wait.
 
-**CPU Hardening + Ring-3 Foundation (M7–M14)** — Quiet LAPIC/IPI logging with cooperative `yield`/`complete`; contiguous-frame heap; GS-base `PerCpu`; kernel `CpuContext` switch; BSP `lapic-local`; x2APIC (xAPIC fallback); MADT IOAPIC + `irq-route`; user GDT + SCE/`user-smoke` (no ELF loader yet).
+**CPU Hardening + Ring-3 Foundation (M7–M14)** — Quiet LAPIC/IPI logging with cooperative `yield`/`complete`; contiguous-frame heap; GS-base `PerCpu`; kernel `CpuContext` switch; BSP `lapic-local`; x2APIC (xAPIC fallback); MADT IOAPIC + `irq-route`; user GDT + SCE/`user-smoke`; ELF64 loader and minimal process table.
 
 **GPU Foundation** — Virtio-gpu 2D command packing, soft scanout/resource/flush into the boot framebuffer, modern virtio-pci capability parse + control virtqueue under `virtio-hw`, console `gpuinfo` / `gpusmoke`.
 
@@ -245,7 +245,9 @@ Deployment:
 - [x] External network transport (virtio-net MMIO bring-up path + non-loopback external interfaces via `eth0` default external backend and adapter-based transports)
 - [x] Multi-core foundation (trampoline, LAPIC, TSS, IPIs, MADT discovery, AP ready mailbox, percpu slots, TLB ACK)
 - [x] Multi-core hardening (quiet SMP lifecycle, contiguous heap, GS-base PerCpu, kernel context switch, BSP lapic-local, x2APIC with xAPIC fallback, IOAPIC IRQ0/1 + optional `irq-route`)
-- [x] User-mode / ring-3 foundation (user GDT segments, SCE/LSTAR syscall + `user-smoke`; no ELF loader / multi-process yet)
+- [x] User-mode / ring-3 foundation (user GDT segments, SCE/LSTAR syscall + `user-smoke`)
+- [x] ELF64 loader and minimal process table
+- [ ] Run a loaded ELF as a ring-3 process (spawn → user entry → syscalls → exit)
 - [x] GPU support (soft 2D command pipeline + FB flush; PCI/MMIO virtio-gpu probe under `virtio-hw`; `gpuinfo` / `gpusmoke`)
 - [x] Unified memory foundation (contiguous shared regions, CPU fill + fence, virtio-gpu attach; IOMMU identity stub — no migration yet)
 
