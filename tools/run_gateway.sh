@@ -15,4 +15,7 @@ ID=(--identity "$ROOT/target/gateway-identity.key")
 if [ "${1:-}" = "--init" ]; then
     exec "$BIN" --init "${ID[@]}" --pub-out "$ROOT/target/gateway.pub"
 fi
-exec "$BIN" "${ID[@]}" "${1:-$ROOT/target/cdk-link.sock}"
+# MCP servers the gateway exposes to CDK agents. Default: the demo server.
+# Override with CDK_MCP="name=command args" (one server).
+MCP=(--mcp "${CDK_MCP:-demo=python3 $ROOT/gateway/examples/demo_mcp_server.py}")
+exec "$BIN" "${ID[@]}" "${MCP[@]}" ${CDK_MCP_ALLOW:+--allow "$CDK_MCP_ALLOW"} "${1:-$ROOT/target/cdk-link.sock}"

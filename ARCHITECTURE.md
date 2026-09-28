@@ -210,6 +210,22 @@ Signatures are hybrid Ed25519 + ML-DSA-65 with FIPS 204 context `CDK-LINK-v1` (t
 
 **Gateway.** `gateway/` is an ordinary Linux program (`tools/run_gateway.sh` builds it for the host target) that connects to the socket, logs `HELLO`, answers `PING` with `PONG`, acknowledges `DATA`, and answers the handshake with its long-term identity (`target/gateway-identity.key`, mode 0600, created by `tools/run_gateway.sh --init`); with a session it answers sealed messages sealed and refuses plaintext `DATA`. `burst N` makes it send N near-maximum frames for link testing.
 
+### Agent Tools / MCP Gateway (`src/tools.rs`, `link/src/tool.rs`, `gateway/src/mcp.rs`)
+
+The gateway starts each configured MCP server (`--mcp NAME=COMMAND`, stdio JSON-RPC: `initialize`, `notifications/initialized`, `tools/list`) and keeps a registry of tool names; with `--allow` only listed tools are offered or callable. Tool messages are `cdk_link::tool` payloads carried inside the sealed channel: `ListRequest`/`ListResponse` (≤ 16 names of ≤ 48 bytes) and `CallRequest {call_id, name, args}` / `CallResponse {call_id, status, body}`, status `Ok`, `ToolError`, `UnknownTool`, `Refused` (allowlist), `Unavailable` (server failed or took over 10 s), `Truncated`.
+
+`tools-sync` registers a kernel object of kind `tool:<name>` for each listed tool, so tools are granted like any other object. `tool_call` (syscall 9: `handle, args_ptr, args_len, out_ptr, out_len` in `rdi, rsi, rdx, r10, r8`):
+
+1. copies the arguments (≤ `MAX_BODY`) and checks the whole result buffer (≤ 4096) is user-writable, before anything is sent;
+2. re-verifies the handle's token against the kernel issuer and requires `Execute` on a `tool:` object (denials are audited as `cap-rejected`);
+3. requires the secure session (`ENOLINK` otherwise; tools never travel in plaintext);
+4. if the token carries the approval constraint, queues it for the human (the prompt names the tool and shows the escaped arguments; denial returns `HumanDenied`);
+5. sends the `CallRequest`, records `tool-call` (detail: first 8 bytes of SHA-256 of the arguments, so the log proves what was sent without storing it), and blocks the agent.
+
+The scheduler polls the link while calls are in flight. The response is copied into the agent's buffer through its own page tables (`copy_to_user`, all-or-nothing), `tool-result` records status and full length, and the agent resumes with `status << 32 | copied_len` (`Truncated` if the buffer was short). After 15 s without a response the call fails with `ETIMEDOUT` (`-10`) and `tool-result` records `timeout`; a late response is dropped. The kernel does not parse the JSON arguments; the gateway requires a JSON object.
+
+**Limits.** At most 8 calls in flight; one CPU services them (roadmap 2.7). What a tool does on the host is outside CDK's control: capabilities decide *which* tools an agent may call and with what human oversight, and the gateway's allowlist and the MCP server's own permissions bound the rest.
+
 ### Human-Approval Gates (`src/agent.rs`, `src/syscall.rs`, `src/process.rs`)
 
 `Permission::RequiresApproval` (tag 7) is a *constraint* carried in the signed permission set: an agent can't strip it by forging, and `cap_derive` always carries it into the child (a child may add it but never drop it). `all` grants every right but not the constraint.
@@ -237,8 +253,10 @@ Each process gets a table of up to 16 `Capability` tokens when it is spawned; th
 | 5 | `cap_derive` | `handle, mask` | new handle, holding only `mask` (must be a subset; the parent is re-verified first) |
 | 6 | `send` | `handle, ptr, len ≤ 64` | 0; message goes to the handle's object, `from = pid-N` |
 | 7 | `recv` | `handle, ptr, len` | bytes copied from the next message |
+| 8 | `getpid` | — | pid |
+| 9 | `tool_call` | `handle, args, args_len, out, out_len` | `status << 32 \| len`; see Agent Tools |
 
-Errors return as `-(code)`: 1 bad handle, 2 denied, 3 invalid, 4 queue full, 5 empty, 6 table full, 7 bad signature. `send`/`recv` go through `Kernel::send_message`/`receive_message`, so every use re-verifies the hybrid proof (usually a verified-proof cache hit) and checks the permission. Grants (`cap-granted`), derivations (`cap-derived`), and denials (`cap-rejected`, reason 4) are audit-logged. The syscall entry stub now passes a third argument (`rdx`). User writes (`recv`, `cap_list`) use `copy_to_user`, which requires every destination page to be user-accessible and writable before writing anything.
+Errors return as `-(code)`: 1 bad handle, 2 denied, 3 invalid, 4 queue full, 5 empty, 6 table full, 7 bad signature, 8 human denied, 9 no secure link, 10 timed out. `send`/`recv` go through `Kernel::send_message`/`receive_message`, so every use re-verifies the hybrid proof (usually a verified-proof cache hit) and checks the permission. Grants (`cap-granted`), derivations (`cap-derived`), and denials (`cap-rejected`, reason 4) are audit-logged. The syscall entry stub now passes a third argument (`rdx`). User writes (`recv`, `cap_list`) use `copy_to_user`, which requires every destination page to be user-accessible and writable before writing anything.
 
 **Kernel access from syscalls.** The console holds the kernel lock while a program runs, so syscalls can't take it. `agent::with_kernel` lends the console's `&mut Kernel` to the syscall layer for the duration of `process::enter`; this is sound because the program runs synchronously on the console's CPU until it exits. This remains sound with preemptive scheduling because every agent still runs on the console's CPU and preemption only switches between ring-3 programs; running agents on other CPUs (roadmap 2.7) must replace it with proper locking.
 

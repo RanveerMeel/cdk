@@ -154,6 +154,8 @@ const COMMANDS: &[&str] = &[
     "link-send",
     "link-recv",
     "link-secure",
+    "tools",
+    "tools-sync",
     "capbench",
     "audit",
     "audit-verify",
@@ -640,6 +642,8 @@ fn dispatch(
         "link-send" => cmd_link_send(line.split_once(' ').map_or("", |(_, rest)| rest)),
         "link-recv" => cmd_link_recv(),
         "link-secure" => cmd_link_secure(),
+        "tools" => cmd_tools(kernel),
+        "tools-sync" => cmd_tools_sync(kernel),
         "capbench" => cmd_capbench(arg1, arg2, kernel),
         "audit" => cmd_audit(arg1),
         "audit-verify" => cmd_audit_verify(),
@@ -752,6 +756,8 @@ fn cmd_help() {
     crate::println!("  link-send <text>  Send a DATA frame to the host gateway");
     crate::println!("  link-recv         Show frames received from the host gateway");
     crate::println!("  link-secure       Post-quantum handshake with the pinned gateway; seal all traffic");
+    crate::println!("  tools-sync        Fetch the gateway's MCP tools and register them as objects");
+    crate::println!("  tools             List registered tool objects (grant with: grant <pid> tool:<name> exec)");
     crate::println!("  capbench <id> [n] Time n capability checks, uncached vs cached");
     crate::println!("  audit [n]         Show the last n audit records (default 12)");
     crate::println!("  audit-verify      Verify the audit hash chain and signed checkpoints");
@@ -1294,8 +1300,17 @@ fn cmd_audit(n_str: &str) {
             );
             if r.kind == crate::audit::EventKind::ProcessSpawned {
                 crate::print!("{:#x} ", r.detail);
-            } else if r.kind == crate::audit::EventKind::ProgramLoaded {
+            } else if matches!(
+                r.kind,
+                crate::audit::EventKind::ProgramLoaded | crate::audit::EventKind::ToolCall
+            ) {
                 crate::print!("sha256:{:016x} ", r.detail);
+            } else if r.kind == crate::audit::EventKind::ToolResult {
+                if r.detail == u64::MAX {
+                    crate::print!("timeout ");
+                } else {
+                    crate::print!("status={} len={} ", r.detail >> 32, r.detail & 0xffff_ffff);
+                }
             } else {
                 crate::print!("{:<8} ", r.detail);
             }
@@ -1389,6 +1404,31 @@ fn cmd_link() {
             "      no secure session (pinned gateway: {})",
             if crate::link::pinned_gateway().is_some() { "present" } else { "MISSING from ramdisk" }
         ),
+    }
+}
+
+fn cmd_tools_sync(kernel: &mut Kernel) {
+    match crate::tools::sync(kernel) {
+        Ok(names) => {
+            crate::println!("tools: gateway offers {} tool(s):", names.len());
+            for n in names.iter() {
+                crate::println!("  tool:{}", n);
+            }
+        }
+        Err(e) => crate::println!("tools-sync: {}", e),
+    }
+}
+
+fn cmd_tools(kernel: &mut Kernel) {
+    let mut any = false;
+    kernel.for_each_object(|o| {
+        if o.kind.starts_with(crate::tools::KIND_PREFIX) {
+            any = true;
+            crate::println!("  {:<8} {}", o.id.as_str(), o.kind.as_str());
+        }
+    });
+    if !any {
+        crate::println!("tools: none registered (run link-secure, then tools-sync)");
     }
 }
 

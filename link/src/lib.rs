@@ -21,6 +21,7 @@
 extern crate alloc;
 
 pub mod secure;
+pub mod tool;
 
 pub const MAGIC: [u8; 4] = *b"CDK1";
 pub const MAX_PAYLOAD: usize = 1024;

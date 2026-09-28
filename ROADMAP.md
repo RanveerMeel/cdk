@@ -106,7 +106,7 @@ copies, address-space teardown. See `README.md` for the full list.
 |---|---|---|
 | 3.1 | **Host link.** virtio-console transport (port 0, polled split virtqueues; no host privileges, unlike vhost-vsock) with shared `cdk-link` framing (magic, length, CRC-32, resync) and a host gateway (`gateway/`); `link`, `link-ping`, `link-send`, `link-recv`. A vhost-vsock backend can follow where the host allows it. | ✅ |
 | 3.2 | **PQ-secure channel.** Hybrid X25519 + ML-KEM-768 key exchange (HKDF-SHA256 over the transcript); both sides sign the transcript with Ed25519 + ML-DSA-65 (`CDK-LINK-v1`); CDK pins the gateway identity from the ramdisk (`gateway.pub`); ChaCha20-Poly1305 with strictly ordered per-direction sequence numbers; `link-secure`, audit `link-secure` / `link-rejected`. | ✅ |
-| 3.3 | **MCP gateway:** agent tool calls leave CDK only through a policy check against the agent's capabilities, and every call is audit-logged. | ⬜ |
+| 3.3 | **MCP gateway.** Gateway tools become kernel objects `tool:<name>` (`tools-sync`); agents call them with `tool_call` (syscall 9) through a handle carrying `exec`, optionally approval-gated; calls go sealed over the 3.2 channel, the gateway runs MCP `tools/call` on its configured servers (stdio JSON-RPC, optional allowlist), and every call and result is audit-logged (`tool-call` with the arguments' SHA-256, `tool-result`). The agent blocks until the result or a 15 s timeout. | ✅ |
 | 3.4 | GPU inference through Linux-hosted model servers (vLLM, llama.cpp, TensorRT), gated by per-model capabilities. | ⬜ |
 | 3.5 | Distributed capabilities: tokens verifiable across CDK nodes via an issuer key registry. | ⬜ |
 

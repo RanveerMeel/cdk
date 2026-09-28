@@ -59,7 +59,14 @@ pub enum Outcome {
 /// register state (number in `rax`; arguments in `rdi`, `rsi`, `rdx`).
 #[no_mangle]
 pub extern "C" fn syscall_entry(frame: &mut crate::process::TrapFrame) {
-    match syscall_dispatch(frame.rax, frame.rdi, frame.rsi, frame.rdx) {
+    // Five-argument calls take their 4th/5th arguments from r10 and r8
+    // (the SysV syscall convention; rcx is clobbered by `syscall`).
+    let outcome = if frame.rax == crate::tools::SYS_TOOL_CALL {
+        crate::tools::sys_tool_call(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8)
+    } else {
+        syscall_dispatch(frame.rax, frame.rdi, frame.rsi, frame.rdx)
+    };
+    match outcome {
         Outcome::Return(v) => frame.rax = v,
         Outcome::Block => block_current(frame),
     }

@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 cdk-link = { path = "../link" }
 rand_core = { version = "0.6", features = ["getrandom"] }
+serde_json = "1"
 
 [profile.dev.package.ml-kem]
 opt-level = 3

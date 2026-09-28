@@ -10,9 +10,13 @@
 //!   signature, then opens and answers sealed messages. Once a session
 //!   exists, plaintext `DATA` is refused.
 //!
+//! * MCP gateway (3.3): sealed tool messages (`cdk_link::tool`) are
+//!   translated to MCP `tools/list` / `tools/call` on the configured stdio
+//!   MCP servers; an optional allowlist limits which tools CDK may reach.
+//!
 //! ```text
 //! cdk-gateway --init [--identity FILE] [--pub-out FILE]   create identity, export public key
-//! cdk-gateway [--identity FILE] [SOCKET]                  run (default target/cdk-link.sock)
+//! cdk-gateway [--identity FILE] [--mcp NAME=COMMAND]... [--allow t1,t2] [SOCKET]
 //! ```
 //! The public key file (1984 bytes) is packed into CDK's ramdisk as
 //! `gateway.pub`; CDK refuses any other gateway.
@@ -24,8 +28,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use cdk_link::secure::{self, hybrid, Reassembler, ServerState, Session};
+use cdk_link::tool::{self, Status};
 use cdk_link::{kind, Decoder, MAX_FRAME};
 use rand_core::{OsRng, RngCore};
+
+mod mcp;
 
 fn send(stream: &mut UnixStream, k: u8, flags: u8, payload: &[u8]) -> std::io::Result<()> {
     let mut buf = [0u8; MAX_FRAME];
@@ -84,6 +91,60 @@ fn load_identity(path: &Path) -> std::io::Result<hybrid::Keypair> {
     Ok(hybrid::Keypair::from_seeds(&ed, &ml))
 }
 
+/// Answer a sealed tool message from CDK.
+fn handle_tool(
+    msg: &[u8],
+    registry: &mut mcp::Registry,
+    allowed: &dyn Fn(&str) -> bool,
+) -> Vec<u8> {
+    match tool::decode(msg) {
+        Ok(tool::Message::ListRequest) => {
+            let names: Vec<String> = registry
+                .tool_names()
+                .into_iter()
+                .filter(|n| allowed(n))
+                .take(tool::MAX_TOOLS)
+                .collect();
+            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+            eprintln!("gateway: <- tools/list, -> {refs:?}");
+            tool::encode_list_response(&refs)
+                .unwrap_or_else(|_| tool::encode_list_response(&[]).unwrap())
+        }
+        Ok(tool::Message::CallRequest {
+            call_id,
+            name,
+            args,
+        }) => {
+            eprintln!(
+                "gateway: <- tools/call #{call_id} {name} {}",
+                printable(args)
+            );
+            let (status, body) = if !allowed(name) {
+                (
+                    Status::Refused,
+                    format!("tool {name} is not allowed by the gateway"),
+                )
+            } else {
+                match registry.call(name, args) {
+                    None => (
+                        Status::UnknownTool,
+                        format!("no MCP server provides {name}"),
+                    ),
+                    Some(mcp::CallOutcome::Ok(t)) => (Status::Ok, t),
+                    Some(mcp::CallOutcome::ToolError(t)) => (Status::ToolError, t),
+                    Some(mcp::CallOutcome::Failed(t)) => (Status::Unavailable, t),
+                }
+            };
+            eprintln!(
+                "gateway: -> #{call_id} {status:?} {}",
+                printable(body.as_bytes())
+            );
+            tool::encode_call_response(call_id, status, body.as_bytes())
+        }
+        _ => tool::encode_call_response(0, Status::ToolError, b"malformed tool message"),
+    }
+}
+
 fn connect(path: &str) -> std::io::Result<UnixStream> {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
@@ -100,6 +161,8 @@ struct Args {
     identity: PathBuf,
     pub_out: PathBuf,
     socket: String,
+    mcp: Vec<(String, String)>,
+    allow: Option<Vec<String>>,
 }
 
 fn args() -> Args {
@@ -108,6 +171,8 @@ fn args() -> Args {
         identity: PathBuf::from("target/gateway-identity.key"),
         pub_out: PathBuf::from("target/gateway.pub"),
         socket: "target/cdk-link.sock".to_string(),
+        mcp: Vec::new(),
+        allow: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(x) = it.next() {
@@ -115,6 +180,15 @@ fn args() -> Args {
             "--init" => a.init = true,
             "--identity" => a.identity = it.next().expect("--identity FILE").into(),
             "--pub-out" => a.pub_out = it.next().expect("--pub-out FILE").into(),
+            "--mcp" => {
+                let spec = it.next().expect("--mcp NAME=COMMAND");
+                let (name, cmd) = spec.split_once('=').expect("--mcp NAME=COMMAND");
+                a.mcp.push((name.to_string(), cmd.to_string()));
+            }
+            "--allow" => {
+                let list = it.next().expect("--allow tool1,tool2");
+                a.allow = Some(list.split(',').map(str::to_string).collect());
+            }
             s => a.socket = s.to_string(),
         }
     }
@@ -142,6 +216,17 @@ fn main() -> std::io::Result<()> {
     }
 
     eprintln!("gateway: identity {}", hex(&me.public().id()));
+    let mut registry = mcp::Registry::default();
+    for (name, cmd) in &a.mcp {
+        match mcp::Server::start(name, cmd) {
+            Ok(s) => {
+                eprintln!("gateway: MCP server {name}: tools {:?}", s.tools);
+                registry.add(s);
+            }
+            Err(e) => eprintln!("gateway: MCP server {name} failed: {e}"),
+        }
+    }
+    let allowed = |t: &str| a.allow.as_ref().is_none_or(|l| l.iter().any(|x| x == t));
     eprintln!("gateway: connecting to {}", a.socket);
     let mut stream = connect(&a.socket)?;
     eprintln!("gateway: connected");
@@ -245,6 +330,12 @@ fn main() -> std::io::Result<()> {
                         };
                         let mut plain = [0u8; cdk_link::MAX_PAYLOAD];
                         match s.open(&payload, &mut plain) {
+                            Ok(m) if plain[0] <= tool::LIST_RESPONSE && m > 0 => {
+                                let reply = handle_tool(&plain[..m], &mut registry, &allowed);
+                                let mut out = [0u8; cdk_link::MAX_PAYLOAD];
+                                let len = s.seal(&reply, &mut out).expect("tool reply fits");
+                                send(&mut stream, kind::SEALED, 0, &out[..len])?;
+                            }
                             Ok(m) => {
                                 let text = &plain[..m];
                                 eprintln!("gateway: <- SEALED \"{}\"", printable(text));
@@ -287,5 +378,81 @@ fn main() -> std::io::Result<()> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn demo_registry() -> mcp::Registry {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/demo_mcp_server.py");
+        let mut r = mcp::Registry::default();
+        r.add(
+            mcp::Server::start("demo", &format!("python3 {script}"))
+                .expect("start demo MCP server"),
+        );
+        r
+    }
+
+    fn call(
+        r: &mut mcp::Registry,
+        allowed: &dyn Fn(&str) -> bool,
+        name: &str,
+        args: &[u8],
+    ) -> (Status, String) {
+        let req = tool::encode_call_request(7, name, args).unwrap();
+        match tool::decode(&handle_tool(&req, r, allowed)).unwrap() {
+            tool::Message::CallResponse {
+                call_id,
+                status,
+                body,
+            } => {
+                assert_eq!(call_id, 7);
+                (status, String::from_utf8(body.to_vec()).unwrap())
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn allowlist_filters_listing_and_refuses_calls() {
+        let mut r = demo_registry();
+        let allowed = |t: &str| t == "echo";
+        let list = handle_tool(&tool::encode_list_request(), &mut r, &allowed);
+        match tool::decode(&list).unwrap() {
+            tool::Message::ListResponse(names) => {
+                assert_eq!(names.into_iter().collect::<Vec<&str>>(), ["echo"])
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(
+            call(&mut r, &allowed, "echo", br#"{"text":"hi"}"#),
+            (Status::Ok, "hi".into())
+        );
+        let (status, _) = call(&mut r, &allowed, "word_count", br#"{"text":"a b"}"#);
+        assert_eq!(status, Status::Refused);
+    }
+
+    #[test]
+    fn call_outcomes_map_to_statuses() {
+        let mut r = demo_registry();
+        let all = |_: &str| true;
+        assert_eq!(
+            call(&mut r, &all, "word_count", br#"{"text":"a b c"}"#),
+            (Status::Ok, "3".into())
+        );
+        assert_eq!(call(&mut r, &all, "nope", b"{}").0, Status::UnknownTool);
+        assert_eq!(
+            call(&mut r, &all, "sleep", br#"{"seconds":"x"}"#).0,
+            Status::ToolError
+        );
+        // Arguments that are not a JSON object are rejected before the server.
+        assert_eq!(call(&mut r, &all, "echo", b"not json").0, Status::ToolError);
+        // The server survives all of the above.
+        assert_eq!(
+            call(&mut r, &all, "echo", br#"{"text":"ok"}"#),
+            (Status::Ok, "ok".into())
+        );
     }
 }

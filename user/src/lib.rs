@@ -33,6 +33,7 @@ pub const SYS_CAP_DERIVE: u64 = 5;
 pub const SYS_SEND: u64 = 6;
 pub const SYS_RECV: u64 = 7;
 pub const SYS_GETPID: u64 = 8;
+pub const SYS_TOOL_CALL: u64 = 9;
 
 /// Permission bits in a capability mask (bit = kernel permission tag).
 pub mod perm {
@@ -65,6 +66,10 @@ pub enum Error {
     BadSignature,
     /// A human denied the action (approval-gated handle).
     HumanDenied,
+    /// No secure link to the gateway.
+    NoLink,
+    /// The tool call got no result in time.
+    TimedOut,
     /// Unrecognized error code.
     Other(u64),
 }
@@ -80,6 +85,8 @@ impl Error {
             6 => Error::NoSpace,
             7 => Error::BadSignature,
             8 => Error::HumanDenied,
+            9 => Error::NoLink,
+            10 => Error::TimedOut,
             c => Error::Other(c),
         }
     }
@@ -207,6 +214,69 @@ pub fn recv(handle: u32, buf: &mut [u8]) -> Result<usize, Error> {
         )
     };
     check(r).map(|n| n as usize)
+}
+
+#[inline]
+unsafe fn syscall5(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
+    let ret: u64;
+    core::arch::asm!(
+        "syscall",
+        inlateout("rax") nr => ret,
+        in("rdi") a0,
+        in("rsi") a1,
+        in("rdx") a2,
+        in("r10") a3,
+        in("r8") a4,
+        lateout("rcx") _,
+        lateout("r11") _,
+        clobber_abi("C"),
+        options(nostack),
+    );
+    ret
+}
+
+/// How a tool call ended (from the gateway / MCP server).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolStatus {
+    Ok,
+    /// The tool reported an error; the result text explains it.
+    ToolError,
+    UnknownTool,
+    /// The gateway's policy refused the call.
+    Refused,
+    /// The tool server failed or timed out.
+    Unavailable,
+    /// The result did not fit and was cut.
+    Truncated,
+    Other(u32),
+}
+
+/// Call the MCP tool behind `handle` (needs [`perm::EXEC`]) with JSON
+/// `args`; the result text is written to `out`. Blocks until the gateway
+/// answers (or a human decides, for approval-gated handles). Returns the
+/// status and the number of result bytes written.
+pub fn tool_call(handle: u32, args: &[u8], out: &mut [u8]) -> Result<(ToolStatus, usize), Error> {
+    let r = unsafe {
+        syscall5(
+            SYS_TOOL_CALL,
+            handle as u64,
+            args.as_ptr() as u64,
+            args.len() as u64,
+            out.as_mut_ptr() as u64,
+            out.len() as u64,
+        )
+    };
+    let v = check(r)?;
+    let status = match (v >> 32) as u32 {
+        0 => ToolStatus::Ok,
+        1 => ToolStatus::ToolError,
+        2 => ToolStatus::UnknownTool,
+        3 => ToolStatus::Refused,
+        4 => ToolStatus::Unavailable,
+        5 => ToolStatus::Truncated,
+        s => ToolStatus::Other(s),
+    };
+    Ok((status, (v & 0xffff_ffff) as usize))
 }
 
 /// This process's id.

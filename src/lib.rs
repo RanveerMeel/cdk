@@ -40,6 +40,7 @@ pub mod rng;
 pub mod scheduler;
 pub mod serial;
 pub mod syscall;
+pub mod tools;
 pub mod um;
 pub mod vga_buffer;
 pub mod virtio_console;
