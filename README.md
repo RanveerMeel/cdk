@@ -31,7 +31,7 @@ CDK is **open core**. This repository — the kernel, the capability model, the 
 
 **Agent Capability Handles** — Each process holds up to 16 capabilities in a kernel-side table and refers to them only by index, so tokens can't be forged, copied, or leaked. Syscalls `cap_list`, `cap_drop`, `cap_derive` (a new handle may only *drop* permissions, and is re-issued with hybrid post-quantum signatures), `send` and `recv` (to the handle's object). Every use is re-verified and permission-checked; grants, derivations, and denials land in the audit log. Demo agents: `agent` checks every rule, `intruder` (no grants) is blocked on all 19 attempts.
 
-**Host Link and Gateway** — `run_qemu.sh` attaches a virtio-console device backed by `target/cdk-link.sock`; in another terminal `tools/run_gateway.sh` starts the host gateway, which connects to it. Kernel and gateway share the `link/` crate (framing with CRC-32 and resync), so both sides are byte-identical. Try `link-ping`, `link-send hello`, `link-recv`. The link is plaintext today; the post-quantum secure channel (roadmap 3.2) runs on top of it.
+**Host Link and Gateway** — `run_qemu.sh` attaches a virtio-console device backed by `target/cdk-link.sock`; in another terminal `tools/run_gateway.sh` starts the host gateway, which connects to it. Kernel and gateway share the `link/` crate (framing with CRC-32 and resync), so both sides are byte-identical. Try `link-ping`, `link-send hello`, `link-recv`. Then `link-secure` runs the post-quantum handshake: hybrid X25519 + ML-KEM-768 key exchange, both sides sign the transcript with Ed25519 + ML-DSA-65, and CDK only accepts the gateway whose public key is pinned in the ramdisk (`run_qemu.sh` creates `target/gateway-identity.key` once and packs `target/gateway.pub`). After that every `link-send` is sealed with ChaCha20-Poly1305; replayed, reordered, or tampered frames are rejected, and the gateway refuses plaintext.
 
 **Human-Approval Gates** — Grant a handle with the `approval` constraint (`exec requester obj-2 send,approval`). Every `send` through it blocks the agent; the console shows who is asking, the target, and the exact payload (control characters escaped, so an agent can't forge console output), and the kernel performs the send only if the human answers `y`. Otherwise the agent gets `HumanDenied`. The constraint is part of the signed token and survives derivation; requests and decisions are audit-logged (`approval-asked`, `approval-yes`, `approval-no`).
 
@@ -206,7 +206,8 @@ cargo check --features virtio-hw
 | `link` | Host link status (bytes, frames, CRC errors) |
 | `link-ping` | Round-trip a `PING` through the host gateway |
 | `link-send <text>` | Send a `DATA` frame to the gateway (`link-send burst 50` asks it for a 50-frame test burst) |
-| `link-recv` | Show frames received from the gateway |
+| `link-recv` | Show frames received from the gateway (sealed ones are shown decrypted and marked authenticated) |
+| `link-secure` | Post-quantum handshake with the pinned gateway; afterwards all `link-send` traffic is sealed |
 | `capsign <id>` | Issue a hybrid post-quantum capability for an object and verify it |
 | `capverify <id>` | Show unsigned, forged, and escalated tokens being rejected |
 | `capbench <id> [n]` | Time *n* capability checks without and with the verified-proof cache |
@@ -309,6 +310,7 @@ The full plan — phases, milestones, and editions — is in [ROADMAP.md](ROADMA
 - [x] Native integer-only inference for agents (`cdk-ml`, `CDKLM1` models) with a public demo classifier — roadmap milestone 2.4
 - [x] Human-approval gates: approval-constrained capabilities block the agent until a person approves the exact payload — roadmap milestone 2.5
 - [x] Host link: virtio-console transport, shared framing crate, and a host gateway — roadmap milestone 3.1
+- [x] Post-quantum secure channel to the gateway: hybrid X25519 + ML-KEM-768, hybrid-signed transcript, pinned gateway identity, ChaCha20-Poly1305 — roadmap milestone 3.2
 - [x] Framebuffer text rendering (8×16 bitmap font, RGB/BGR/U8 pixel formats, auto-scroll)
 - [x] Network stack integration (loopback interfaces, capability-gated send/recv, object bridge routing, bindings, pump telemetry)
 - [x] External network transport (virtio-net MMIO bring-up path + non-loopback external interfaces via `eth0` default external backend and adapter-based transports)

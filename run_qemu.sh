@@ -33,7 +33,7 @@ if [[ "${CDK_VIRTIO_HW:-}" == "1" ]]; then
     FEATURES=(--features virtio-hw)
 fi
 
-RUSTFLAGS="${RUSTFLAGS:-} --cfg curve25519_dalek_backend=\"serial\"" \
+RUSTFLAGS="${RUSTFLAGS:-} --cfg curve25519_dalek_backend=\"serial\" --cfg poly1305_force_soft --cfg chacha20_force_soft" \
     cargo build --release --bin cdk "${FEATURES[@]}"
 
 # BIOS bootable raw image (bootloader 0.11)
@@ -47,6 +47,9 @@ if ! rustup toolchain list | grep -q '^nightly'; then
     echo "  rustup component add rust-src llvm-tools-preview --toolchain nightly"
     exit 1
 fi
+# Gateway identity (created once) whose public key CDK pins for the link.
+tools/run_gateway.sh --init
+
 # User programs (user/) packed into the boot ramdisk (ustar).
 echo "Building user programs..."
 RAMDISK="target/initrd.tar"

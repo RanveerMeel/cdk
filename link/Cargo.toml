@@ -2,9 +2,29 @@
 name = "cdk-link"
 version = "0.1.0"
 edition = "2021"
-description = "CDK <-> host link protocol: framing (and, later, the PQ-secure channel). no_std."
+description = "CDK <-> host link protocol: framing and the post-quantum secure channel. no_std + alloc."
 license = "Apache-2.0"
 publish = false
 
 [lib]
 path = "src/lib.rs"
+
+[dependencies]
+sha2 = { version = "0.10", default-features = false }
+hkdf = { version = "0.12", default-features = false }
+chacha20poly1305 = { version = "0.10", default-features = false }
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
+ml-kem = { version = "0.3.2", default-features = false }
+ml-dsa = { version = "0.1.1", default-features = false, features = ["alloc", "zeroize"] }
+ed25519-dalek = { version = "2.0", default-features = false, features = ["zeroize"] }
+zeroize = { version = "1.8", default-features = false }
+
+# ML-KEM / ML-DSA are slow unoptimized; keep tests quick.
+[profile.dev.package.ml-kem]
+opt-level = 3
+[profile.dev.package.ml-dsa]
+opt-level = 3
+[profile.dev.package.module-lattice]
+opt-level = 3
+[profile.dev.package.keccak]
+opt-level = 3

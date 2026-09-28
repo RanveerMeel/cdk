@@ -194,7 +194,21 @@ Switching only happens at ring-3 interrupt boundaries or when a syscall blocks (
 
 **Framing.** The `cdk-link` crate (`no_std`, shared with the gateway) frames the byte stream: `"CDK1" ‖ type ‖ flags ‖ len (≤ 1024) ‖ payload ‖ CRC-32`. The streaming decoder reassembles frames split across receive buffers and resyncs on the next magic after garbage, a bad CRC, or an impossible length. The CRC only detects corruption; confidentiality and authenticity come from the secure channel (roadmap 3.2).
 
-**Gateway.** `gateway/` is an ordinary Linux program (`tools/run_gateway.sh` builds it for the host target) that connects to the socket, logs `HELLO`, answers `PING` with `PONG`, and acknowledges `DATA`; `burst N` makes it send N near-maximum frames for link testing.
+**Secure channel (`link/src/secure.rs`, `CDK-LINK-v1`).**
+
+```
+CDK (client)                                      gateway (server)
+  CH = 1 ‖ nonce ‖ X25519_c ‖ ML-KEM-768 ek      ──►
+                                                 ◄──  SH = nonce ‖ X25519_s ‖ ML-KEM ct ‖ gateway id ‖ Sig_s
+  CF = CDK issuer id ‖ Sig_c                     ──►
+keys = HKDF-SHA256(salt = SHA-256("CDK-LINK-v1 keys" ‖ CH ‖ SH ‖ CF), ikm = X25519_ss ‖ ML-KEM_ss) → c2s, s2c
+```
+
+Signatures are hybrid Ed25519 + ML-DSA-65 with FIPS 204 context `CDK-LINK-v1` (the kernel signs with its issuer under `SigDomain::Link`), over `CH ‖ SH-without-sig` (gateway) and `CH ‖ SH ‖ CF-without-sig` (CDK). CDK accepts only the gateway identity pinned in the ramdisk file `gateway.pub`; the gateway checks CDK's signature and that its issuer matches the one announced in `HELLO`. Handshake messages (up to 6.5 KB) travel as `HANDSHAKE` fragments. Data frames are `SEALED`: `seq ‖ ChaCha20-Poly1305(ciphertext) ‖ tag`, nonce from `seq`, and each direction's `seq` must be exactly the next one, so replays, drops, and reordering are rejected. ML-KEM runs on the crypto stack; `link/` has host tests for the full handshake, an impostor (validly signing but unpinned) gateway, a forged client signature, tampering, replay, reordering, fragmentation, and an ML-KEM-768 known-answer test (IETF LAMPS example key).
+
+**Limits.** The pin is only as trustworthy as the boot image until measured boot (roadmap 4.2); CDK's issuer key is regenerated each boot, so the gateway can check consistency but not pin CDK across boots; before a session exists the console can still send plaintext `DATA` for debugging.
+
+**Gateway.** `gateway/` is an ordinary Linux program (`tools/run_gateway.sh` builds it for the host target) that connects to the socket, logs `HELLO`, answers `PING` with `PONG`, acknowledges `DATA`, and answers the handshake with its long-term identity (`target/gateway-identity.key`, mode 0600, created by `tools/run_gateway.sh --init`); with a session it answers sealed messages sealed and refuses plaintext `DATA`. `burst N` makes it send N near-maximum frames for link testing.
 
 ### Human-Approval Gates (`src/agent.rs`, `src/syscall.rs`, `src/process.rs`)
 

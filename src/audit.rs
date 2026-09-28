@@ -87,6 +87,10 @@ pub enum EventKind {
     ApprovalGranted = 15,
     /// A human denied request `detail`.
     ApprovalDenied = 16,
+    /// Secure link established. Subject `gateway:<id>`; `detail` = 1.
+    LinkEstablished = 17,
+    /// Secure link handshake failed. Subject `gateway`; `detail` = reason.
+    LinkRejected = 18,
 }
 
 impl EventKind {
@@ -108,6 +112,8 @@ impl EventKind {
             EventKind::ApprovalRequested => "approval-asked",
             EventKind::ApprovalGranted => "approval-yes",
             EventKind::ApprovalDenied => "approval-no",
+            EventKind::LinkEstablished => "link-secure",
+            EventKind::LinkRejected => "link-rejected",
         }
     }
 }

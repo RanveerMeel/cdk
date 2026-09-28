@@ -18,6 +18,10 @@
 
 #![no_std]
 
+extern crate alloc;
+
+pub mod secure;
+
 pub const MAGIC: [u8; 4] = *b"CDK1";
 pub const MAX_PAYLOAD: usize = 1024;
 const HEADER: usize = 8;
@@ -31,9 +35,16 @@ pub mod kind {
     /// Liveness probe; payload echoed in the `PONG`.
     pub const PING: u8 = 2;
     pub const PONG: u8 = 3;
-    /// Application data.
+    /// Application data (plaintext; only before a secure session exists).
     pub const DATA: u8 = 4;
+    /// Handshake message fragment; `flags` bit 0 = more fragments follow.
+    pub const HANDSHAKE: u8 = 5;
+    /// AEAD-sealed application data (see [`crate::secure::Session`]).
+    pub const SEALED: u8 = 6;
 }
+
+/// `flags` bit: more fragments of this message follow.
+pub const FLAG_MORE: u8 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameError {
@@ -56,6 +67,16 @@ pub fn crc32(data: &[u8]) -> u32 {
 
 /// Encode one frame into `out`; returns its length.
 pub fn encode(kind: u8, payload: &[u8], out: &mut [u8]) -> Result<usize, FrameError> {
+    encode_with_flags(kind, 0, payload, out)
+}
+
+/// [`encode`] with explicit flags.
+pub fn encode_with_flags(
+    kind: u8,
+    flags: u8,
+    payload: &[u8],
+    out: &mut [u8],
+) -> Result<usize, FrameError> {
     if payload.len() > MAX_PAYLOAD {
         return Err(FrameError::PayloadTooLarge);
     }
@@ -65,7 +86,7 @@ pub fn encode(kind: u8, payload: &[u8], out: &mut [u8]) -> Result<usize, FrameEr
     }
     out[..4].copy_from_slice(&MAGIC);
     out[4] = kind;
-    out[5] = 0;
+    out[5] = flags;
     out[6..8].copy_from_slice(&(payload.len() as u16).to_le_bytes());
     out[8..8 + payload.len()].copy_from_slice(payload);
     let crc = crc32(&out[4..8 + payload.len()]);

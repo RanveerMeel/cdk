@@ -42,6 +42,15 @@ if [ -n "${CDK_PRIVATE_PROGRAMS_DIR:-}" ]; then
     done
 fi
 
+# The gateway identity CDK pins for its secure link (see tools/run_gateway.sh
+# --init). Public key only; override with CDK_GATEWAY_PUB.
+GATEWAY_PUB="${CDK_GATEWAY_PUB:-$ROOT/target/gateway.pub}"
+if [ -f "$GATEWAY_PUB" ]; then
+    cp "$GATEWAY_PUB" "$STAGE/gateway.pub"
+else
+    echo "note: no $GATEWAY_PUB — the secure link will refuse to connect (run tools/run_gateway.sh --init)" >&2
+fi
+
 # Reproducible archive: fixed order, owner, and timestamps.
 (cd "$STAGE" && tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner \
     --mtime=@0 -cf "$OUT" -- *)

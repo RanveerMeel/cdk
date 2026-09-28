@@ -153,6 +153,7 @@ const COMMANDS: &[&str] = &[
     "link-ping",
     "link-send",
     "link-recv",
+    "link-secure",
     "capbench",
     "audit",
     "audit-verify",
@@ -636,8 +637,9 @@ fn dispatch(
         "issuer" => cmd_issuer(),
         "link" => cmd_link(),
         "link-ping" => cmd_link_ping(),
-        "link-send" => cmd_link_send(line.splitn(2, ' ').nth(1).unwrap_or("")),
+        "link-send" => cmd_link_send(line.split_once(' ').map_or("", |(_, rest)| rest)),
         "link-recv" => cmd_link_recv(),
+        "link-secure" => cmd_link_secure(),
         "capbench" => cmd_capbench(arg1, arg2, kernel),
         "audit" => cmd_audit(arg1),
         "audit-verify" => cmd_audit_verify(),
@@ -749,6 +751,7 @@ fn cmd_help() {
     crate::println!("  link-ping         Round-trip a PING through the host gateway");
     crate::println!("  link-send <text>  Send a DATA frame to the host gateway");
     crate::println!("  link-recv         Show frames received from the host gateway");
+    crate::println!("  link-secure       Post-quantum handshake with the pinned gateway; seal all traffic");
     crate::println!("  capbench <id> [n] Time n capability checks, uncached vs cached");
     crate::println!("  audit [n]         Show the last n audit records (default 12)");
     crate::println!("  audit-verify      Verify the audit hash chain and signed checkpoints");
@@ -1261,7 +1264,7 @@ fn cmd_capbench(id: &str, n_str: &str, kernel: &mut Kernel) {
         n,
         uncached / 1000,
         cached / 1000,
-        if cached > 0 { uncached / cached } else { 0 },
+        uncached.checked_div(cached).unwrap_or(0),
         if ok1 && ok2 { "" } else { "  (VERIFY FAILED)" }
     );
 }
@@ -1376,6 +1379,28 @@ fn cmd_link() {
         d.crc_errors,
         d.skipped
     );
+    match crate::link::gateway_id() {
+        Some(id) => {
+            crate::print!("      secure session with gateway ");
+            print_hex(&id);
+            crate::println!(" (X25519+ML-KEM-768, ChaCha20-Poly1305)");
+        }
+        None => crate::println!(
+            "      no secure session (pinned gateway: {})",
+            if crate::link::pinned_gateway().is_some() { "present" } else { "MISSING from ramdisk" }
+        ),
+    }
+}
+
+fn cmd_link_secure() {
+    match crate::link::secure_connect(5000) {
+        Ok(id) => {
+            crate::print!("link: SECURE — gateway ");
+            print_hex(&id);
+            crate::println!(" verified against the pinned key; X25519+ML-KEM-768 keys, ChaCha20-Poly1305");
+        }
+        Err(e) => crate::println!("link: handshake failed: {:?}", e),
+    }
 }
 
 fn print_link_frame(kind: u8, payload: &[u8]) {
@@ -1404,8 +1429,9 @@ fn cmd_link_send(text: &str) {
         crate::println!("Usage: link-send <text>");
         return;
     }
-    match crate::link::send(cdk_link::kind::DATA, text.as_bytes()) {
-        Ok(()) => crate::println!("link: sent {} bytes", text.len()),
+    match crate::link::send_data(text.as_bytes()) {
+        Ok(true) => crate::println!("link: sent {} bytes (sealed)", text.len()),
+        Ok(false) => crate::println!("link: sent {} bytes (plaintext — run link-secure)", text.len()),
         Err(e) => crate::println!("link: {}", e),
     }
 }
@@ -1416,7 +1442,24 @@ fn cmd_link_recv() {
     let start = crate::cpu::rdtsc();
     let (mut n, mut bytes, mut bad) = (0u64, 0u64, 0u64);
     while crate::cpu::rdtsc().wrapping_sub(start) < 1_000_000_000 {
-        crate::link::poll(|k, p| {
+        crate::link::recv(|m| {
+            let (k, p) = match m {
+                crate::link::Incoming::Plain(k, p) => (k, p),
+                crate::link::Incoming::Sealed(p) => {
+                    crate::print!("  <- SEALED, authenticated, {} B \"", p.len());
+                    crate::agent::write_sanitized(&p[..p.len().min(60)], |s| crate::print!("{}", s));
+                    crate::println!("{}\"", if p.len() > 60 { "…" } else { "" });
+                    n += 1;
+                    bytes += p.len() as u64;
+                    return;
+                }
+                crate::link::Incoming::Rejected(e) => {
+                    crate::println!("  <- SEALED frame REJECTED: {:?}", e);
+                    bad += 1;
+                    n += 1;
+                    return;
+                }
+            };
             let burst = p.starts_with(b"burst ");
             if burst {
                 // Pattern check: byte i (after the tag) is b'a' + i % 26.

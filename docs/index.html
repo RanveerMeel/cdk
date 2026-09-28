@@ -120,7 +120,7 @@
 │ hybrid PQ-signed capability tokens         │     │ inference servers     │
 │ policy + human-approval gates              │     │ MCP tool servers      │
 │ tamper-evident signed audit log            │     └───────────▲───────────┘
-│ PQ-secure channel X25519+ML-KEM   (planned)│◄── virtio-vsock ┘
+│ PQ-secure channel X25519+ML-KEM            │◄── virtio-console ┘
 └────────────────────────────────────────────┘</code></pre>
         </div>
       </section>
@@ -149,14 +149,14 @@
                 <li>Preemptive scheduling of agents with a CPU-budget watchdog for runaway agents</li>
                 <li>Native integer-only ML inference inside agents; the model's hash is in the audit trail</li>
                 <li>Human-approval gates: an agent waits until a person approves the exact action</li>
-                <li>Host link to Linux (virtio-console) with a gateway program on the host side</li>
+                <li>Host link to Linux with a post-quantum secure channel (X25519 + ML-KEM-768, hybrid-signed, pinned gateway)</li>
               </ul>
             </div>
             <div>
               <h3 class="status-head next">Next on the roadmap</h3>
               <ul class="checklist todo">
                 <li>Signed operator approvals; agents on every CPU</li>
-                <li>Hybrid X25519 + ML-KEM-768 encryption on the Linux link; MCP gateway</li>
+                <li>MCP gateway: agent tool calls through CDK's permission checks</li>
                 <li>Native CPU inference demo; ARM64 port</li>
               </ul>
             </div>
