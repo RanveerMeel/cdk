@@ -1,0 +1,10 @@
+[package]
+name = "cdk-link"
+version = "0.1.0"
+edition = "2021"
+description = "CDK <-> host link protocol: framing (and, later, the PQ-secure channel). no_std."
+license = "Apache-2.0"
+publish = false
+
+[lib]
+path = "src/lib.rs"

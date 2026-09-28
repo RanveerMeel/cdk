@@ -1,0 +1,10 @@
+[package]
+name = "cdk-gateway"
+version = "0.1.0"
+edition = "2021"
+description = "Host-side gateway for the CDK link (runs on Linux next to the CDK VM)"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+cdk-link = { path = "../link" }

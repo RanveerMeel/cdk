@@ -188,6 +188,14 @@ Each process carries a saved `TrapFrame` (15 general-purpose registers plus the 
 
 Switching only happens at ring-3 interrupt boundaries or when a syscall blocks (syscalls run with interrupts masked by `SFMASK`), so one kernel stack per CPU is enough and no kernel state is ever suspended mid-operation. User programs are soft-float, so no FPU state is switched yet (roadmap 2.6); all agents currently run on the console's CPU (roadmap 2.7), which is also what keeps `agent::with_kernel` sound.
 
+### Host Link (`src/virtio_console.rs`, `src/link.rs`, `link/`, `gateway/`)
+
+**Transport.** QEMU's `virtio-serial-pci` + `virtconsole` backed by a host Unix socket (`target/cdk-link.sock`); unlike vhost-vsock it needs no host privileges. The driver negotiates only `VIRTIO_F_VERSION_1` (no multiport), so port 0 is queue 0 (receive) and queue 1 (transmit). Rings and buffers are page-aligned statics that each fit in one page, so a single page-table lookup yields a DMA-able physical address. Four 1 KiB receive buffers stay posted and are recycled as they are drained; transmit is polled with a TSC timeout. No interrupts.
+
+**Framing.** The `cdk-link` crate (`no_std`, shared with the gateway) frames the byte stream: `"CDK1" ‖ type ‖ flags ‖ len (≤ 1024) ‖ payload ‖ CRC-32`. The streaming decoder reassembles frames split across receive buffers and resyncs on the next magic after garbage, a bad CRC, or an impossible length. The CRC only detects corruption; confidentiality and authenticity come from the secure channel (roadmap 3.2).
+
+**Gateway.** `gateway/` is an ordinary Linux program (`tools/run_gateway.sh` builds it for the host target) that connects to the socket, logs `HELLO`, answers `PING` with `PONG`, and acknowledges `DATA`; `burst N` makes it send N near-maximum frames for link testing.
+
 ### Human-Approval Gates (`src/agent.rs`, `src/syscall.rs`, `src/process.rs`)
 
 `Permission::RequiresApproval` (tag 7) is a *constraint* carried in the signed permission set: an agent can't strip it by forging, and `cap_derive` always carries it into the child (a child may add it but never drop it). `all` grants every right but not the constraint.

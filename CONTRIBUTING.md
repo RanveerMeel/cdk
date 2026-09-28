@@ -48,6 +48,7 @@ cargo check --features virtio-hw   # hardware probe paths
 cargo test-host                    # host unit tests
 tools/build_user_programs.sh       # user programs + ramdisk (user/)
 (cd user/ml && cargo test --target x86_64-unknown-linux-gnu)   # inference runtime
+(cd link && cargo test --target x86_64-unknown-linux-gnu)      # link protocol
 python3 tools/train_demo_model.py && git diff --exit-code user/models  # demo model is reproducible
 ./run_qemu.sh                      # boot and exercise your change at the cdk> prompt
 ```

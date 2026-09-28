@@ -87,6 +87,7 @@ version = "0.1.0"
 dependencies = [
  "bootimage",
  "bootloader_api",
+ "cdk-link",
  "ed25519-dalek",
  "heapless",
  "linked_list_allocator",
@@ -99,6 +100,10 @@ dependencies = [
  "x86_64",
  "zeroize",
 ]
+
+[[package]]
+name = "cdk-link"
+version = "0.1.0"
 
 [[package]]
 name = "cfg-if"

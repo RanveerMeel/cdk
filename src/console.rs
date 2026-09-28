@@ -149,6 +149,10 @@ const COMMANDS: &[&str] = &[
     "capsign",
     "capverify",
     "issuer",
+    "link",
+    "link-ping",
+    "link-send",
+    "link-recv",
     "capbench",
     "audit",
     "audit-verify",
@@ -630,6 +634,10 @@ fn dispatch(
         "capsign" => cmd_capsign(arg1, kernel),
         "capverify" => cmd_capverify(arg1, kernel),
         "issuer" => cmd_issuer(),
+        "link" => cmd_link(),
+        "link-ping" => cmd_link_ping(),
+        "link-send" => cmd_link_send(line.splitn(2, ' ').nth(1).unwrap_or("")),
+        "link-recv" => cmd_link_recv(),
         "capbench" => cmd_capbench(arg1, arg2, kernel),
         "audit" => cmd_audit(arg1),
         "audit-verify" => cmd_audit_verify(),
@@ -737,6 +745,10 @@ fn cmd_help() {
     crate::println!("  capsign <id>      Issue a hybrid PQ-signed capability for <id> and verify it");
     crate::println!("  capverify <id>    Show that unsigned, forged, and tampered tokens are rejected");
     crate::println!("  issuer            Show the kernel capability issuer (Ed25519+ML-DSA-65)");
+    crate::println!("  link              Host link (virtio-console) status");
+    crate::println!("  link-ping         Round-trip a PING through the host gateway");
+    crate::println!("  link-send <text>  Send a DATA frame to the host gateway");
+    crate::println!("  link-recv         Show frames received from the host gateway");
     crate::println!("  capbench <id> [n] Time n capability checks, uncached vs cached");
     crate::println!("  audit [n]         Show the last n audit records (default 12)");
     crate::println!("  audit-verify      Verify the audit hash chain and signed checkpoints");
@@ -1345,6 +1357,86 @@ fn cmd_audit_demo_tamper(seq_str: &str) {
         );
     } else {
         crate::println!("audit: record {} is not retained", seq);
+    }
+}
+
+fn cmd_link() {
+    if !crate::virtio_console::is_ready() {
+        crate::println!("link: no virtio-console device (run with the gateway socket)");
+        return;
+    }
+    let s = crate::virtio_console::stats();
+    let d = crate::link::decoder_stats();
+    crate::println!(
+        "link: virtio-console ready  tx={} B rx={} B tx_timeouts={}  frames={} crc_errors={} skipped={} B",
+        s.tx_bytes,
+        s.rx_bytes,
+        s.tx_timeouts,
+        d.frames,
+        d.crc_errors,
+        d.skipped
+    );
+}
+
+fn print_link_frame(kind: u8, payload: &[u8]) {
+    let name = match kind {
+        cdk_link::kind::HELLO => "HELLO",
+        cdk_link::kind::PING => "PING",
+        cdk_link::kind::PONG => "PONG",
+        cdk_link::kind::DATA => "DATA",
+        _ => "?",
+    };
+    crate::print!("  <- {} {} B \"", name, payload.len());
+    crate::agent::write_sanitized(&payload[..payload.len().min(60)], |s| crate::print!("{}", s));
+    crate::println!("{}\"", if payload.len() > 60 { "…" } else { "" });
+}
+
+fn cmd_link_ping() {
+    let nonce = crate::cpu::rdtsc();
+    match crate::link::ping(nonce, 3000, print_link_frame) {
+        Ok(cycles) => crate::println!("link: PONG in {} kcycles", cycles / 1000),
+        Err(e) => crate::println!("link: {}", e),
+    }
+}
+
+fn cmd_link_send(text: &str) {
+    if text.is_empty() {
+        crate::println!("Usage: link-send <text>");
+        return;
+    }
+    match crate::link::send(cdk_link::kind::DATA, text.as_bytes()) {
+        Ok(()) => crate::println!("link: sent {} bytes", text.len()),
+        Err(e) => crate::println!("link: {}", e),
+    }
+}
+
+fn cmd_link_recv() {
+    // Give the host a moment to answer anything just sent. Bursts are
+    // summarized: every frame is checked, only the first/last are shown.
+    let start = crate::cpu::rdtsc();
+    let (mut n, mut bytes, mut bad) = (0u64, 0u64, 0u64);
+    while crate::cpu::rdtsc().wrapping_sub(start) < 1_000_000_000 {
+        crate::link::poll(|k, p| {
+            let burst = p.starts_with(b"burst ");
+            if burst {
+                // Pattern check: byte i (after the tag) is b'a' + i % 26.
+                let ok = p.len() == 1000
+                    && p.iter().enumerate().skip(11).all(|(i, &b)| b == b'a' + (i % 26) as u8);
+                if !ok {
+                    bad += 1;
+                }
+            }
+            if !burst || n == 0 {
+                print_link_frame(k, p);
+            }
+            n += 1;
+            bytes += p.len() as u64;
+        });
+    }
+    if n == 0 {
+        crate::println!("link: no frames");
+    } else {
+        crate::println!("link: {} frame(s), {} B payload, {} corrupt", n, bytes, bad);
     }
 }
 

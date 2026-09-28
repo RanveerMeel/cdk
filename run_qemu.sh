@@ -73,12 +73,21 @@ SMP_ARGS=(-smp "${CDK_QEMU_SMP:-2}")
 # Virtio-gpu on the PCI bus (soft backend always works without it).
 GPU_ARGS=(-device virtio-gpu-pci)
 
+# Host link: virtio-console backed by a Unix socket. Run the gateway with
+# tools/run_gateway.sh in another terminal (it connects to this socket).
+LINK_SOCK="${CDK_LINK_SOCK:-$PWD/target/cdk-link.sock}"
+rm -f "$LINK_SOCK"
+LINK_ARGS=(-device virtio-serial-pci
+    -chardev "socket,id=cdklink,path=$LINK_SOCK,server=on,wait=off"
+    -device virtconsole,chardev=cdklink)
+
 qemu-system-x86_64 \
     -cpu max \
     -drive format=raw,file="$RUN_IMG",snapshot=on \
     -serial stdio \
     "${SMP_ARGS[@]}" \
     "${GPU_ARGS[@]}" \
+    "${LINK_ARGS[@]}" \
     "${DISPLAY_ARGS[@]}" \
     -no-reboot \
     -no-shutdown
