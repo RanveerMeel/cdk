@@ -1,4 +1,9 @@
-//! Agent tool calls through the host MCP gateway (roadmap 3.3).
+//! Agent tool calls through the host MCP gateway (roadmap 3.3), and model
+//! inference through Linux-hosted model servers (3.4).
+//!
+//! Model backends (`model:<name>`) are called exactly like tools; the
+//! gateway turns the call into an OpenAI-compatible chat completion and
+//! adds the backend's credential, which never enters CDK.
 //!
 //! Tools offered by the gateway's MCP servers become kernel objects of kind
 //! `tool:<name>` ([`sync`]). An agent can call a tool only through a
@@ -16,7 +21,8 @@
 //!
 //! Calls and results are audit-logged (`tool-call`, `tool-result`). The
 //! agent supplies the arguments as JSON bytes, which the kernel passes
-//! through without parsing.
+//! through without parsing. Results longer than one frame arrive as chunks
+//! and are copied into the agent's buffer as they come.
 
 use core::fmt::Write as _;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -38,10 +44,19 @@ pub const SYS_TOOL_CALL: u64 = 9;
 /// reported by the gateway (`Unavailable`) and this only fires if the
 /// gateway itself goes silent.
 pub const CALL_TIMEOUT_MS: u64 = 15_000;
+/// Time-out for model calls: longer than the gateway's model time-out (90 s).
+pub const MODEL_CALL_TIMEOUT_MS: u64 = 120_000;
 /// Largest result buffer an agent may pass.
-pub const MAX_RESULT: u64 = 4096;
+pub const MAX_RESULT: u64 = tool::MAX_RESULT as u64;
 /// Kind prefix of tool objects.
 pub const KIND_PREFIX: &str = "tool:";
+
+/// The name the gateway knows an object by: `tool:echo` → `echo`,
+/// `model:qwen` → `model:qwen`; `None` if the object is neither.
+pub fn wire_name(kind: &str) -> Option<&str> {
+    kind.strip_prefix(KIND_PREFIX)
+        .or_else(|| kind.starts_with(tool::MODEL_PREFIX).then_some(kind))
+}
 
 struct InFlight {
     call_id: u32,
@@ -51,6 +66,11 @@ struct InFlight {
     out_len: u64,
     pml4: u64,
     started: u64,
+    timeout_ms: u64,
+    /// Result bytes received so far (chunks).
+    received: usize,
+    /// A chunk could not be copied to the agent.
+    failed: bool,
 }
 
 static INFLIGHT: Mutex<heapless::Vec<InFlight, 8>> = Mutex::new(heapless::Vec::new());
@@ -85,7 +105,7 @@ pub fn sync(
                     }
                     names = Some(v);
                 }
-                Ok(Message::CallResponse { .. }) => deliver(p),
+                Ok(Message::CallResponse { .. } | Message::CallChunk { .. }) => deliver(p),
                 _ => {}
             }
         });
@@ -93,7 +113,12 @@ pub fn sync(
     let names = names.ok_or("gateway did not answer tools/list")?;
     for n in names.iter() {
         let mut kind: String<32> = String::new();
-        if write!(kind, "{KIND_PREFIX}{n}").is_err() {
+        let written = if n.starts_with(tool::MODEL_PREFIX) {
+            kind.push_str(n).map_err(|_| core::fmt::Error)
+        } else {
+            write!(kind, "{KIND_PREFIX}{n}")
+        };
+        if written.is_err() {
             continue; // name too long for an object kind
         }
         if kernel.resolve_object_ref(&kind).is_err() {
@@ -157,7 +182,7 @@ fn prepare(
     let tool_name = kernel
         .for_each_object_find(&cap.object_id)
         .and_then(|o| {
-            o.kind.strip_prefix(KIND_PREFIX).map(|n| {
+            wire_name(&o.kind).map(|n| {
                 let mut s: String<{ tool::MAX_NAME }> = String::new();
                 let _ = s.push_str(n);
                 s
@@ -219,6 +244,11 @@ pub fn dispatch(call: Call) -> Result<(), u64> {
         format_args!("pid-{}:call-{}:{}", call.pid, call_id, call.tool),
         u64::from_be_bytes(prefix),
     );
+    let timeout_ms = if call.tool.starts_with(tool::MODEL_PREFIX) {
+        MODEL_CALL_TIMEOUT_MS
+    } else {
+        CALL_TIMEOUT_MS
+    };
     let _ = INFLIGHT.lock().push(InFlight {
         call_id,
         pid: call.pid,
@@ -227,6 +257,9 @@ pub fn dispatch(call: Call) -> Result<(), u64> {
         out_len: call.out_len,
         pml4: call.pml4,
         started: crate::cpu::rdtsc(),
+        timeout_ms,
+        received: 0,
+        failed: false,
     });
     Ok(())
 }
@@ -237,20 +270,23 @@ pub fn poll() -> usize {
     let mut done = 0;
     crate::link::recv(|m| {
         if let crate::link::Incoming::Sealed(p) = m {
-            if matches!(tool::decode(p), Ok(Message::CallResponse { .. })) {
-                deliver(p);
-                done += 1;
+            match tool::decode(p) {
+                Ok(Message::CallResponse { .. }) => {
+                    deliver(p);
+                    done += 1;
+                }
+                Ok(Message::CallChunk { .. }) => deliver(p),
+                _ => {}
             }
         }
     });
     let now = crate::cpu::rdtsc();
-    let limit = CALL_TIMEOUT_MS * 2_000_000;
     loop {
         let expired = {
             let mut inflight = INFLIGHT.lock();
             let pos = inflight
                 .iter()
-                .position(|c| now.wrapping_sub(c.started) > limit);
+                .position(|c| now.wrapping_sub(c.started) > c.timeout_ms * 2_000_000);
             pos.map(|i| inflight.swap_remove(i))
         };
         let Some(c) = expired else {
@@ -274,38 +310,53 @@ pub fn wait_progress() {
     }
 }
 
+/// Handle a `CallChunk` (copy it at the current offset) or the final
+/// `CallResponse` (copy the rest, audit, and wake the agent).
 fn deliver(msg: &[u8]) {
-    let Ok(Message::CallResponse {
-        call_id,
-        status,
-        body,
-    }) = tool::decode(msg)
-    else {
-        return;
+    let (call_id, status, body) = match tool::decode(msg) {
+        Ok(Message::CallChunk { call_id, body }) => (call_id, None, body),
+        Ok(Message::CallResponse {
+            call_id,
+            status,
+            body,
+        }) => (call_id, Some(status), body),
+        _ => return,
     };
-    let call = {
-        let mut inflight = INFLIGHT.lock();
-        let Some(i) = inflight.iter().position(|c| c.call_id == call_id) else {
-            return; // unknown or already timed out
-        };
-        inflight.swap_remove(i)
+    let mut inflight = INFLIGHT.lock();
+    let Some(i) = inflight.iter().position(|c| c.call_id == call_id) else {
+        return; // unknown or already timed out
     };
-    let n = body.len().min(call.out_len as usize);
-    let tables = crate::paging::PageTableManager::from_pml4_phys(call.pml4);
-    let result = if n == 0 || tables.copy_to_user(call.out_ptr, &body[..n]).is_ok() {
-        let status = if n < body.len() && status == Status::Ok {
+    let c = &mut inflight[i];
+    let room = (c.out_len as usize).saturating_sub(c.received);
+    let n = body.len().min(room);
+    if n > 0 && !c.failed {
+        let tables = crate::paging::PageTableManager::from_pml4_phys(c.pml4);
+        c.failed = tables
+            .copy_to_user(c.out_ptr + c.received as u64, &body[..n])
+            .is_err();
+    }
+    c.received += body.len();
+    let Some(status) = status else {
+        return; // more to come
+    };
+    let call = inflight.swap_remove(i);
+    drop(inflight);
+
+    let copied = call.received.min(call.out_len as usize);
+    let result = if call.failed {
+        err(errno::EINVAL)
+    } else {
+        let status = if copied < call.received && status == Status::Ok {
             Status::Truncated
         } else {
             status
         };
-        ((status as u64) << 32) | n as u64
-    } else {
-        err(errno::EINVAL)
+        ((status as u64) << 32) | copied as u64
     };
     audit::record_fmt(
         EventKind::ToolResult,
         format_args!("pid-{}:call-{}:{}", call.pid, call_id, call.tool),
-        ((status as u64) << 32) | body.len() as u64,
+        ((status as u64) << 32) | call.received as u64,
     );
     crate::process::unblock(call.pid, result);
 }

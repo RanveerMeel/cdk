@@ -436,12 +436,20 @@ fn prompt_console(req: &Pending) -> bool {
             req.object(),
             req.handle
         ),
-        Action::Tool { tool, .. } => crate::println!(
-            "  action : call tool '{}' ({}, handle h{}) via the gateway",
-            tool,
-            req.object(),
-            req.handle
-        ),
+        Action::Tool { tool, .. } => match tool.strip_prefix(cdk_link::tool::MODEL_PREFIX) {
+            Some(model) => crate::println!(
+                "  action : prompt model '{}' ({}, handle h{}) via the gateway",
+                model,
+                req.object(),
+                req.handle
+            ),
+            None => crate::println!(
+                "  action : call tool '{}' ({}, handle h{}) via the gateway",
+                tool,
+                req.object(),
+                req.handle
+            ),
+        },
     }
     crate::print!("  data   : \"");
     write_sanitized(&req.payload, |s| crate::print!("{}", s));

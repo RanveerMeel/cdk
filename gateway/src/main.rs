@@ -13,10 +13,13 @@
 //! * MCP gateway (3.3): sealed tool messages (`cdk_link::tool`) are
 //!   translated to MCP `tools/list` / `tools/call` on the configured stdio
 //!   MCP servers; an optional allowlist limits which tools CDK may reach.
+//! * model backends (3.4): OpenAI-compatible model servers appear to CDK as
+//!   tools `model:<name>`; the gateway injects each backend's credential,
+//!   which CDK never sees (`models`). Long results are chunked.
 //!
 //! ```text
 //! cdk-gateway --init [--identity FILE] [--pub-out FILE]   create identity, export public key
-//! cdk-gateway [--identity FILE] [--mcp NAME=COMMAND]... [--allow t1,t2] [SOCKET]
+//! cdk-gateway [--identity FILE] [--mcp NAME=COMMAND]... [--model SPEC]... [--allow t1,t2] [SOCKET]
 //! ```
 //! The public key file (1984 bytes) is packed into CDK's ramdisk as
 //! `gateway.pub`; CDK refuses any other gateway.
@@ -33,6 +36,7 @@ use cdk_link::{kind, Decoder, MAX_FRAME};
 use rand_core::{OsRng, RngCore};
 
 mod mcp;
+mod models;
 
 fn send(stream: &mut UnixStream, k: u8, flags: u8, payload: &[u8]) -> std::io::Result<()> {
     let mut buf = [0u8; MAX_FRAME];
@@ -91,24 +95,27 @@ fn load_identity(path: &Path) -> std::io::Result<hybrid::Keypair> {
     Ok(hybrid::Keypair::from_seeds(&ed, &ml))
 }
 
-/// Answer a sealed tool message from CDK.
+/// Answer a sealed tool message from CDK; returns the reply messages
+/// (several when a long result is chunked).
 fn handle_tool(
     msg: &[u8],
     registry: &mut mcp::Registry,
+    models: &[models::Backend],
     allowed: &dyn Fn(&str) -> bool,
-) -> Vec<u8> {
+) -> Vec<Vec<u8>> {
     match tool::decode(msg) {
         Ok(tool::Message::ListRequest) => {
             let names: Vec<String> = registry
                 .tool_names()
                 .into_iter()
+                .chain(models.iter().map(models::Backend::tool_name))
                 .filter(|n| allowed(n))
                 .take(tool::MAX_TOOLS)
                 .collect();
             let refs: Vec<&str> = names.iter().map(String::as_str).collect();
             eprintln!("gateway: <- tools/list, -> {refs:?}");
-            tool::encode_list_response(&refs)
-                .unwrap_or_else(|_| tool::encode_list_response(&[]).unwrap())
+            vec![tool::encode_list_response(&refs)
+                .unwrap_or_else(|_| tool::encode_list_response(&[]).unwrap())]
         }
         Ok(tool::Message::CallRequest {
             call_id,
@@ -119,29 +126,42 @@ fn handle_tool(
                 "gateway: <- tools/call #{call_id} {name} {}",
                 printable(args)
             );
-            let (status, body) = if !allowed(name) {
-                (
+            let outcome = if !allowed(name) {
+                Err((
                     Status::Refused,
-                    format!("tool {name} is not allowed by the gateway"),
-                )
+                    format!("{name} is not allowed by the gateway"),
+                ))
+            } else if let Some(model) = name.strip_prefix(tool::MODEL_PREFIX) {
+                models
+                    .iter()
+                    .find(|m| m.name == model)
+                    .map(|b| b.call(args))
+                    .ok_or((Status::UnknownTool, format!("no model backend {model}")))
             } else {
-                match registry.call(name, args) {
-                    None => (
-                        Status::UnknownTool,
-                        format!("no MCP server provides {name}"),
-                    ),
-                    Some(mcp::CallOutcome::Ok(t)) => (Status::Ok, t),
-                    Some(mcp::CallOutcome::ToolError(t)) => (Status::ToolError, t),
-                    Some(mcp::CallOutcome::Failed(t)) => (Status::Unavailable, t),
-                }
+                registry.call(name, args).ok_or((
+                    Status::UnknownTool,
+                    format!("no MCP server provides {name}"),
+                ))
             };
+            let (status, body) = match outcome {
+                Err(e) => e,
+                Ok(mcp::CallOutcome::Ok(t)) => (Status::Ok, t),
+                Ok(mcp::CallOutcome::ToolError(t)) => (Status::ToolError, t),
+                Ok(mcp::CallOutcome::Failed(t)) => (Status::Unavailable, t),
+            };
+            let shown: String = body.chars().take(160).collect();
             eprintln!(
-                "gateway: -> #{call_id} {status:?} {}",
-                printable(body.as_bytes())
+                "gateway: -> #{call_id} {status:?} ({} B) {}",
+                body.len(),
+                printable(shown.as_bytes())
             );
-            tool::encode_call_response(call_id, status, body.as_bytes())
+            tool::encode_call_result(call_id, status, body.as_bytes())
         }
-        _ => tool::encode_call_response(0, Status::ToolError, b"malformed tool message"),
+        _ => vec![tool::encode_call_response(
+            0,
+            Status::ToolError,
+            b"malformed tool message",
+        )],
     }
 }
 
@@ -162,6 +182,7 @@ struct Args {
     pub_out: PathBuf,
     socket: String,
     mcp: Vec<(String, String)>,
+    models: Vec<String>,
     allow: Option<Vec<String>>,
 }
 
@@ -172,6 +193,7 @@ fn args() -> Args {
         pub_out: PathBuf::from("target/gateway.pub"),
         socket: "target/cdk-link.sock".to_string(),
         mcp: Vec::new(),
+        models: Vec::new(),
         allow: None,
     };
     let mut it = std::env::args().skip(1);
@@ -185,6 +207,9 @@ fn args() -> Args {
                 let (name, cmd) = spec.split_once('=').expect("--mcp NAME=COMMAND");
                 a.mcp.push((name.to_string(), cmd.to_string()));
             }
+            "--model" => a
+                .models
+                .push(it.next().expect("--model NAME=URL[,options]")),
             "--allow" => {
                 let list = it.next().expect("--allow tool1,tool2");
                 a.allow = Some(list.split(',').map(str::to_string).collect());
@@ -216,6 +241,22 @@ fn main() -> std::io::Result<()> {
     }
 
     eprintln!("gateway: identity {}", hex(&me.public().id()));
+    // Models first: `key-env` removes keys from the environment before any
+    // MCP server is started.
+    let mut backends = Vec::new();
+    for spec in &a.models {
+        match models::Backend::from_spec(spec) {
+            Ok(b) => {
+                eprintln!("gateway: model {}", b.describe());
+                backends.push(b);
+            }
+            Err(e) => {
+                let name = spec.split(',').next().unwrap_or("");
+                eprintln!("gateway: --model {name}: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
     let mut registry = mcp::Registry::default();
     for (name, cmd) in &a.mcp {
         match mcp::Server::start(name, cmd) {
@@ -331,10 +372,13 @@ fn main() -> std::io::Result<()> {
                         let mut plain = [0u8; cdk_link::MAX_PAYLOAD];
                         match s.open(&payload, &mut plain) {
                             Ok(m) if plain[0] <= tool::LIST_RESPONSE && m > 0 => {
-                                let reply = handle_tool(&plain[..m], &mut registry, &allowed);
-                                let mut out = [0u8; cdk_link::MAX_PAYLOAD];
-                                let len = s.seal(&reply, &mut out).expect("tool reply fits");
-                                send(&mut stream, kind::SEALED, 0, &out[..len])?;
+                                for reply in
+                                    handle_tool(&plain[..m], &mut registry, &backends, &allowed)
+                                {
+                                    let mut out = [0u8; cdk_link::MAX_PAYLOAD];
+                                    let len = s.seal(&reply, &mut out).expect("tool reply fits");
+                                    send(&mut stream, kind::SEALED, 0, &out[..len])?;
+                                }
                             }
                             Ok(m) => {
                                 let text = &plain[..m];
@@ -402,7 +446,7 @@ mod tests {
         args: &[u8],
     ) -> (Status, String) {
         let req = tool::encode_call_request(7, name, args).unwrap();
-        match tool::decode(&handle_tool(&req, r, allowed)).unwrap() {
+        match tool::decode(&handle_tool(&req, r, &[], allowed)[0]).unwrap() {
             tool::Message::CallResponse {
                 call_id,
                 status,
@@ -419,8 +463,8 @@ mod tests {
     fn allowlist_filters_listing_and_refuses_calls() {
         let mut r = demo_registry();
         let allowed = |t: &str| t == "echo";
-        let list = handle_tool(&tool::encode_list_request(), &mut r, &allowed);
-        match tool::decode(&list).unwrap() {
+        let list = handle_tool(&tool::encode_list_request(), &mut r, &[], &allowed);
+        match tool::decode(&list[0]).unwrap() {
             tool::Message::ListResponse(names) => {
                 assert_eq!(names.into_iter().collect::<Vec<&str>>(), ["echo"])
             }

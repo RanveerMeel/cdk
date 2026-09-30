@@ -1,4 +1,7 @@
-//! Tool-call messages between CDK and the gateway (roadmap 3.3).
+//! Tool-call messages between CDK and the gateway (roadmap 3.3, 3.4).
+//!
+//! Names are MCP tool names (`echo`) or model backends (`model:qwen`, 3.4);
+//! both are called the same way.
 //!
 //! Carried as plaintext *inside* sealed frames (the secure channel provides
 //! confidentiality and integrity). The gateway translates them to MCP
@@ -9,8 +12,14 @@
 //! ListRequest  : 3
 //! ListResponse : 4 | count u8 | (len u8 | name)*
 //! CallRequest  : 1 | call_id u32 | len u8 | name | args_len u16 | args (JSON bytes, passed through)
+//! CallChunk    : 5 | call_id u32 | len u16 | body
 //! CallResponse : 2 | call_id u32 | status u8 | len u16 | body (UTF-8 text)
 //! ```
+//!
+//! A result longer than one frame is sent as `CallChunk`s followed by the
+//! final `CallResponse` ([`encode_call_result`]); the body is their
+//! concatenation. The sealed channel is strictly ordered, so chunks cannot
+//! be reordered or dropped undetected.
 
 use alloc::vec::Vec;
 
@@ -18,11 +27,17 @@ pub const LIST_REQUEST: u8 = 3;
 pub const LIST_RESPONSE: u8 = 4;
 pub const CALL_REQUEST: u8 = 1;
 pub const CALL_RESPONSE: u8 = 2;
+pub const CALL_CHUNK: u8 = 5;
 
 /// Longest tool name.
 pub const MAX_NAME: usize = 48;
 /// Largest `args` / `body` that fits a sealed frame with its header.
 pub const MAX_BODY: usize = crate::secure::MAX_PLAINTEXT - 8 - MAX_NAME;
+/// Largest complete result (all chunks); longer results are cut and
+/// marked [`Status::Truncated`].
+pub const MAX_RESULT: usize = 16 * 1024;
+/// Name prefix of model backends.
+pub const MODEL_PREFIX: &str = "model:";
 /// Tools listed at most.
 pub const MAX_TOOLS: usize = 16;
 
@@ -38,7 +53,7 @@ pub enum Status {
     Refused = 3,
     /// The tool server failed or timed out.
     Unavailable = 4,
-    /// The result was cut to fit [`MAX_BODY`].
+    /// The result was cut to fit (the buffer, or [`MAX_RESULT`]).
     Truncated = 5,
 }
 
@@ -76,13 +91,19 @@ pub enum Message<'a> {
         status: Status,
         body: &'a [u8],
     },
+    /// A leading part of a result; the final [`Message::CallResponse`]
+    /// follows.
+    CallChunk {
+        call_id: u32,
+        body: &'a [u8],
+    },
 }
 
 fn valid_name(n: &str) -> bool {
     !n.is_empty()
         && n.len() <= MAX_NAME
         && n.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"._-/".contains(&b))
+            .all(|b| b.is_ascii_alphanumeric() || b"._-/:".contains(&b))
 }
 
 pub fn encode_list_request() -> Vec<u8> {
@@ -130,6 +151,31 @@ pub fn encode_call_response(call_id: u32, mut status: Status, body: &[u8]) -> Ve
     out.push(status as u8);
     out.extend_from_slice(&(body.len() as u16).to_le_bytes());
     out.extend_from_slice(body);
+    out
+}
+
+/// Encode a result of any length (up to [`MAX_RESULT`]) as `CallChunk`s
+/// and a final `CallResponse`.
+pub fn encode_call_result(call_id: u32, mut status: Status, body: &[u8]) -> Vec<Vec<u8>> {
+    let body = if body.len() > MAX_RESULT {
+        if status == Status::Ok {
+            status = Status::Truncated;
+        }
+        &body[..MAX_RESULT]
+    } else {
+        body
+    };
+    let mut parts: Vec<&[u8]> = body.chunks(MAX_BODY).collect();
+    let last = parts.pop().unwrap_or(&[]);
+    let mut out = Vec::new();
+    for p in parts {
+        let mut m = alloc::vec![CALL_CHUNK];
+        m.extend_from_slice(&call_id.to_le_bytes());
+        m.extend_from_slice(&(p.len() as u16).to_le_bytes());
+        m.extend_from_slice(p);
+        out.push(m);
+    }
+    out.push(encode_call_response(call_id, status, last));
     out
 }
 
@@ -204,6 +250,16 @@ pub fn decode(b: &[u8]) -> Result<Message<'_>, ToolMsgError> {
                 body,
             })
         }
+        CALL_CHUNK => {
+            let call_id = u32_at(rest)?;
+            let r = &rest[4..];
+            let blen = u16_at(r)?;
+            let body = r.get(2..2 + blen).ok_or(bad)?;
+            if r.len() != 2 + blen || blen > MAX_BODY {
+                return Err(bad);
+            }
+            Ok(Message::CallChunk { call_id, body })
+        }
         _ => Err(bad),
     }
 }
@@ -264,6 +320,49 @@ mod tests {
     }
 
     #[test]
+    fn long_results_are_chunked_and_capped() {
+        let body: Vec<u8> = (0..3 * MAX_BODY + 7)
+            .map(|i| b'a' + (i % 26) as u8)
+            .collect();
+        let msgs = encode_call_result(9, Status::Ok, &body);
+        assert_eq!(msgs.len(), 4);
+        let mut got = Vec::new();
+        for (i, m) in msgs.iter().enumerate() {
+            assert!(m.len() <= crate::secure::MAX_PLAINTEXT);
+            match decode(m).unwrap() {
+                Message::CallChunk { call_id: 9, body } if i < 3 => got.extend_from_slice(body),
+                Message::CallResponse {
+                    call_id: 9,
+                    status: Status::Ok,
+                    body,
+                } if i == 3 => got.extend_from_slice(body),
+                other => panic!("{i}: {other:?}"),
+            }
+        }
+        assert_eq!(got, body);
+
+        let msgs = encode_call_result(1, Status::Ok, &[b'z'; MAX_RESULT + 1]);
+        let total: usize = msgs
+            .iter()
+            .map(|m| match decode(m).unwrap() {
+                Message::CallChunk { body, .. } | Message::CallResponse { body, .. } => body.len(),
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(total, MAX_RESULT);
+        assert!(matches!(
+            decode(msgs.last().unwrap()),
+            Ok(Message::CallResponse {
+                status: Status::Truncated,
+                ..
+            })
+        ));
+        // Short and empty results are a single response.
+        assert_eq!(encode_call_result(2, Status::Ok, b"").len(), 1);
+        assert!(encode_list_response(&["model:qwen2.5"]).is_ok());
+    }
+
+    #[test]
     fn malformed_messages_are_rejected() {
         for b in [
             &[][..],
@@ -273,6 +372,7 @@ mod tests {
             &[CALL_REQUEST, 1, 0, 0, 0, 4, b'e', b'c', b'h', b'o', 9, 0][..],
             &[CALL_RESPONSE, 1, 0, 0, 0, 77, 0, 0][..],
             &[CALL_RESPONSE, 1, 0, 0, 0, 0, 3, 0, b'a'][..],
+            &[CALL_CHUNK, 1, 0, 0, 0, 2, 0, b'a'][..],
         ] {
             assert_eq!(decode(b), Err(ToolMsgError::Malformed), "{b:?}");
         }

@@ -279,6 +279,93 @@ pub fn tool_call(handle: u32, args: &[u8], out: &mut [u8]) -> Result<(ToolStatus
     Ok((status, (v & 0xffff_ffff) as usize))
 }
 
+/// Largest JSON argument block the kernel accepts for one call.
+pub const MAX_ARGS: usize = 900;
+
+/// Ask the model behind `handle` (a `model:<name>` object; needs
+/// [`perm::EXEC`]). Builds `{"prompt":…,"system":…,"max_tokens":…}` and calls
+/// it like a tool; the gateway runs the model and adds any credential, which
+/// the agent never sees. Returns [`Error::Invalid`] if the escaped request
+/// exceeds [`MAX_ARGS`].
+pub fn ask_model(
+    handle: u32,
+    system: Option<&str>,
+    prompt: &str,
+    max_tokens: u32,
+    out: &mut [u8],
+) -> Result<(ToolStatus, usize), Error> {
+    let mut buf = [0u8; MAX_ARGS];
+    let mut w = JsonWriter {
+        buf: &mut buf,
+        len: 0,
+        overflow: false,
+    };
+    w.raw("{\"prompt\":");
+    w.string(prompt);
+    if let Some(s) = system {
+        w.raw(",\"system\":");
+        w.string(s);
+    }
+    let _ = core::fmt::Write::write_fmt(&mut w, format_args!(",\"max_tokens\":{}}}", max_tokens));
+    if w.overflow {
+        return Err(Error::Invalid);
+    }
+    let len = w.len;
+    tool_call(handle, &buf[..len], out)
+}
+
+struct JsonWriter<'a> {
+    buf: &'a mut [u8],
+    len: usize,
+    overflow: bool,
+}
+
+impl JsonWriter<'_> {
+    fn raw(&mut self, s: &str) {
+        for &b in s.as_bytes() {
+            self.byte(b);
+        }
+    }
+
+    fn byte(&mut self, b: u8) {
+        match self.buf.get_mut(self.len) {
+            Some(slot) => {
+                *slot = b;
+                self.len += 1;
+            }
+            None => self.overflow = true,
+        }
+    }
+
+    /// A JSON string literal; control characters, `"` and `\\` escaped.
+    fn string(&mut self, s: &str) {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        self.byte(b'"');
+        for &b in s.as_bytes() {
+            match b {
+                b'"' | b'\\' => {
+                    self.byte(b'\\');
+                    self.byte(b);
+                }
+                0..=0x1f => {
+                    self.raw("\\u00");
+                    self.byte(HEX[(b >> 4) as usize]);
+                    self.byte(HEX[(b & 15) as usize]);
+                }
+                _ => self.byte(b),
+            }
+        }
+        self.byte(b'"');
+    }
+}
+
+impl core::fmt::Write for JsonWriter<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        self.raw(s);
+        Ok(())
+    }
+}
+
 /// This process's id.
 pub fn getpid() -> u32 {
     unsafe { syscall3(SYS_GETPID, 0, 0, 0) as u32 }

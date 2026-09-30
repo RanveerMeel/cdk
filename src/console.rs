@@ -1412,7 +1412,11 @@ fn cmd_tools_sync(kernel: &mut Kernel) {
         Ok(names) => {
             crate::println!("tools: gateway offers {} tool(s):", names.len());
             for n in names.iter() {
-                crate::println!("  tool:{}", n);
+                if n.starts_with(cdk_link::tool::MODEL_PREFIX) {
+                    crate::println!("  {}", n);
+                } else {
+                    crate::println!("  {}{}", crate::tools::KIND_PREFIX, n);
+                }
             }
         }
         Err(e) => crate::println!("tools-sync: {}", e),
@@ -1422,7 +1426,7 @@ fn cmd_tools_sync(kernel: &mut Kernel) {
 fn cmd_tools(kernel: &mut Kernel) {
     let mut any = false;
     kernel.for_each_object(|o| {
-        if o.kind.starts_with(crate::tools::KIND_PREFIX) {
+        if crate::tools::wire_name(&o.kind).is_some() {
             any = true;
             crate::println!("  {:<8} {}", o.id.as_str(), o.kind.as_str());
         }
