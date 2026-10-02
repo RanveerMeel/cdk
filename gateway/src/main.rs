@@ -166,7 +166,7 @@ fn handle_tool(
 }
 
 fn connect(path: &str) -> std::io::Result<UnixStream> {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_secs(60); // CDK may still be booting
     loop {
         match UnixStream::connect(path) {
             Ok(s) => return Ok(s),
@@ -268,8 +268,21 @@ fn main() -> std::io::Result<()> {
         }
     }
     let allowed = |t: &str| a.allow.as_ref().is_none_or(|l| l.iter().any(|x| x == t));
-    eprintln!("gateway: connecting to {}", a.socket);
-    let mut stream = connect(&a.socket)?;
+    eprintln!(
+        "gateway: connecting to {} (waiting up to 60 s for CDK)",
+        a.socket
+    );
+    let mut stream = match connect(&a.socket) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "gateway: cannot connect to the CDK link socket {} ({e})\n\
+                 gateway: start CDK first (./run_qemu.sh), then the gateway",
+                a.socket
+            );
+            std::process::exit(1);
+        }
+    };
     eprintln!("gateway: connected");
     send(&mut stream, kind::HELLO, 0, b"cdk-gateway 0.2")?;
 
