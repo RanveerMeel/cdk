@@ -99,15 +99,16 @@ copies, address-space teardown. See `README.md` for the full list.
 | 2.8 | Approver identity: decisions signed by an operator key (hardware token / second device), multi-party approval, time-outs, and gating of more effect types than `send`. | ⬜ |
 | 2.6 | Per-process FPU/SSE/AVX state (`XSAVE`) so agents can run vectorized code; today user programs are soft-float. | ⬜ |
 | 2.7 | Agents on every CPU: per-CPU run queues and proper kernel locking in place of the console lending its kernel reference to syscalls. | ⬜ |
+| 2.9 | **Policy change review.** Before a grant, derivation, or gateway policy change (allowlist, new tool, model, or credential) takes effect, CDK computes what new reach it adds — which agents gain which tools, models, hosts, or credential-bearing endpoints — shows it as a reviewable diff, and requires an operator approval (signed, with 2.8). Later: machine-checked policy invariants (e.g. "no agent holding customer data can reach a network tool") verified on every change. | ⬜ |
 
 ### Phase 3 — Connected agents
 
 | # | Milestone | Status |
 |---|---|---|
-| 3.1 | virtio-vsock transport to a Linux host / VM. | ⬜ |
-| 3.2 | **PQ-secure channel:** hybrid X25519 + ML-KEM-768 handshake, authenticated with hybrid issuer signatures, then AEAD (ChaCha20-Poly1305 / AES-256-GCM). | ⬜ |
-| 3.3 | **MCP gateway:** agent tool calls leave CDK only through a policy check against the agent's capabilities, and every call is audit-logged. | ⬜ |
-| 3.4 | GPU inference through Linux-hosted model servers (vLLM, llama.cpp, TensorRT), gated by per-model capabilities. | ⬜ |
+| 3.1 | **Host link.** virtio-console transport (port 0, polled split virtqueues; no host privileges, unlike vhost-vsock) with shared `cdk-link` framing (magic, length, CRC-32, resync) and a host gateway (`gateway/`); `link`, `link-ping`, `link-send`, `link-recv`. A vhost-vsock backend can follow where the host allows it. | ✅ |
+| 3.2 | **PQ-secure channel.** Hybrid X25519 + ML-KEM-768 key exchange (HKDF-SHA256 over the transcript); both sides sign the transcript with Ed25519 + ML-DSA-65 (`CDK-LINK-v1`); CDK pins the gateway identity from the ramdisk (`gateway.pub`); ChaCha20-Poly1305 with strictly ordered per-direction sequence numbers; `link-secure`, audit `link-secure` / `link-rejected`. | ✅ |
+| 3.3 | **MCP gateway.** Gateway tools become kernel objects `tool:<name>` (`tools-sync`); agents call them with `tool_call` (syscall 9) through a handle carrying `exec`, optionally approval-gated; calls go sealed over the 3.2 channel, the gateway runs MCP `tools/call` on its configured servers (stdio JSON-RPC, optional allowlist), and every call and result is audit-logged (`tool-call` with the arguments' SHA-256, `tool-result`). The agent blocks until the result or a 15 s timeout. | ✅ |
+| 3.4 | **Model inference through Linux-hosted model servers, with credential injection.** Gateway model backends (`--model NAME=URL,...`, any OpenAI-compatible server: vLLM, llama.cpp, Ollama, TensorRT-LLM, or a remote API) appear as kernel objects `model:<name>`, granted per model with `exec` and optionally approval-gated; agents call them with `tool_call` (`ask_model` in the user library). The gateway holds each backend's key (0600 file or env var, removed from the environment, wiped on drop) and adds it only to that backend's own URL: no redirects, no proxy, no key over plaintext http to non-loopback hosts, keys scrubbed from anything returned. Agents and the kernel never see credentials. Long results arrive as chunks (≤ 16 KiB); model calls time out after 90 s (gateway) / 120 s (kernel). GPUs stay with the Linux host's drivers. | ✅ |
 | 3.5 | Distributed capabilities: tokens verifiable across CDK nodes via an issuer key registry. | ⬜ |
 
 ### Phase 4 — Hardening and platforms

@@ -87,6 +87,16 @@ pub enum EventKind {
     ApprovalGranted = 15,
     /// A human denied request `detail`.
     ApprovalDenied = 16,
+    /// Secure link established. Subject `gateway:<id>`; `detail` = 1.
+    LinkEstablished = 17,
+    /// Secure link handshake failed. Subject `gateway`; `detail` = reason.
+    LinkRejected = 18,
+    /// An agent's tool call was sent to the gateway. Subject
+    /// `pid-N:call-C:tool`; `detail` = first 8 bytes of SHA-256(args).
+    ToolCall = 19,
+    /// A tool call finished. `detail` = status << 32 | result length
+    /// (`u64::MAX` = timed out).
+    ToolResult = 20,
 }
 
 impl EventKind {
@@ -108,6 +118,10 @@ impl EventKind {
             EventKind::ApprovalRequested => "approval-asked",
             EventKind::ApprovalGranted => "approval-yes",
             EventKind::ApprovalDenied => "approval-no",
+            EventKind::LinkEstablished => "link-secure",
+            EventKind::LinkRejected => "link-rejected",
+            EventKind::ToolCall => "tool-call",
+            EventKind::ToolResult => "tool-result",
         }
     }
 }

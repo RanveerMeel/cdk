@@ -50,6 +50,9 @@ sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
 ml-dsa = { version = "0.1.1", default-features = false, features = ["alloc", "zeroize"] }
 zeroize = { version = "1.8", default-features = false }
 
+# CDK <-> host link protocol, shared with the host gateway (gateway/).
+cdk-link = { path = "link" }
+
 # rand_core on host includes getrandom (OsRng); bare-metal uses traits only.
 [target.'cfg(not(target_os = "none"))'.dependencies]
 rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }

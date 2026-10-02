@@ -662,6 +662,10 @@ pub fn run_scheduled(which: Select) -> Result<Vec<(u32, ExitStatus), MAX_PROCESS
         if crate::agent::has_pending() {
             crate::agent::resolve_approvals();
         }
+        // Deliver any tool results that have arrived.
+        if crate::tools::has_inflight() {
+            crate::tools::poll();
+        }
         let next = TABLE.lock().dispatch_next();
         let Some(proc) = next else {
             // Nothing runnable. Processes waiting on a human get their
@@ -672,6 +676,11 @@ pub fn run_scheduled(which: Select) -> Result<Vec<(u32, ExitStatus), MAX_PROCESS
                 break;
             }
             crate::agent::resolve_approvals();
+            if crate::tools::has_inflight() {
+                // Agents waiting on tool results: wait for one to finish.
+                crate::tools::wait_progress();
+                continue;
+            }
             for pid in TABLE.lock().blocked_scheduled() {
                 unblock(pid, crate::agent::err(crate::agent::errno::EDENIED));
             }
@@ -759,6 +768,12 @@ pub fn block_current(frame: &TrapFrame) {
 /// Resume a `Blocked` process with `result` as its syscall return value.
 pub fn unblock(pid: u32, result: u64) -> bool {
     TABLE.lock().unblock(pid, result)
+}
+
+/// Page-table root of process `pid`, if it exists.
+pub fn pml4_of(pid: u32) -> Option<u64> {
+    let t = TABLE.lock();
+    t.find(pid).map(|i| t.slots[i].pml4_phys)
 }
 
 /// Name of process `pid`, if it exists.

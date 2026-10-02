@@ -48,5 +48,14 @@ jobs:
       - name: Inference runtime tests
         run: cd user/ml && cargo test --target x86_64-unknown-linux-gnu
 
+      - name: Link protocol tests
+        run: cd link && cargo test --target x86_64-unknown-linux-gnu
+
+      - name: Host gateway tests (runs the demo MCP server)
+        run: cd gateway && cargo test --target x86_64-unknown-linux-gnu
+
+      - name: Demo MCP and model servers compile
+        run: python3 -m py_compile gateway/examples/demo_mcp_server.py gateway/examples/demo_model_server.py
+
       - name: Demo model is reproducible
         run: python3 tools/train_demo_model.py && git diff --exit-code user/models

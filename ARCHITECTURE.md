@@ -188,6 +188,46 @@ Each process carries a saved `TrapFrame` (15 general-purpose registers plus the 
 
 Switching only happens at ring-3 interrupt boundaries or when a syscall blocks (syscalls run with interrupts masked by `SFMASK`), so one kernel stack per CPU is enough and no kernel state is ever suspended mid-operation. User programs are soft-float, so no FPU state is switched yet (roadmap 2.6); all agents currently run on the console's CPU (roadmap 2.7), which is also what keeps `agent::with_kernel` sound.
 
+### Host Link (`src/virtio_console.rs`, `src/link.rs`, `link/`, `gateway/`)
+
+**Transport.** QEMU's `virtio-serial-pci` + `virtconsole` backed by a host Unix socket (`target/cdk-link.sock`); unlike vhost-vsock it needs no host privileges. The driver negotiates only `VIRTIO_F_VERSION_1` (no multiport), so port 0 is queue 0 (receive) and queue 1 (transmit). Rings and buffers are page-aligned statics that each fit in one page, so a single page-table lookup yields a DMA-able physical address. Four 1 KiB receive buffers stay posted and are recycled as they are drained; transmit is polled with a TSC timeout. No interrupts.
+
+**Framing.** The `cdk-link` crate (`no_std`, shared with the gateway) frames the byte stream: `"CDK1" ‖ type ‖ flags ‖ len (≤ 1024) ‖ payload ‖ CRC-32`. The streaming decoder reassembles frames split across receive buffers and resyncs on the next magic after garbage, a bad CRC, or an impossible length. The CRC only detects corruption; confidentiality and authenticity come from the secure channel (roadmap 3.2).
+
+**Secure channel (`link/src/secure.rs`, `CDK-LINK-v1`).**
+
+```
+CDK (client)                                      gateway (server)
+  CH = 1 ‖ nonce ‖ X25519_c ‖ ML-KEM-768 ek      ──►
+                                                 ◄──  SH = nonce ‖ X25519_s ‖ ML-KEM ct ‖ gateway id ‖ Sig_s
+  CF = CDK issuer id ‖ Sig_c                     ──►
+keys = HKDF-SHA256(salt = SHA-256("CDK-LINK-v1 keys" ‖ CH ‖ SH ‖ CF), ikm = X25519_ss ‖ ML-KEM_ss) → c2s, s2c
+```
+
+Signatures are hybrid Ed25519 + ML-DSA-65 with FIPS 204 context `CDK-LINK-v1` (the kernel signs with its issuer under `SigDomain::Link`), over `CH ‖ SH-without-sig` (gateway) and `CH ‖ SH ‖ CF-without-sig` (CDK). CDK accepts only the gateway identity pinned in the ramdisk file `gateway.pub`; the gateway checks CDK's signature and that its issuer matches the one announced in `HELLO`. Handshake messages (up to 6.5 KB) travel as `HANDSHAKE` fragments. Data frames are `SEALED`: `seq ‖ ChaCha20-Poly1305(ciphertext) ‖ tag`, nonce from `seq`, and each direction's `seq` must be exactly the next one, so replays, drops, and reordering are rejected. ML-KEM runs on the crypto stack; `link/` has host tests for the full handshake, an impostor (validly signing but unpinned) gateway, a forged client signature, tampering, replay, reordering, fragmentation, and an ML-KEM-768 known-answer test (IETF LAMPS example key).
+
+**Limits.** The pin is only as trustworthy as the boot image until measured boot (roadmap 4.2); CDK's issuer key is regenerated each boot, so the gateway can check consistency but not pin CDK across boots; before a session exists the console can still send plaintext `DATA` for debugging.
+
+**Gateway.** `gateway/` is an ordinary Linux program (`tools/run_gateway.sh` builds it for the host target) that connects to the socket, logs `HELLO`, answers `PING` with `PONG`, acknowledges `DATA`, and answers the handshake with its long-term identity (`target/gateway-identity.key`, mode 0600, created by `tools/run_gateway.sh --init`); with a session it answers sealed messages sealed and refuses plaintext `DATA`. `burst N` makes it send N near-maximum frames for link testing.
+
+### Agent Tools / MCP Gateway / Models (`src/tools.rs`, `link/src/tool.rs`, `gateway/src/mcp.rs`, `gateway/src/models.rs`)
+
+The gateway starts each configured MCP server (`--mcp NAME=COMMAND`, stdio JSON-RPC: `initialize`, `notifications/initialized`, `tools/list`) and keeps a registry of tool names; with `--allow` only listed tools are offered or callable. Tool messages are `cdk_link::tool` payloads carried inside the sealed channel: `ListRequest`/`ListResponse` (≤ 16 names of ≤ 48 bytes) and `CallRequest {call_id, name, args}` / `CallResponse {call_id, status, body}`, preceded by `CallChunk {call_id, body}` parts when the result exceeds one frame (≤ 16 KiB in total), status `Ok`, `ToolError`, `UnknownTool`, `Refused` (allowlist), `Unavailable` (server failed or took over 10 s), `Truncated`.
+
+`tools-sync` registers a kernel object of kind `tool:<name>` for each listed tool, so tools are granted like any other object. `tool_call` (syscall 9: `handle, args_ptr, args_len, out_ptr, out_len` in `rdi, rsi, rdx, r10, r8`):
+
+1. copies the arguments (≤ `MAX_BODY`) and checks the whole result buffer (≤ 16 KiB) is user-writable, before anything is sent;
+2. re-verifies the handle's token against the kernel issuer and requires `Execute` on a `tool:` or `model:` object (denials are audited as `cap-rejected`);
+3. requires the secure session (`ENOLINK` otherwise; tools never travel in plaintext);
+4. if the token carries the approval constraint, queues it for the human (the prompt names the tool and shows the escaped arguments; denial returns `HumanDenied`);
+5. sends the `CallRequest`, records `tool-call` (detail: first 8 bytes of SHA-256 of the arguments, so the log proves what was sent without storing it), and blocks the agent.
+
+The scheduler polls the link while calls are in flight. Each chunk and the final response are copied into the agent's buffer at the running offset through the agent's own page tables (`copy_to_user`, all-or-nothing per part); `tool-result` records status and full length, and the agent resumes with `status << 32 | copied_len` (`Truncated` if the buffer was short). After 15 s (tools) or 120 s (models) without a response the call fails with `ETIMEDOUT` (`-10`) and `tool-result` records `timeout`; a late response is dropped. The kernel does not parse the JSON arguments; the gateway requires a JSON object.
+
+**Model backends and credential injection (3.4, `gateway/src/models.rs`).** `--model NAME=URL[,model=ID][,max-tokens=N][,key-file=PATH][,key-env=VAR]` adds an OpenAI-compatible chat-completion backend, listed to CDK as `model:NAME` and subject to the same allowlist. Agents send `{"prompt", "system", "max_tokens"}`; the gateway caps `max_tokens`, sets temperature 0, and returns the first choice's text. The backend's key lives only in the gateway: read from a mode-0600 file or an environment variable (then removed from the environment, so MCP servers started later cannot inherit it), held in zeroizing memory, redacted from `Debug` output and logs, and added as `Authorization: Bearer` only to requests for that backend's configured URL. Redirects are never followed and no proxy is used, so the key cannot be steered to another host; a key over plaintext `http://` is refused unless the host is loopback; any occurrence of the key in a response or error is replaced with `[redacted]` before it reaches CDK. Gateway tests run a stub model server that requires the key, echoes wrong keys (to test redaction), and redirects. CDK itself never holds a credential: the capability decides *whether* an agent may use a model, the gateway decides *how* it is reached.
+
+**Limits.** At most 8 calls in flight; one CPU services them (roadmap 2.7). The gateway handles one call at a time, so a slow model call delays other tool calls. Model output is untrusted input to the agent. What a tool does on the host is outside CDK's control: capabilities decide *which* tools an agent may call and with what human oversight, and the gateway's allowlist and the MCP server's own permissions bound the rest.
+
 ### Human-Approval Gates (`src/agent.rs`, `src/syscall.rs`, `src/process.rs`)
 
 `Permission::RequiresApproval` (tag 7) is a *constraint* carried in the signed permission set: an agent can't strip it by forging, and `cap_derive` always carries it into the child (a child may add it but never drop it). `all` grants every right but not the constraint.
@@ -215,8 +255,10 @@ Each process gets a table of up to 16 `Capability` tokens when it is spawned; th
 | 5 | `cap_derive` | `handle, mask` | new handle, holding only `mask` (must be a subset; the parent is re-verified first) |
 | 6 | `send` | `handle, ptr, len ≤ 64` | 0; message goes to the handle's object, `from = pid-N` |
 | 7 | `recv` | `handle, ptr, len` | bytes copied from the next message |
+| 8 | `getpid` | — | pid |
+| 9 | `tool_call` | `handle, args, args_len, out, out_len` | `status << 32 \| len`; see Agent Tools |
 
-Errors return as `-(code)`: 1 bad handle, 2 denied, 3 invalid, 4 queue full, 5 empty, 6 table full, 7 bad signature. `send`/`recv` go through `Kernel::send_message`/`receive_message`, so every use re-verifies the hybrid proof (usually a verified-proof cache hit) and checks the permission. Grants (`cap-granted`), derivations (`cap-derived`), and denials (`cap-rejected`, reason 4) are audit-logged. The syscall entry stub now passes a third argument (`rdx`). User writes (`recv`, `cap_list`) use `copy_to_user`, which requires every destination page to be user-accessible and writable before writing anything.
+Errors return as `-(code)`: 1 bad handle, 2 denied, 3 invalid, 4 queue full, 5 empty, 6 table full, 7 bad signature, 8 human denied, 9 no secure link, 10 timed out. `send`/`recv` go through `Kernel::send_message`/`receive_message`, so every use re-verifies the hybrid proof (usually a verified-proof cache hit) and checks the permission. Grants (`cap-granted`), derivations (`cap-derived`), and denials (`cap-rejected`, reason 4) are audit-logged. The syscall entry stub now passes a third argument (`rdx`). User writes (`recv`, `cap_list`) use `copy_to_user`, which requires every destination page to be user-accessible and writable before writing anything.
 
 **Kernel access from syscalls.** The console holds the kernel lock while a program runs, so syscalls can't take it. `agent::with_kernel` lends the console's `&mut Kernel` to the syscall layer for the duration of `process::enter`; this is sound because the program runs synchronously on the console's CPU until it exits. This remains sound with preemptive scheduling because every agent still runs on the console's CPU and preemption only switches between ring-3 programs; running agents on other CPUs (roadmap 2.7) must replace it with proper locking.
 

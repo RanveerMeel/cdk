@@ -33,6 +33,7 @@ pub const SYS_CAP_DERIVE: u64 = 5;
 pub const SYS_SEND: u64 = 6;
 pub const SYS_RECV: u64 = 7;
 pub const SYS_GETPID: u64 = 8;
+pub const SYS_TOOL_CALL: u64 = 9;
 
 /// Permission bits in a capability mask (bit = kernel permission tag).
 pub mod perm {
@@ -65,6 +66,10 @@ pub enum Error {
     BadSignature,
     /// A human denied the action (approval-gated handle).
     HumanDenied,
+    /// No secure link to the gateway.
+    NoLink,
+    /// The tool call got no result in time.
+    TimedOut,
     /// Unrecognized error code.
     Other(u64),
 }
@@ -80,6 +85,8 @@ impl Error {
             6 => Error::NoSpace,
             7 => Error::BadSignature,
             8 => Error::HumanDenied,
+            9 => Error::NoLink,
+            10 => Error::TimedOut,
             c => Error::Other(c),
         }
     }
@@ -207,6 +214,156 @@ pub fn recv(handle: u32, buf: &mut [u8]) -> Result<usize, Error> {
         )
     };
     check(r).map(|n| n as usize)
+}
+
+#[inline]
+unsafe fn syscall5(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
+    let ret: u64;
+    core::arch::asm!(
+        "syscall",
+        inlateout("rax") nr => ret,
+        in("rdi") a0,
+        in("rsi") a1,
+        in("rdx") a2,
+        in("r10") a3,
+        in("r8") a4,
+        lateout("rcx") _,
+        lateout("r11") _,
+        clobber_abi("C"),
+        options(nostack),
+    );
+    ret
+}
+
+/// How a tool call ended (from the gateway / MCP server).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolStatus {
+    Ok,
+    /// The tool reported an error; the result text explains it.
+    ToolError,
+    UnknownTool,
+    /// The gateway's policy refused the call.
+    Refused,
+    /// The tool server failed or timed out.
+    Unavailable,
+    /// The result did not fit and was cut.
+    Truncated,
+    Other(u32),
+}
+
+/// Call the MCP tool behind `handle` (needs [`perm::EXEC`]) with JSON
+/// `args`; the result text is written to `out`. Blocks until the gateway
+/// answers (or a human decides, for approval-gated handles). Returns the
+/// status and the number of result bytes written.
+pub fn tool_call(handle: u32, args: &[u8], out: &mut [u8]) -> Result<(ToolStatus, usize), Error> {
+    let r = unsafe {
+        syscall5(
+            SYS_TOOL_CALL,
+            handle as u64,
+            args.as_ptr() as u64,
+            args.len() as u64,
+            out.as_mut_ptr() as u64,
+            out.len() as u64,
+        )
+    };
+    let v = check(r)?;
+    let status = match (v >> 32) as u32 {
+        0 => ToolStatus::Ok,
+        1 => ToolStatus::ToolError,
+        2 => ToolStatus::UnknownTool,
+        3 => ToolStatus::Refused,
+        4 => ToolStatus::Unavailable,
+        5 => ToolStatus::Truncated,
+        s => ToolStatus::Other(s),
+    };
+    Ok((status, (v & 0xffff_ffff) as usize))
+}
+
+/// Largest JSON argument block the kernel accepts for one call.
+pub const MAX_ARGS: usize = 900;
+
+/// Ask the model behind `handle` (a `model:<name>` object; needs
+/// [`perm::EXEC`]). Builds `{"prompt":…,"system":…,"max_tokens":…}` and calls
+/// it like a tool; the gateway runs the model and adds any credential, which
+/// the agent never sees. Returns [`Error::Invalid`] if the escaped request
+/// exceeds [`MAX_ARGS`].
+pub fn ask_model(
+    handle: u32,
+    system: Option<&str>,
+    prompt: &str,
+    max_tokens: u32,
+    out: &mut [u8],
+) -> Result<(ToolStatus, usize), Error> {
+    let mut buf = [0u8; MAX_ARGS];
+    let mut w = JsonWriter {
+        buf: &mut buf,
+        len: 0,
+        overflow: false,
+    };
+    w.raw("{\"prompt\":");
+    w.string(prompt);
+    if let Some(s) = system {
+        w.raw(",\"system\":");
+        w.string(s);
+    }
+    let _ = core::fmt::Write::write_fmt(&mut w, format_args!(",\"max_tokens\":{}}}", max_tokens));
+    if w.overflow {
+        return Err(Error::Invalid);
+    }
+    let len = w.len;
+    tool_call(handle, &buf[..len], out)
+}
+
+struct JsonWriter<'a> {
+    buf: &'a mut [u8],
+    len: usize,
+    overflow: bool,
+}
+
+impl JsonWriter<'_> {
+    fn raw(&mut self, s: &str) {
+        for &b in s.as_bytes() {
+            self.byte(b);
+        }
+    }
+
+    fn byte(&mut self, b: u8) {
+        match self.buf.get_mut(self.len) {
+            Some(slot) => {
+                *slot = b;
+                self.len += 1;
+            }
+            None => self.overflow = true,
+        }
+    }
+
+    /// A JSON string literal; control characters, `"` and `\\` escaped.
+    fn string(&mut self, s: &str) {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        self.byte(b'"');
+        for &b in s.as_bytes() {
+            match b {
+                b'"' | b'\\' => {
+                    self.byte(b'\\');
+                    self.byte(b);
+                }
+                0..=0x1f => {
+                    self.raw("\\u00");
+                    self.byte(HEX[(b >> 4) as usize]);
+                    self.byte(HEX[(b & 15) as usize]);
+                }
+                _ => self.byte(b),
+            }
+        }
+        self.byte(b'"');
+    }
+}
+
+impl core::fmt::Write for JsonWriter<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        self.raw(s);
+        Ok(())
+    }
 }
 
 /// This process's id.

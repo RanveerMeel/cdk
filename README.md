@@ -31,6 +31,12 @@ CDK is **open core**. This repository — the kernel, the capability model, the 
 
 **Agent Capability Handles** — Each process holds up to 16 capabilities in a kernel-side table and refers to them only by index, so tokens can't be forged, copied, or leaked. Syscalls `cap_list`, `cap_drop`, `cap_derive` (a new handle may only *drop* permissions, and is re-issued with hybrid post-quantum signatures), `send` and `recv` (to the handle's object). Every use is re-verified and permission-checked; grants, derivations, and denials land in the audit log. Demo agents: `agent` checks every rule, `intruder` (no grants) is blocked on all 19 attempts.
 
+**Host Link and Gateway** — `run_qemu.sh` attaches a virtio-console device backed by `target/cdk-link.sock`; in another terminal `tools/run_gateway.sh` starts the host gateway, which connects to it. Kernel and gateway share the `link/` crate (framing with CRC-32 and resync), so both sides are byte-identical. Try `link-ping`, `link-send hello`, `link-recv`. Then `link-secure` runs the post-quantum handshake: hybrid X25519 + ML-KEM-768 key exchange, both sides sign the transcript with Ed25519 + ML-DSA-65, and CDK only accepts the gateway whose public key is pinned in the ramdisk (`run_qemu.sh` creates `target/gateway-identity.key` once and packs `target/gateway.pub`). After that every `link-send` is sealed with ChaCha20-Poly1305; replayed, reordered, or tampered frames are rejected, and the gateway refuses plaintext.
+
+**Agent Tools over MCP** — The gateway fronts MCP (Model Context Protocol) servers: `tools/run_gateway.sh` starts the stdlib demo server (`gateway/examples/demo_mcp_server.py`: `echo`, `word_count`, `utc_time`, `sleep`) unless `CDK_MCP="name=command"` names another, and `CDK_MCP_ALLOW=echo,word_count` limits what CDK may reach. After `link-secure`, `tools-sync` turns each offered tool into a kernel object `tool:<name>`. An agent can call a tool only through a handle with `exec`: `spawn researcher`, `grant 1 tool:word_count exec`, `elf-run 1`. Add `approval` (`grant 1 tool:echo exec,approval`) and a human must approve the exact arguments first (`spawn careful` shows approve, deny, and a slow tool). Calls travel sealed; the kernel records `tool-call` (SHA-256 of the arguments) and `tool-result` (status and length) in the audit log.
+
+**Models on the Host, Credentials in the Gateway** — Large models run on Linux, next to its GPU drivers (vLLM, llama.cpp, Ollama, TensorRT-LLM, or a remote API — anything OpenAI-compatible). `CDK_MODEL="qwen=http://127.0.0.1:11434/v1,model=qwen2.5:3b-instruct" tools/run_gateway.sh` offers a local Ollama model; after `tools-sync` it is the kernel object `model:qwen`. `spawn analyst`, `grant 1 model:qwen exec` (add `,approval` to gate every prompt), `elf-run 1`. For a paid or remote API, add `key-file=PATH` (mode 0600) or `key-env=VAR`: the gateway attaches the key only to that backend's URL, never follows redirects, refuses keys over plaintext http to remote hosts, and scrubs the key from anything it returns. Agents and the kernel never see it.
+
 **Human-Approval Gates** — Grant a handle with the `approval` constraint (`exec requester obj-2 send,approval`). Every `send` through it blocks the agent; the console shows who is asking, the target, and the exact payload (control characters escaped, so an agent can't forge console output), and the kernel performs the send only if the human answers `y`. Otherwise the agent gets `HumanDenied`. The constraint is part of the signed token and survives derivation; requests and decisions are audit-logged (`approval-asked`, `approval-yes`, `approval-no`).
 
 **Native Inference in Agents** — `user/ml` (`cdk-ml`) evaluates int8 linear models (`CDKLM1`) with integer arithmetic only, so agents need no FPU state. An agent embeds its model at build time, so the audit log's `program-loaded` SHA-256 identifies code *and* model. Demo: `send obj-2 server down, production outage`, `send obj-2 lunch menu for friday`, then `exec classify obj-2 recv`. The demo model (`user/models/priority-demo.cdklm`, message priority ROUTINE/URGENT) is synthetic and regenerated reproducibly by `tools/train_demo_model.py`.
@@ -201,6 +207,13 @@ cargo check --features virtio-hw
 | `reap <pid>` | Free a `Ready`/`Zombie`/`Crashed` process and its address space |
 | `user-smoke` | Minimal ring-3 round trip (enter, `SYS_exit`, return) |
 | `issuer` | Kernel capability issuer: id, algorithms, entropy source, crypto-stack peak |
+| `link` | Host link status (bytes, frames, CRC errors) |
+| `link-ping` | Round-trip a `PING` through the host gateway |
+| `link-send <text>` | Send a `DATA` frame to the gateway (`link-send burst 50` asks it for a 50-frame test burst) |
+| `link-recv` | Show frames received from the gateway (sealed ones are shown decrypted and marked authenticated) |
+| `link-secure` | Post-quantum handshake with the pinned gateway; afterwards all `link-send` traffic is sealed |
+| `tools-sync` | Ask the gateway for its MCP tools and register a `tool:<name>` object for each |
+| `tools` | List registered tool objects |
 | `capsign <id>` | Issue a hybrid post-quantum capability for an object and verify it |
 | `capverify <id>` | Show unsigned, forged, and escalated tokens being rejected |
 | `capbench <id> [n]` | Time *n* capability checks without and with the verified-proof cache |
@@ -302,6 +315,10 @@ The full plan — phases, milestones, and editions — is in [ROADMAP.md](ROADMA
 - [x] Preemptive round-robin scheduling of agents on one CPU, with a CPU-budget watchdog — roadmap milestone 2.3
 - [x] Native integer-only inference for agents (`cdk-ml`, `CDKLM1` models) with a public demo classifier — roadmap milestone 2.4
 - [x] Human-approval gates: approval-constrained capabilities block the agent until a person approves the exact payload — roadmap milestone 2.5
+- [x] Host link: virtio-console transport, shared framing crate, and a host gateway — roadmap milestone 3.1
+- [x] Post-quantum secure channel to the gateway: hybrid X25519 + ML-KEM-768, hybrid-signed transcript, pinned gateway identity, ChaCha20-Poly1305 — roadmap milestone 3.2
+- [x] MCP gateway: agent tool calls gated by `exec` capabilities (optionally human-approved), sent sealed to MCP servers, and audit-logged — roadmap milestone 3.3
+- [x] Model inference through Linux-hosted model servers (OpenAI-compatible), per-model capabilities, gateway-side credential injection — roadmap milestone 3.4
 - [x] Framebuffer text rendering (8×16 bitmap font, RGB/BGR/U8 pixel formats, auto-scroll)
 - [x] Network stack integration (loopback interfaces, capability-gated send/recv, object bridge routing, bindings, pump telemetry)
 - [x] External network transport (virtio-net MMIO bring-up path + non-loopback external interfaces via `eth0` default external backend and adapter-based transports)

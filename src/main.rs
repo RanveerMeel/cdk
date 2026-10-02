@@ -458,6 +458,29 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let mut fa = FRAME_ALLOCATOR.lock();
         cdk::gpu::init(pt_guard.as_mut(), Some(&mut *fa));
     }
+
+    // Host link (virtio-console) for the gateway, if QEMU provides one.
+    {
+        let mut pt_guard = PAGE_TABLE.lock();
+        let mut fa = FRAME_ALLOCATOR.lock();
+        match pt_guard.as_mut() {
+            Some(pt) => match cdk::virtio_console::init(pt, &mut fa) {
+                Ok(()) => {
+                    cdk::println!("Link: virtio-console ready (host gateway link)");
+                    let mut hello: heapless::String<48> = heapless::String::new();
+                    let _ = hello.push_str("cdk issuer=");
+                    for b in &cdk::issuer::kernel().id()[..8] {
+                        let _ = core::fmt::write(&mut hello, format_args!("{:02x}", b));
+                    }
+                    if cdk::link::send(cdk_link::kind::HELLO, hello.as_bytes()).is_err() {
+                        cdk::println!("Link: HELLO not delivered (gateway not connected yet)");
+                    }
+                }
+                Err(e) => cdk::println!("Link: none ({})", e),
+            },
+            None => cdk::println!("Link: skipped (no page table)"),
+        }
+    }
     {
         let s = cdk::um::status();
         cdk::println!(

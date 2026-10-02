@@ -56,6 +56,8 @@ pub enum SigDomain {
     Capability,
     /// Audit-log checkpoints.
     AuditCheckpoint,
+    /// Host-link handshake transcripts (`cdk-link` secure channel).
+    Link,
 }
 
 impl SigDomain {
@@ -64,6 +66,7 @@ impl SigDomain {
         match self {
             SigDomain::Capability => b"CDK-CAP-v1",
             SigDomain::AuditCheckpoint => b"CDK-AUDIT-v1",
+            SigDomain::Link => b"CDK-LINK-v1",
         }
     }
 }

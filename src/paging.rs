@@ -638,6 +638,20 @@ impl PageTableManager {
         Ok(())
     }
 
+    /// Check that `[virt, virt + len)` is user-accessible and writable
+    /// without writing anything.
+    pub fn check_user_writable(&self, virt: u64, len: u64) -> PagingResult<()> {
+        if !is_user_range(virt, len) {
+            return Err(PagingError::OutsideUserRegion);
+        }
+        let mut page = virt & !(PAGE_SIZE - 1);
+        while page < virt + len {
+            self.translate_user_writable(page)?;
+            page += PAGE_SIZE;
+        }
+        Ok(())
+    }
+
     /// [`translate_user`](Self::translate_user) that also requires the leaf
     /// entry to be writable.
     pub fn translate_user_writable(&self, virt: u64) -> PagingResult<u64> {

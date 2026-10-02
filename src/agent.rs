@@ -62,6 +62,10 @@ pub mod errno {
     pub const ESIG: u64 = 7;
     /// A human denied the action (approval-gated handle).
     pub const EDENIED: u64 = 8;
+    /// No secure link to the gateway (tool calls need one).
+    pub const ENOLINK: u64 = 9;
+    /// The tool call got no result in time.
+    pub const ETIMEDOUT: u64 = 10;
 }
 
 /// Encode an error code as a syscall return value.
@@ -299,13 +303,32 @@ pub fn describe(pid: u32, mut f: impl FnMut(u32, u64, &str)) -> Result<(), Handl
 // Human approval
 // ---------------------------------------------------------------------------
 
-/// A blocked `send` waiting for a human decision.
+/// Largest payload a pending request carries (tool arguments are the
+/// biggest).
+const PENDING_PAYLOAD: usize = cdk_link::tool::MAX_BODY;
+
+/// What a pending request will do if approved.
+pub enum Action {
+    /// `send` the payload to the handle's object.
+    Send,
+    /// Call `tool` with the payload as JSON arguments; the result goes to
+    /// the agent's buffer.
+    Tool {
+        tool: heapless::String<{ cdk_link::tool::MAX_NAME }>,
+        out_ptr: u64,
+        out_len: u64,
+        pml4: u64,
+    },
+}
+
+/// A blocked action waiting for a human decision.
 pub struct Pending {
     pub id: u32,
     pub pid: u32,
     pub handle: u64,
     cap: Capability,
-    payload: heapless::Vec<u8, MAX_MESSAGE>,
+    payload: heapless::Vec<u8, PENDING_PAYLOAD>,
+    pub action: Action,
 }
 
 impl Pending {
@@ -354,15 +377,28 @@ pub fn resolve_with(mut decide: impl FnMut(&Pending) -> bool) -> usize {
             format_args!("pid-{}:req-{}:{}", req.pid, req.id, req.object()),
             req.id as u64,
         );
-        let result = if approved {
-            match perform_send(req.pid, req.handle, &req.cap, &req.payload) {
+        let result = match (approved, req.action) {
+            (false, _) => Some(err(errno::EDENIED)),
+            (true, Action::Send) => Some(match perform_send(req.pid, req.handle, &req.cap, &req.payload) {
                 Ok(v) => v,
                 Err(code) => err(code),
+            }),
+            (true, Action::Tool { tool, out_ptr, out_len, pml4 }) => {
+                let call = crate::tools::Call {
+                    pid: req.pid,
+                    tool,
+                    args: heapless::Vec::from_slice(&req.payload).unwrap_or_default(),
+                    out_ptr,
+                    out_len,
+                    pml4,
+                };
+                // On success the process stays blocked until the result arrives.
+                crate::tools::dispatch(call).err().map(err)
             }
-        } else {
-            err(errno::EDENIED)
         };
-        crate::process::unblock(req.pid, result);
+        if let Some(r) = result {
+            crate::process::unblock(req.pid, r);
+        }
         n += 1;
     }
     n
@@ -393,12 +429,28 @@ fn prompt_console(req: &Pending) -> bool {
         req.pid,
         name.as_ref().map_or("?", |n| n.as_str())
     );
-    crate::println!(
-        "  action : send {} bytes to {} (handle h{})",
-        req.payload.len(),
-        req.object(),
-        req.handle
-    );
+    match &req.action {
+        Action::Send => crate::println!(
+            "  action : send {} bytes to {} (handle h{})",
+            req.payload.len(),
+            req.object(),
+            req.handle
+        ),
+        Action::Tool { tool, .. } => match tool.strip_prefix(cdk_link::tool::MODEL_PREFIX) {
+            Some(model) => crate::println!(
+                "  action : prompt model '{}' ({}, handle h{}) via the gateway",
+                model,
+                req.object(),
+                req.handle
+            ),
+            None => crate::println!(
+                "  action : call tool '{}' ({}, handle h{}) via the gateway",
+                tool,
+                req.object(),
+                req.handle
+            ),
+        },
+    }
     crate::print!("  data   : \"");
     write_sanitized(&req.payload, |s| crate::print!("{}", s));
     crate::println!("\"");
@@ -456,6 +508,11 @@ pub fn with_kernel<R>(kernel: &mut Kernel, f: impl FnOnce() -> R) -> R {
     let r = f();
     KERNEL_CTX.store(core::ptr::null_mut(), Ordering::Release);
     r
+}
+
+/// The kernel lent by [`with_kernel`], for other syscall modules.
+pub fn kernel_ref() -> Option<&'static mut Kernel> {
+    kernel()
 }
 
 fn kernel() -> Option<&'static mut Kernel> {
@@ -560,7 +617,7 @@ fn sys_cap_derive(pid: u32, handle: u64, mask: u64) -> Result<u64, u64> {
     Ok(new as u64)
 }
 
-fn audit_denied(pid: u32, handle: u64, what: &str) {
+pub fn audit_denied(pid: u32, handle: u64, what: &str) {
     audit::record_fmt(
         EventKind::CapRejected,
         format_args!("pid-{}:h{}:{}", pid, handle, what),
@@ -603,24 +660,50 @@ pub fn sys_send_outcome(handle: u64, ptr: u64, len: u64) -> crate::syscall::Outc
         audit_denied(pid, handle, "send");
         return Outcome::Return(err(errno::EPERM));
     }
+    match enqueue(pid, handle, cap, &payload, Action::Send) {
+        Ok(()) => Outcome::Block,
+        Err(()) => Outcome::Return(err(errno::EFULL)),
+    }
+}
+
+fn enqueue(pid: u32, handle: u64, cap: Capability, payload: &[u8], action: Action) -> Result<(), ()> {
     let id = NEXT_REQUEST.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let object = cap.object_id.clone();
-    let queued = PENDING.lock().push_back(Pending {
-        id,
-        pid,
-        handle,
-        cap,
-        payload,
-    });
-    if queued.is_err() {
-        return Outcome::Return(err(errno::EFULL));
-    }
+    let payload = heapless::Vec::from_slice(payload).map_err(|_| ())?;
+    PENDING
+        .lock()
+        .push_back(Pending {
+            id,
+            pid,
+            handle,
+            cap,
+            payload,
+            action,
+        })
+        .map_err(|_| ())?;
     audit::record_fmt(
         EventKind::ApprovalRequested,
         format_args!("pid-{}:req-{}:{}", pid, id, object),
         id as u64,
     );
-    Outcome::Block
+    Ok(())
+}
+
+/// Queue a tool call on an approval-gated handle; the process blocks until
+/// a human decides (and, if approved, until the result arrives).
+pub fn request_tool_approval(handle: u64, cap: Capability, call: crate::tools::Call) -> Result<(), ()> {
+    let action = Action::Tool {
+        tool: call.tool,
+        out_ptr: call.out_ptr,
+        out_len: call.out_len,
+        pml4: call.pml4,
+    };
+    enqueue(call.pid, handle, cap, &call.args, action)
+}
+
+/// The capability behind `pid`'s `handle`.
+pub fn handle_cap(pid: u32, handle: u64) -> Result<Capability, HandleError> {
+    with_table(pid, |t| t.get(handle).cloned())?
 }
 
 /// Copy the message from user memory and look up the handle.
@@ -800,6 +883,7 @@ mod tests {
             handle: 0,
             cap: c,
             payload: heapless::Vec::from_slice(b"transfer 5").unwrap(),
+            action: Action::Send,
         });
         let mut seen = std::vec::Vec::new();
         let n = resolve_with(|req| {

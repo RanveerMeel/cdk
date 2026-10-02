@@ -149,6 +149,13 @@ const COMMANDS: &[&str] = &[
     "capsign",
     "capverify",
     "issuer",
+    "link",
+    "link-ping",
+    "link-send",
+    "link-recv",
+    "link-secure",
+    "tools",
+    "tools-sync",
     "capbench",
     "audit",
     "audit-verify",
@@ -630,6 +637,13 @@ fn dispatch(
         "capsign" => cmd_capsign(arg1, kernel),
         "capverify" => cmd_capverify(arg1, kernel),
         "issuer" => cmd_issuer(),
+        "link" => cmd_link(),
+        "link-ping" => cmd_link_ping(),
+        "link-send" => cmd_link_send(line.split_once(' ').map_or("", |(_, rest)| rest)),
+        "link-recv" => cmd_link_recv(),
+        "link-secure" => cmd_link_secure(),
+        "tools" => cmd_tools(kernel),
+        "tools-sync" => cmd_tools_sync(kernel),
         "capbench" => cmd_capbench(arg1, arg2, kernel),
         "audit" => cmd_audit(arg1),
         "audit-verify" => cmd_audit_verify(),
@@ -737,6 +751,13 @@ fn cmd_help() {
     crate::println!("  capsign <id>      Issue a hybrid PQ-signed capability for <id> and verify it");
     crate::println!("  capverify <id>    Show that unsigned, forged, and tampered tokens are rejected");
     crate::println!("  issuer            Show the kernel capability issuer (Ed25519+ML-DSA-65)");
+    crate::println!("  link              Host link (virtio-console) status");
+    crate::println!("  link-ping         Round-trip a PING through the host gateway");
+    crate::println!("  link-send <text>  Send a DATA frame to the host gateway");
+    crate::println!("  link-recv         Show frames received from the host gateway");
+    crate::println!("  link-secure       Post-quantum handshake with the pinned gateway; seal all traffic");
+    crate::println!("  tools-sync        Fetch the gateway's MCP tools and register them as objects");
+    crate::println!("  tools             List registered tool objects (grant with: grant <pid> tool:<name> exec)");
     crate::println!("  capbench <id> [n] Time n capability checks, uncached vs cached");
     crate::println!("  audit [n]         Show the last n audit records (default 12)");
     crate::println!("  audit-verify      Verify the audit hash chain and signed checkpoints");
@@ -1249,7 +1270,7 @@ fn cmd_capbench(id: &str, n_str: &str, kernel: &mut Kernel) {
         n,
         uncached / 1000,
         cached / 1000,
-        if cached > 0 { uncached / cached } else { 0 },
+        uncached.checked_div(cached).unwrap_or(0),
         if ok1 && ok2 { "" } else { "  (VERIFY FAILED)" }
     );
 }
@@ -1279,8 +1300,17 @@ fn cmd_audit(n_str: &str) {
             );
             if r.kind == crate::audit::EventKind::ProcessSpawned {
                 crate::print!("{:#x} ", r.detail);
-            } else if r.kind == crate::audit::EventKind::ProgramLoaded {
+            } else if matches!(
+                r.kind,
+                crate::audit::EventKind::ProgramLoaded | crate::audit::EventKind::ToolCall
+            ) {
                 crate::print!("sha256:{:016x} ", r.detail);
+            } else if r.kind == crate::audit::EventKind::ToolResult {
+                if r.detail == u64::MAX {
+                    crate::print!("timeout ");
+                } else {
+                    crate::print!("status={} len={} ", r.detail >> 32, r.detail & 0xffff_ffff);
+                }
             } else {
                 crate::print!("{:<8} ", r.detail);
             }
@@ -1345,6 +1375,155 @@ fn cmd_audit_demo_tamper(seq_str: &str) {
         );
     } else {
         crate::println!("audit: record {} is not retained", seq);
+    }
+}
+
+fn cmd_link() {
+    if !crate::virtio_console::is_ready() {
+        crate::println!("link: no virtio-console device (run with the gateway socket)");
+        return;
+    }
+    let s = crate::virtio_console::stats();
+    let d = crate::link::decoder_stats();
+    crate::println!(
+        "link: virtio-console ready  tx={} B rx={} B tx_timeouts={}  frames={} crc_errors={} skipped={} B",
+        s.tx_bytes,
+        s.rx_bytes,
+        s.tx_timeouts,
+        d.frames,
+        d.crc_errors,
+        d.skipped
+    );
+    match crate::link::gateway_id() {
+        Some(id) => {
+            crate::print!("      secure session with gateway ");
+            print_hex(&id);
+            crate::println!(" (X25519+ML-KEM-768, ChaCha20-Poly1305)");
+        }
+        None => crate::println!(
+            "      no secure session (pinned gateway: {})",
+            if crate::link::pinned_gateway().is_some() { "present" } else { "MISSING from ramdisk" }
+        ),
+    }
+}
+
+fn cmd_tools_sync(kernel: &mut Kernel) {
+    match crate::tools::sync(kernel) {
+        Ok(names) => {
+            crate::println!("tools: gateway offers {} tool(s):", names.len());
+            for n in names.iter() {
+                if n.starts_with(cdk_link::tool::MODEL_PREFIX) {
+                    crate::println!("  {}", n);
+                } else {
+                    crate::println!("  {}{}", crate::tools::KIND_PREFIX, n);
+                }
+            }
+        }
+        Err(e) => crate::println!("tools-sync: {}", e),
+    }
+}
+
+fn cmd_tools(kernel: &mut Kernel) {
+    let mut any = false;
+    kernel.for_each_object(|o| {
+        if crate::tools::wire_name(&o.kind).is_some() {
+            any = true;
+            crate::println!("  {:<8} {}", o.id.as_str(), o.kind.as_str());
+        }
+    });
+    if !any {
+        crate::println!("tools: none registered (run link-secure, then tools-sync)");
+    }
+}
+
+fn cmd_link_secure() {
+    match crate::link::secure_connect(5000) {
+        Ok(id) => {
+            crate::print!("link: SECURE — gateway ");
+            print_hex(&id);
+            crate::println!(" verified against the pinned key; X25519+ML-KEM-768 keys, ChaCha20-Poly1305");
+        }
+        Err(e) => crate::println!("link: handshake failed: {:?}", e),
+    }
+}
+
+fn print_link_frame(kind: u8, payload: &[u8]) {
+    let name = match kind {
+        cdk_link::kind::HELLO => "HELLO",
+        cdk_link::kind::PING => "PING",
+        cdk_link::kind::PONG => "PONG",
+        cdk_link::kind::DATA => "DATA",
+        _ => "?",
+    };
+    crate::print!("  <- {} {} B \"", name, payload.len());
+    crate::agent::write_sanitized(&payload[..payload.len().min(60)], |s| crate::print!("{}", s));
+    crate::println!("{}\"", if payload.len() > 60 { "…" } else { "" });
+}
+
+fn cmd_link_ping() {
+    let nonce = crate::cpu::rdtsc();
+    match crate::link::ping(nonce, 3000, print_link_frame) {
+        Ok(cycles) => crate::println!("link: PONG in {} kcycles", cycles / 1000),
+        Err(e) => crate::println!("link: {}", e),
+    }
+}
+
+fn cmd_link_send(text: &str) {
+    if text.is_empty() {
+        crate::println!("Usage: link-send <text>");
+        return;
+    }
+    match crate::link::send_data(text.as_bytes()) {
+        Ok(true) => crate::println!("link: sent {} bytes (sealed)", text.len()),
+        Ok(false) => crate::println!("link: sent {} bytes (plaintext — run link-secure)", text.len()),
+        Err(e) => crate::println!("link: {}", e),
+    }
+}
+
+fn cmd_link_recv() {
+    // Give the host a moment to answer anything just sent. Bursts are
+    // summarized: every frame is checked, only the first/last are shown.
+    let start = crate::cpu::rdtsc();
+    let (mut n, mut bytes, mut bad) = (0u64, 0u64, 0u64);
+    while crate::cpu::rdtsc().wrapping_sub(start) < 1_000_000_000 {
+        crate::link::recv(|m| {
+            let (k, p) = match m {
+                crate::link::Incoming::Plain(k, p) => (k, p),
+                crate::link::Incoming::Sealed(p) => {
+                    crate::print!("  <- SEALED, authenticated, {} B \"", p.len());
+                    crate::agent::write_sanitized(&p[..p.len().min(60)], |s| crate::print!("{}", s));
+                    crate::println!("{}\"", if p.len() > 60 { "…" } else { "" });
+                    n += 1;
+                    bytes += p.len() as u64;
+                    return;
+                }
+                crate::link::Incoming::Rejected(e) => {
+                    crate::println!("  <- SEALED frame REJECTED: {:?}", e);
+                    bad += 1;
+                    n += 1;
+                    return;
+                }
+            };
+            let burst = p.starts_with(b"burst ");
+            if burst {
+                // Pattern check: byte i (after the tag) is b'a' + i % 26.
+                let ok = p.len() == 1000
+                    && p.iter().enumerate().skip(11).all(|(i, &b)| b == b'a' + (i % 26) as u8);
+                if !ok {
+                    bad += 1;
+                }
+            }
+            if !burst || n == 0 {
+                print_link_frame(k, p);
+            }
+            n += 1;
+            bytes += p.len() as u64;
+        });
+    }
+    if n == 0 {
+        crate::println!("link: no frames");
+    } else {
+        crate::println!("link: {} frame(s), {} B payload, {} corrupt", n, bytes, bad);
     }
 }
 
