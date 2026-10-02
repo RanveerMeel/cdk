@@ -26,6 +26,13 @@ use crate::virtio_console;
 
 static DECODER: Mutex<Decoder> = Mutex::new(Decoder::new());
 static SESSION: Mutex<Option<Established>> = Mutex::new(None);
+/// Counts established sessions; tool listings are re-verified per session.
+static EPOCH: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Number of the current secure session (0 = none yet).
+pub fn session_epoch() -> u32 {
+    EPOCH.load(core::sync::atomic::Ordering::Relaxed)
+}
 
 /// Ramdisk file holding the pinned gateway identity (Ed25519 ‖ ML-DSA-65).
 pub const PINNED_GATEWAY_FILE: &str = "gateway.pub";
@@ -139,6 +146,7 @@ fn secure_connect_inner(timeout_ms: u64) -> Result<[u8; 16], SecureError> {
     send_message(&cf).map_err(|_| SecureError::NoLink)?;
     let id = gateway.id();
     *SESSION.lock() = Some(Established { session, gateway });
+    EPOCH.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     Ok(id)
 }
 

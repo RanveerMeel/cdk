@@ -47,6 +47,9 @@ pub struct Backend {
     max_tokens: u32,
     key: Option<Secret>,
     agent: ureq::Agent,
+    /// `host[:port]` the backend is reached at (reported to CDK).
+    endpoint: String,
+    remote: bool,
 }
 
 impl fmt::Debug for Backend {
@@ -61,8 +64,8 @@ impl fmt::Debug for Backend {
     }
 }
 
-/// `(scheme, host)` of an `http(s)://` URL.
-fn scheme_host(url: &str) -> Option<(&str, &str)> {
+/// `(scheme, host, authority)` of an `http(s)://` URL.
+fn scheme_host(url: &str) -> Option<(&str, &str, &str)> {
     let (scheme, rest) = url.split_once("://")?;
     let authority = rest.split('/').next()?;
     if authority.is_empty() || authority.contains('@') {
@@ -73,7 +76,7 @@ fn scheme_host(url: &str) -> Option<(&str, &str)> {
     } else {
         authority.split(':').next()?
     };
-    Some((scheme, host))
+    Some((scheme, host, authority))
 }
 
 fn is_loopback(host: &str) -> bool {
@@ -116,12 +119,15 @@ impl Backend {
         }
         let mut parts = rest.split(',');
         let base_url = parts.next().unwrap_or("").trim_end_matches('/').to_string();
-        let (scheme, host) = scheme_host(&base_url).ok_or(format!("bad URL {base_url:?}"))?;
+        let (scheme, host, authority) =
+            scheme_host(&base_url).ok_or(format!("bad URL {base_url:?}"))?;
         if scheme != "http" && scheme != "https" {
             return Err(format!("URL must be http:// or https://, not {scheme}://"));
         }
         let plaintext_remote = scheme == "http" && !is_loopback(host);
         let host = host.to_string();
+        let endpoint = authority.to_string();
+        let remote = !is_loopback(&host);
         let mut b = Backend {
             name: name.to_string(),
             model: name.to_string(),
@@ -132,6 +138,8 @@ impl Backend {
                 .redirects(0)
                 .build(),
             base_url,
+            endpoint,
+            remote,
         };
         for opt in parts {
             let (k, v) = opt.split_once('=').ok_or(format!("bad option {opt:?}"))?;
@@ -168,6 +176,18 @@ impl Backend {
     /// The name CDK sees.
     pub fn tool_name(&self) -> String {
         format!("{}{}", cdk_link::tool::MODEL_PREFIX, self.name)
+    }
+
+    /// How CDK sees this backend in a tool listing.
+    pub fn entry(&self) -> (String, u8, String) {
+        let mut flags = 0;
+        if self.key.is_some() {
+            flags |= cdk_link::tool::FLAG_CREDENTIAL;
+        }
+        if self.remote {
+            flags |= cdk_link::tool::FLAG_REMOTE;
+        }
+        (self.tool_name(), flags, self.endpoint.clone())
     }
 
     pub fn has_key(&self) -> bool {
@@ -415,7 +435,16 @@ mod tests {
         }
         std::fs::remove_file(kf).unwrap();
         // Loopback and https are fine.
-        assert!(Backend::from_spec("m=http://[::1]:8000/v1").is_ok());
-        assert!(Backend::from_spec("m=https://api.example.com/v1,model=x").is_ok());
+        let local = Backend::from_spec("m=http://[::1]:8000/v1").unwrap();
+        assert_eq!(local.entry(), ("model:m".into(), 0, "[::1]:8000".into()));
+        std::env::set_var("CDK_TEST_HTTPS_KEY", "k");
+        let remote =
+            Backend::from_spec("r=https://api.example.com/v1,model=x,key-env=CDK_TEST_HTTPS_KEY")
+                .unwrap();
+        let flags = cdk_link::tool::FLAG_CREDENTIAL | cdk_link::tool::FLAG_REMOTE;
+        assert_eq!(
+            remote.entry(),
+            ("model:r".into(), flags, "api.example.com".into())
+        );
     }
 }

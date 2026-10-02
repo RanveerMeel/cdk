@@ -10,7 +10,7 @@
 //!
 //! ```text
 //! ListRequest  : 3
-//! ListResponse : 4 | count u8 | (len u8 | name)*
+//! ListResponse : 4 | count u8 | (len u8 | name | flags u8 | len u8 | endpoint)*
 //! CallRequest  : 1 | call_id u32 | len u8 | name | args_len u16 | args (JSON bytes, passed through)
 //! CallChunk    : 5 | call_id u32 | len u16 | body
 //! CallResponse : 2 | call_id u32 | status u8 | len u16 | body (UTF-8 text)
@@ -38,6 +38,12 @@ pub const MAX_BODY: usize = crate::secure::MAX_PLAINTEXT - 8 - MAX_NAME;
 pub const MAX_RESULT: usize = 16 * 1024;
 /// Name prefix of model backends.
 pub const MODEL_PREFIX: &str = "model:";
+/// Longest endpoint description in a listing.
+pub const MAX_ENDPOINT: usize = 64;
+/// [`Entry::flags`]: the gateway adds a credential to this tool's requests.
+pub const FLAG_CREDENTIAL: u8 = 1;
+/// [`Entry::flags`]: requests leave this machine (non-loopback network).
+pub const FLAG_REMOTE: u8 = 2;
 /// Tools listed at most.
 pub const MAX_TOOLS: usize = 16;
 
@@ -77,10 +83,32 @@ pub enum ToolMsgError {
     TooLarge,
 }
 
+/// One listed tool or model and what reaching it involves (roadmap 2.9:
+/// CDK pins these and reviews any change).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Entry<'a> {
+    pub name: &'a str,
+    /// [`FLAG_CREDENTIAL`] | [`FLAG_REMOTE`].
+    pub flags: u8,
+    /// Where the gateway sends calls: `host:port` for models, `mcp:<server>`
+    /// for MCP tools.
+    pub endpoint: &'a str,
+}
+
+impl<'a> Entry<'a> {
+    pub fn new(name: &'a str) -> Self {
+        Entry {
+            name,
+            flags: 0,
+            endpoint: "",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Message<'a> {
     ListRequest,
-    ListResponse(Vec<&'a str>),
+    ListResponse(Vec<Entry<'a>>),
     CallRequest {
         call_id: u32,
         name: &'a str,
@@ -110,14 +138,25 @@ pub fn encode_list_request() -> Vec<u8> {
     alloc::vec![LIST_REQUEST]
 }
 
-pub fn encode_list_response(names: &[&str]) -> Result<Vec<u8>, ToolMsgError> {
-    if names.len() > MAX_TOOLS || !names.iter().all(|n| valid_name(n)) {
+fn valid_endpoint(e: &str) -> bool {
+    e.len() <= MAX_ENDPOINT && e.bytes().all(|b| b.is_ascii_graphic())
+}
+
+pub fn encode_list_response(entries: &[Entry<'_>]) -> Result<Vec<u8>, ToolMsgError> {
+    if entries.len() > MAX_TOOLS
+        || !entries
+            .iter()
+            .all(|e| valid_name(e.name) && valid_endpoint(e.endpoint))
+    {
         return Err(ToolMsgError::TooLarge);
     }
-    let mut out = alloc::vec![LIST_RESPONSE, names.len() as u8];
-    for n in names {
-        out.push(n.len() as u8);
-        out.extend_from_slice(n.as_bytes());
+    let mut out = alloc::vec![LIST_RESPONSE, entries.len() as u8];
+    for e in entries {
+        out.push(e.name.len() as u8);
+        out.extend_from_slice(e.name.as_bytes());
+        out.push(e.flags);
+        out.push(e.endpoint.len() as u8);
+        out.extend_from_slice(e.endpoint.as_bytes());
     }
     Ok(out)
 }
@@ -198,21 +237,33 @@ pub fn decode(b: &[u8]) -> Result<Message<'_>, ToolMsgError> {
             if count as usize > MAX_TOOLS {
                 return Err(bad);
             }
-            let mut names = Vec::new();
+            let mut entries = Vec::new();
             for _ in 0..count {
                 let (&len, tail) = r.split_first().ok_or(bad)?;
                 let name = tail.get(..len as usize).ok_or(bad)?;
                 let name = core::str::from_utf8(name).map_err(|_| bad)?;
-                if !valid_name(name) {
+                let tail = &tail[len as usize..];
+                let (&flags, tail) = tail.split_first().ok_or(bad)?;
+                let (&elen, tail) = tail.split_first().ok_or(bad)?;
+                let endpoint = tail.get(..elen as usize).ok_or(bad)?;
+                let endpoint = core::str::from_utf8(endpoint).map_err(|_| bad)?;
+                if !valid_name(name)
+                    || !valid_endpoint(endpoint)
+                    || flags & !(FLAG_CREDENTIAL | FLAG_REMOTE) != 0
+                {
                     return Err(bad);
                 }
-                names.push(name);
-                r = &tail[len as usize..];
+                entries.push(Entry {
+                    name,
+                    flags,
+                    endpoint,
+                });
+                r = &tail[elen as usize..];
             }
             if !r.is_empty() {
                 return Err(bad);
             }
-            Ok(Message::ListResponse(names))
+            Ok(Message::ListResponse(entries))
         }
         CALL_REQUEST => {
             let call_id = u32_at(rest)?;
@@ -271,11 +322,25 @@ mod tests {
     #[test]
     fn round_trips() {
         assert_eq!(decode(&encode_list_request()), Ok(Message::ListRequest));
-        let l = encode_list_response(&["echo", "word_count"]).unwrap();
-        assert_eq!(
-            decode(&l),
-            Ok(Message::ListResponse(alloc::vec!["echo", "word_count"]))
-        );
+        let entries = [
+            Entry {
+                name: "echo",
+                flags: 0,
+                endpoint: "mcp:demo",
+            },
+            Entry {
+                name: "model:remote",
+                flags: FLAG_CREDENTIAL | FLAG_REMOTE,
+                endpoint: "api.example.com:443",
+            },
+        ];
+        let l = encode_list_response(&entries).unwrap();
+        assert_eq!(decode(&l), Ok(Message::ListResponse(entries.to_vec())));
+        assert!(encode_list_response(&[Entry {
+            endpoint: "has space",
+            ..Entry::new("x")
+        }])
+        .is_err());
         let c = encode_call_request(7, "echo", br#"{"text":"hi"}"#).unwrap();
         assert_eq!(
             decode(&c),
@@ -359,7 +424,7 @@ mod tests {
         ));
         // Short and empty results are a single response.
         assert_eq!(encode_call_result(2, Status::Ok, b"").len(), 1);
-        assert!(encode_list_response(&["model:qwen2.5"]).is_ok());
+        assert!(encode_list_response(&[Entry::new("model:qwen2.5")]).is_ok());
     }
 
     #[test]
@@ -369,6 +434,9 @@ mod tests {
             &[9][..],
             &[LIST_REQUEST, 0][..],
             &[LIST_RESPONSE, 1, 5, b'a'][..],
+            &[LIST_RESPONSE, 1, 1, b'a', 0][..],
+            &[LIST_RESPONSE, 1, 1, b'a', 4, 0][..],
+            &[LIST_RESPONSE, 1, 1, b'a', 0, 1, b' '][..],
             &[CALL_REQUEST, 1, 0, 0, 0, 4, b'e', b'c', b'h', b'o', 9, 0][..],
             &[CALL_RESPONSE, 1, 0, 0, 0, 77, 0, 0][..],
             &[CALL_RESPONSE, 1, 0, 0, 0, 0, 3, 0, b'a'][..],

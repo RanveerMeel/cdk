@@ -152,13 +152,14 @@
                 <li>Host link to Linux with a post-quantum secure channel (X25519 + ML-KEM-768, hybrid-signed, pinned gateway)</li>
                 <li>MCP gateway: agent tool calls gated by capabilities and human approval, sealed and audit-logged</li>
                 <li>Models on Linux GPUs, granted per model; API keys stay in the gateway, never in the agent</li>
+                <li>Policy change review: every grant shown as a reach diff, checked against invariant rules, approved before it applies</li>
               </ul>
             </div>
             <div>
               <h3 class="status-head next">Next on the roadmap</h3>
               <ul class="checklist todo">
                 <li>Signed operator approvals; agents on every CPU</li>
-                <li>Policy change review: see the new reach of every grant before it takes effect</li>
+                <li>Distributed capabilities across CDK nodes</li>
                 <li>Native CPU inference demo; ARM64 port</li>
               </ul>
             </div>

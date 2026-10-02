@@ -24,6 +24,8 @@
 //! through without parsing. Results longer than one frame arrive as chunks
 //! and are copied into the agent's buffer as they come.
 
+extern crate alloc;
+
 use core::fmt::Write as _;
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -76,11 +78,92 @@ struct InFlight {
 static INFLIGHT: Mutex<heapless::Vec<InFlight, 8>> = Mutex::new(heapless::Vec::new());
 static NEXT_CALL: AtomicU32 = AtomicU32::new(1);
 
-/// Ask the gateway for its tools and register a `tool:<name>` object for
-/// each new one. Returns the tool names now available.
-pub fn sync(
-    kernel: &mut Kernel,
-) -> Result<heapless::Vec<String<{ tool::MAX_NAME }>, 16>, &'static str> {
+/// A tool or model as last approved by the operator (roadmap 2.9).
+struct Pinned {
+    kind: String<32>,
+    flags: u8,
+    endpoint: String<{ tool::MAX_ENDPOINT }>,
+    /// Session in which this listing was last confirmed; calls are allowed
+    /// only when it is the current one.
+    epoch: u32,
+}
+
+static MANIFEST: Mutex<heapless::Vec<Pinned, 32>> = Mutex::new(heapless::Vec::new());
+
+/// Approved gateway flags of a tool object (0 if not pinned).
+pub fn pinned_flags(kind: &str) -> u8 {
+    MANIFEST
+        .lock()
+        .iter()
+        .find(|p| p.kind == kind)
+        .map_or(0, |p| p.flags)
+}
+
+/// Approved endpoint of a tool object.
+pub fn pinned_endpoint(kind: &str) -> Option<String<{ tool::MAX_ENDPOINT }>> {
+    MANIFEST
+        .lock()
+        .iter()
+        .find(|p| p.kind == kind && !p.endpoint.is_empty())
+        .map(|p| p.endpoint.clone())
+}
+
+/// `(kind, flags, endpoint, callable now)` for each pinned tool or model.
+pub fn for_each_pinned(mut f: impl FnMut(&str, u8, &str, bool)) {
+    let epoch = crate::link::session_epoch();
+    for p in MANIFEST.lock().iter() {
+        f(
+            &p.kind,
+            p.flags,
+            &p.endpoint,
+            p.epoch == epoch && epoch != 0,
+        );
+    }
+}
+
+/// Whether calls to `kind` are allowed: its listing is approved and was
+/// confirmed in the current secure session.
+pub fn verified(kind: &str) -> bool {
+    let epoch = crate::link::session_epoch();
+    MANIFEST
+        .lock()
+        .iter()
+        .any(|p| p.kind == kind && p.epoch == epoch && epoch != 0)
+}
+
+/// One entry of the gateway's listing, owned.
+pub struct Listed {
+    pub kind: String<32>,
+    pub flags: u8,
+    pub endpoint: String<{ tool::MAX_ENDPOINT }>,
+}
+
+fn object_kind(name: &str) -> Option<String<32>> {
+    let mut kind: String<32> = String::new();
+    let written = if name.starts_with(tool::MODEL_PREFIX) {
+        kind.push_str(name).map_err(|_| core::fmt::Error)
+    } else {
+        write!(kind, "{KIND_PREFIX}{name}")
+    };
+    written.ok().map(|_| kind)
+}
+
+pub fn flag_names(flags: u8) -> &'static str {
+    match flags & (tool::FLAG_CREDENTIAL | tool::FLAG_REMOTE) {
+        0 => "-",
+        tool::FLAG_CREDENTIAL => "credential",
+        tool::FLAG_REMOTE => "remote",
+        _ => "credential,remote",
+    }
+}
+
+/// Ask the gateway for its tools and models and review the listing against
+/// the pinned manifest: unchanged entries are confirmed for this session; new
+/// or changed ones (other flags or endpoint) are shown with the agents they
+/// affect, checked against the policy rules, and pinned only if the operator
+/// approves. Until then calls to them fail with `EPOLICY`. Returns the
+/// listing.
+pub fn sync(kernel: &mut Kernel) -> Result<heapless::Vec<Listed, 16>, &'static str> {
     if !crate::link::is_secure() {
         return Err("no secure link (run link-secure)");
     }
@@ -88,8 +171,8 @@ pub fn sync(
         return Err("link not sealed");
     }
     let start = crate::cpu::rdtsc();
-    let mut names: Option<heapless::Vec<String<{ tool::MAX_NAME }>, 16>> = None;
-    while names.is_none() && crate::cpu::rdtsc().wrapping_sub(start) < 5_000 * 2_000_000 {
+    let mut listed: Option<heapless::Vec<Listed, 16>> = None;
+    while listed.is_none() && crate::cpu::rdtsc().wrapping_sub(start) < 5_000 * 2_000_000 {
         crate::link::recv(|m| {
             let crate::link::Incoming::Sealed(p) = m else {
                 return;
@@ -97,35 +180,180 @@ pub fn sync(
             match tool::decode(p) {
                 Ok(Message::ListResponse(list)) => {
                     let mut v = heapless::Vec::new();
-                    for n in list {
-                        let mut s = String::new();
-                        if s.push_str(n).is_ok() {
-                            let _ = v.push(s);
-                        }
+                    for e in list {
+                        let (Some(kind), Ok(endpoint)) =
+                            (object_kind(e.name), String::try_from(e.endpoint))
+                        else {
+                            continue; // name too long for an object kind
+                        };
+                        let _ = v.push(Listed {
+                            kind,
+                            flags: e.flags,
+                            endpoint,
+                        });
                     }
-                    names = Some(v);
+                    listed = Some(v);
                 }
                 Ok(Message::CallResponse { .. } | Message::CallChunk { .. }) => deliver(p),
                 _ => {}
             }
         });
     }
-    let names = names.ok_or("gateway did not answer tools/list")?;
-    for n in names.iter() {
-        let mut kind: String<32> = String::new();
-        let written = if n.starts_with(tool::MODEL_PREFIX) {
-            kind.push_str(n).map_err(|_| core::fmt::Error)
-        } else {
-            write!(kind, "{KIND_PREFIX}{n}")
-        };
-        if written.is_err() {
-            continue; // name too long for an object kind
+    let listed = listed.ok_or("gateway did not answer tools/list")?;
+    review_listing(kernel, &listed);
+    Ok(listed)
+}
+
+fn review_listing(kernel: &mut Kernel, listed: &[Listed]) {
+    let epoch = crate::link::session_epoch();
+    // Confirm unchanged entries; collect new and changed ones.
+    let mut pending: heapless::Vec<usize, 16> = heapless::Vec::new();
+    {
+        let mut m = MANIFEST.lock();
+        for (i, l) in listed.iter().enumerate() {
+            match m.iter_mut().find(|p| p.kind == l.kind) {
+                Some(p) if p.flags == l.flags && p.endpoint == l.endpoint => p.epoch = epoch,
+                _ => {
+                    let _ = pending.push(i);
+                }
+            }
         }
-        if kernel.resolve_object_ref(&kind).is_err() {
-            let _ = kernel.register_object(crate::object::KernelObject::new_compute(&kind, "tool"));
+        for p in m
+            .iter()
+            .filter(|p| !listed.iter().any(|l| l.kind == p.kind))
+        {
+            crate::println!("  - {} no longer offered by the gateway", p.kind);
         }
     }
-    Ok(names)
+    if pending.is_empty() {
+        return;
+    }
+
+    let policy = crate::policy::policy();
+    let before = crate::policy::current_grants(kernel);
+    // The same handles, seen with the listing's new attributes.
+    let mut after = before.clone();
+    for g in after.iter_mut() {
+        if let Some(&i) = pending.iter().find(|&&i| listed[i].kind == g.kind) {
+            g.flags = listed[i].flags;
+        }
+    }
+    let mut text = alloc::string::String::new();
+    crate::println!("=== POLICY CHANGE REVIEW: gateway listing ===");
+    for &i in &pending {
+        let l = &listed[i];
+        let old = MANIFEST
+            .lock()
+            .iter()
+            .find(|p| p.kind == l.kind)
+            .map(|p| (p.flags, p.endpoint.clone()));
+        let labels = policy.labels_of("", &l.kind, l.flags);
+        let mut line: String<256> = String::new();
+        match &old {
+            None => {
+                let _ = write!(line, "+ new {} via {} [", l.kind, l.endpoint);
+            }
+            Some((f, ep)) => {
+                let _ = write!(
+                    line,
+                    "~ CHANGED {}: endpoint {} -> {}, flags {} -> {} [",
+                    l.kind,
+                    ep,
+                    l.endpoint,
+                    flag_names(*f),
+                    flag_names(l.flags)
+                );
+            }
+        }
+        for (n, lab) in labels.iter().enumerate() {
+            let _ = write!(line, "{}{}", if n > 0 { "," } else { "" }, lab);
+        }
+        let _ = line.push(']');
+        crate::println!("  {}", line);
+        let _ = writeln!(text, "{line}");
+        for g in after.iter().filter(|g| g.kind == l.kind) {
+            crate::println!(
+                "      held by pid {} ({}){}",
+                g.pid,
+                crate::agent::permission_names(g.mask),
+                if old.is_some() {
+                    ": its reach changes"
+                } else {
+                    ""
+                }
+            );
+        }
+    }
+    let mut subj: String<48> = String::new();
+    let _ = write!(subj, "tools:{}-change(s)", pending.len());
+    if crate::policy::is_broken() {
+        crate::println!("policy: refused — the boot policy is malformed; these stay blocked");
+        audit::record(
+            EventKind::PolicyRefused,
+            &subj,
+            crate::policy::refuse_reason::POLICY_BROKEN,
+        );
+        return;
+    }
+    let old_v = policy.violations(&before);
+    let fresh: alloc::vec::Vec<_> = policy
+        .violations(&after)
+        .into_iter()
+        .filter(|v| !old_v.contains(v))
+        .collect();
+    if !fresh.is_empty() {
+        for v in &fresh {
+            crate::println!("  ! VIOLATION: {}", v);
+        }
+        crate::println!("policy: refused — calls to these stay blocked (EPOLICY)");
+        audit::record(
+            EventKind::PolicyRefused,
+            &subj,
+            crate::policy::refuse_reason::VIOLATION,
+        );
+        return;
+    }
+    if !crate::policy::confirm("Pin this gateway listing?") {
+        crate::println!("policy: declined — calls to these stay blocked (EPOLICY)");
+        audit::record(
+            EventKind::PolicyRefused,
+            &subj,
+            crate::policy::refuse_reason::DECLINED,
+        );
+        return;
+    }
+    {
+        let mut m = MANIFEST.lock();
+        for &i in &pending {
+            let l = &listed[i];
+            match m.iter_mut().find(|p| p.kind == l.kind) {
+                Some(p) => {
+                    p.flags = l.flags;
+                    p.endpoint = l.endpoint.clone();
+                    p.epoch = epoch;
+                }
+                None => {
+                    let _ = m.push(Pinned {
+                        kind: l.kind.clone(),
+                        flags: l.flags,
+                        endpoint: l.endpoint.clone(),
+                        epoch,
+                    });
+                }
+            }
+        }
+    }
+    for &i in &pending {
+        let kind = &listed[i].kind;
+        if kernel.resolve_object_ref(kind).is_err() {
+            let _ = kernel.register_object(crate::object::KernelObject::new_compute(kind, "tool"));
+        }
+    }
+    audit::record(
+        EventKind::PolicyApplied,
+        &subj,
+        crate::policy::digest(&text),
+    );
 }
 
 /// Whether any tool call is waiting for its result.
@@ -189,12 +417,24 @@ fn prepare(
             })
         })
         .ok_or(errno::EINVAL)?;
+    let kind: String<32> = kernel
+        .for_each_object_find(&cap.object_id)
+        .and_then(|o| String::try_from(o.kind.as_str()).ok())
+        .unwrap_or_default();
     if !cap.has_permission(&Permission::Execute) {
         crate::agent::audit_denied(pid, handle, "tool");
         return Err(errno::EPERM);
     }
     if !crate::link::is_secure() {
         return Err(errno::ENOLINK);
+    }
+    if !verified(&kind) {
+        audit::record_fmt(
+            EventKind::PolicyRefused,
+            format_args!("call:pid-{}:{}", pid, kind),
+            crate::policy::refuse_reason::UNREVIEWED_TOOL,
+        );
+        return Err(errno::EPOLICY);
     }
     let pml4 = crate::process::pml4_of(pid).ok_or(errno::EINVAL)?;
     let call = Call {

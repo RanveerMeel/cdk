@@ -66,6 +66,9 @@ pub mod errno {
     pub const ENOLINK: u64 = 9;
     /// The tool call got no result in time.
     pub const ETIMEDOUT: u64 = 10;
+    /// Blocked by policy review: the tool's listing changed and the
+    /// operator has not approved it (roadmap 2.9).
+    pub const EPOLICY: u64 = 11;
 }
 
 /// Encode an error code as a syscall return value.
@@ -288,6 +291,21 @@ pub fn grant(
     Ok(handle)
 }
 
+/// Whether `pid` has a handle table (is a live process).
+pub fn has_table(pid: u32) -> bool {
+    with_table(pid, |_| ()).is_ok()
+}
+
+/// Every capability held by every process (for policy review).
+pub fn for_each_cap(mut f: impl FnMut(u32, &Capability)) {
+    let tables = TABLES.lock();
+    for t in tables.iter().filter(|t| t.pid != 0) {
+        for cap in t.caps.iter().flatten() {
+            f(t.pid, cap);
+        }
+    }
+}
+
 /// `(handle, mask, object id)` for each handle `pid` holds.
 pub fn describe(pid: u32, mut f: impl FnMut(u32, u64, &str)) -> Result<(), HandleError> {
     with_table(pid, |t| {
@@ -461,7 +479,7 @@ fn prompt_console(req: &Pending) -> bool {
 }
 
 /// Read one line from the console; `y`/`yes` (any case) approves.
-fn read_decision() -> bool {
+pub fn read_decision() -> bool {
     #[cfg(target_os = "none")]
     {
         let mut line = [0u8; 8];
