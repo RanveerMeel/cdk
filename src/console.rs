@@ -1,5 +1,7 @@
 //! Interactive serial console — reads lines from COM1 and dispatches commands.
 
+extern crate alloc;
+
 use crate::allocator::FrameAllocator;
 use crate::capability::Capability;
 use crate::framebuffer::FRAMEBUFFER;
@@ -156,6 +158,7 @@ const COMMANDS: &[&str] = &[
     "link-secure",
     "tools",
     "tools-sync",
+    "policy",
     "capbench",
     "audit",
     "audit-verify",
@@ -644,6 +647,7 @@ fn dispatch(
         "link-secure" => cmd_link_secure(),
         "tools" => cmd_tools(kernel),
         "tools-sync" => cmd_tools_sync(kernel),
+        "policy" => cmd_policy(arg1, arg2, arg3, kernel),
         "capbench" => cmd_capbench(arg1, arg2, kernel),
         "audit" => cmd_audit(arg1),
         "audit-verify" => cmd_audit_verify(),
@@ -679,7 +683,7 @@ fn cmd_help() {
     crate::println!("  ls                List programs in the boot ramdisk (size, SHA-256)");
     crate::println!("  spawn <name>      Load a ramdisk program as a Ready process");
     crate::println!("  exec <name> [obj perms]  Load and run a ramdisk program (optionally grant a handle)");
-    crate::println!("  grant <pid> <obj> [perms]  Give a process a capability handle (default send,recv; add ,approval to require a human for each send)");
+    crate::println!("  grant <pid> <obj> [perms]  Give a process a capability handle (default send,recv; add ,approval to require a human for each send); shown as a reach diff and checked against the policy first");
     crate::println!("  handles <pid>     List a process's capability handles");
     crate::println!("  run-all           Run all Ready processes concurrently (preemptive)");
     crate::println!("  budget [ticks]    Show/set the per-process CPU budget (watchdog)");
@@ -756,8 +760,16 @@ fn cmd_help() {
     crate::println!("  link-send <text>  Send a DATA frame to the host gateway");
     crate::println!("  link-recv         Show frames received from the host gateway");
     crate::println!("  link-secure       Post-quantum handshake with the pinned gateway; seal all traffic");
-    crate::println!("  tools-sync        Fetch the gateway's MCP tools and register them as objects");
+    crate::println!("  tools-sync        Fetch the gateway's tools and models; review and pin new or changed ones");
     crate::println!("  tools             List registered tool objects (grant with: grant <pid> tool:<name> exec)");
+    crate::println!("  policy            Show rules, labels, review mode, and the pinned gateway listing");
+    crate::println!("  policy check      Check every agent's handles against the rules");
+    crate::println!("  policy reach      Show what each agent can reach, with labels");
+    crate::println!("  policy rule add <deny L | separate A B | approval L>   (reviewed)");
+    crate::println!("  policy rule del <n>         Remove rule n (reviewed)");
+    crate::println!("  policy label|unlabel <obj-or-kind> <label>          (reviewed)");
+    crate::println!("  policy begin|diff|commit|abort   Stage several grants, review them together");
+    crate::println!("  policy review on|off        Ask before applying (off = lab mode; rules still enforced)");
     crate::println!("  capbench <id> [n] Time n capability checks, uncached vs cached");
     crate::println!("  audit [n]         Show the last n audit records (default 12)");
     crate::println!("  audit-verify      Verify the audit hash chain and signed checkpoints");
@@ -1302,7 +1314,9 @@ fn cmd_audit(n_str: &str) {
                 crate::print!("{:#x} ", r.detail);
             } else if matches!(
                 r.kind,
-                crate::audit::EventKind::ProgramLoaded | crate::audit::EventKind::ToolCall
+                crate::audit::EventKind::ProgramLoaded
+                    | crate::audit::EventKind::ToolCall
+                    | crate::audit::EventKind::PolicyApplied
             ) {
                 crate::print!("sha256:{:016x} ", r.detail);
             } else if r.kind == crate::audit::EventKind::ToolResult {
@@ -1409,14 +1423,16 @@ fn cmd_link() {
 
 fn cmd_tools_sync(kernel: &mut Kernel) {
     match crate::tools::sync(kernel) {
-        Ok(names) => {
-            crate::println!("tools: gateway offers {} tool(s):", names.len());
-            for n in names.iter() {
-                if n.starts_with(cdk_link::tool::MODEL_PREFIX) {
-                    crate::println!("  {}", n);
-                } else {
-                    crate::println!("  {}{}", crate::tools::KIND_PREFIX, n);
-                }
+        Ok(listed) => {
+            crate::println!("tools: gateway offers {} tool(s):", listed.len());
+            for l in listed.iter() {
+                crate::println!(
+                    "  {:<22} {:<18} {:<24} {}",
+                    l.kind.as_str(),
+                    crate::tools::flag_names(l.flags),
+                    l.endpoint.as_str(),
+                    if crate::tools::verified(&l.kind) { "ok" } else { "BLOCKED (not approved)" }
+                );
             }
         }
         Err(e) => crate::println!("tools-sync: {}", e),
@@ -1428,12 +1444,212 @@ fn cmd_tools(kernel: &mut Kernel) {
     kernel.for_each_object(|o| {
         if crate::tools::wire_name(&o.kind).is_some() {
             any = true;
-            crate::println!("  {:<8} {}", o.id.as_str(), o.kind.as_str());
+            crate::println!(
+                "  {:<8} {:<22} {}",
+                o.id.as_str(),
+                o.kind.as_str(),
+                if crate::tools::verified(&o.kind) { "callable" } else { "blocked until tools-sync is approved" }
+            );
         }
     });
     if !any {
         crate::println!("tools: none registered (run link-secure, then tools-sync)");
     }
+}
+
+fn cmd_policy(sub: &str, a: &str, rest: &str, kernel: &mut Kernel) {
+    use crate::policy::{self, Edit, Rule};
+    let result = match sub {
+        "" | "show" => {
+            policy_show();
+            Ok(())
+        }
+        "check" => {
+            let p = policy::policy();
+            let v = p.violations(&policy::current_grants(kernel));
+            if v.is_empty() {
+                crate::println!("policy: OK — every handle satisfies all {} rule(s)", p.rules.len());
+            }
+            for x in &v {
+                crate::println!("  ! {}", x);
+            }
+            Ok(())
+        }
+        "reach" => {
+            let p = policy::policy();
+            let grants = policy::current_grants(kernel);
+            if grants.is_empty() {
+                crate::println!("policy: no agent holds any handle");
+            }
+            for g in &grants {
+                let c = policy::Change {
+                    pid: g.pid,
+                    object: g.object.clone(),
+                    kind: g.kind.clone(),
+                    flags: g.flags,
+                    added: g.mask & !policy::APPROVAL,
+                    gated: g.mask & policy::APPROVAL != 0,
+                };
+                let mut line: heapless::String<256> = heapless::String::new();
+                let _ = policy::render_change(&c, &p, "holds", &mut line);
+                crate::println!("  {}", line);
+            }
+            Ok(())
+        }
+        "rule" => match a {
+            "add" => Rule::parse(rest).and_then(|r| policy::edit(kernel, Edit::AddRule(r))),
+            "del" => match parse_u32(rest) {
+                Some(n) if n >= 1 => policy::edit(kernel, Edit::RemoveRule(n as usize - 1)),
+                _ => Err("usage: policy rule del <n> (see policy)"),
+            },
+            _ => Err("usage: policy rule add <rule> | policy rule del <n>"),
+        },
+        "label" | "unlabel" => {
+            let label = rest.trim();
+            if a.is_empty() || label.is_empty() || label.contains(' ') {
+                Err("usage: policy label|unlabel <obj-or-kind> <label>")
+            } else if sub == "label" {
+                policy::edit(kernel, Edit::AddLabel(a, label))
+            } else {
+                policy::edit(kernel, Edit::RemoveLabel(a, label))
+            }
+        }
+        "review" => match a {
+            "on" => {
+                policy::set_review(true);
+                Ok(())
+            }
+            "off" => {
+                crate::println!("policy: review OFF (lab mode) — changes apply without asking; rules are still enforced");
+                policy::set_review(false);
+                Ok(())
+            }
+            _ => Err("usage: policy review on|off"),
+        },
+        "begin" => policy::begin().map(|_| crate::println!("policy: batch open — grants are staged until policy commit")),
+        "diff" => {
+            let mut n = 0;
+            policy::peek_batch(|pid, o, p| {
+                n += 1;
+                crate::println!("  staged #{}: grant {} {} {}", n, pid, o, p);
+            });
+            if n == 0 {
+                crate::println!("policy: nothing staged");
+            }
+            Ok(())
+        }
+        "abort" => match policy::take_batch() {
+            Some(b) => {
+                crate::println!("policy: discarded {} staged grant(s)", b.len());
+                Ok(())
+            }
+            None => Err("no open batch"),
+        },
+        "commit" => policy_commit(kernel),
+        _ => Err("unknown policy command (see help)"),
+    };
+    if let Err(e) = result {
+        crate::println!("policy: {}", e);
+    }
+}
+
+fn policy_show() {
+    let p = crate::policy::policy();
+    crate::println!(
+        "policy: review {}{}",
+        if crate::policy::review_enabled() { "ON (every change is shown and must be approved)" } else { "OFF (lab mode)" },
+        if crate::policy::is_broken() { "; BOOT POLICY MALFORMED — all changes refused" } else { "" }
+    );
+    crate::println!("rules:");
+    if p.rules.is_empty() {
+        crate::println!("  (none)");
+    }
+    for (i, r) in p.rules.iter().enumerate() {
+        crate::println!("  {}. {}", i + 1, r);
+    }
+    crate::println!("labels (besides automatic tool, model, credential, remote):");
+    if p.labels.is_empty() {
+        crate::println!("  (none)");
+    }
+    for (sel, l) in &p.labels {
+        crate::println!("  {} -> {}", sel.as_str(), l.as_str());
+    }
+    crate::println!("pinned gateway listing:");
+    let mut any = false;
+    crate::tools::for_each_pinned(|kind, flags, ep, ok| {
+        any = true;
+        crate::println!(
+            "  {:<22} {:<18} {:<24} {}",
+            kind,
+            crate::tools::flag_names(flags),
+            ep,
+            if ok { "confirmed this session" } else { "not confirmed (run tools-sync)" }
+        );
+    });
+    if !any {
+        crate::println!("  (none — run link-secure, then tools-sync)");
+    }
+    if crate::policy::is_staging() {
+        crate::println!("a grant batch is open (policy diff / commit / abort)");
+    }
+}
+
+/// Resolve a grant request into a policy view of it.
+fn proposed_grant(pid: u32, obj_ref: &str, perms: &str, kernel: &Kernel) -> Result<(crate::policy::Grant, heapless::Vec<crate::capability::Permission, 7>), &'static str> {
+    let perms = if perms.is_empty() { "send,recv" } else { perms };
+    let perms = crate::agent::parse_permissions(perms).ok_or("bad permissions (use read,write,exec,send,recv,delete,approval or all)")?;
+    if !crate::agent::has_table(pid) {
+        return Err("no such process");
+    }
+    let id = kernel.resolve_object_ref(obj_ref).map_err(|_| "no such object")?;
+    let obj = kernel.for_each_object_find(&id).ok_or("no such object")?;
+    let mask = perms.iter().fold(0, |m, p| m | (1u64 << p.tag()));
+    let g = crate::policy::Grant::new(pid, &obj.id, &obj.kind, crate::tools::pinned_flags(&obj.kind), mask);
+    Ok((g, perms))
+}
+
+fn apply_grant(g: &crate::policy::Grant, perms: &[crate::capability::Permission], kernel: &Kernel) {
+    let Some(obj) = kernel.for_each_object_find(&g.object) else {
+        crate::println!("grant: object {} vanished", g.object.as_str());
+        return;
+    };
+    match crate::agent::grant(g.pid, obj, perms) {
+        Ok(h) => crate::println!(
+            "grant: pid={} handle={} -> {} [{}] (issued, Ed25519+ML-DSA-65)",
+            g.pid,
+            h,
+            g.object.as_str(),
+            crate::agent::permission_names(g.mask)
+        ),
+        Err(e) => crate::println!("grant failed: {:?}", e),
+    }
+}
+
+fn policy_commit(kernel: &mut Kernel) -> Result<(), &'static str> {
+    let batch = crate::policy::take_batch().ok_or("no open batch")?;
+    if batch.is_empty() {
+        return Err("batch was empty");
+    }
+    let mut grants: heapless::Vec<(crate::policy::Grant, heapless::Vec<crate::capability::Permission, 7>), 16> = heapless::Vec::new();
+    for (pid, o, p) in batch.iter() {
+        match proposed_grant(*pid, o, p, kernel) {
+            Ok(x) => {
+                let _ = grants.push(x);
+            }
+            Err(e) => {
+                crate::println!("policy: staged grant {} {} {}: {} — batch discarded", pid, o.as_str(), p.as_str(), e);
+                return Err("nothing applied");
+            }
+        }
+    }
+    let views: alloc::vec::Vec<crate::policy::Grant> = grants.iter().map(|(g, _)| g.clone()).collect();
+    if !crate::policy::review_grants(kernel, &views) {
+        return Err("batch not applied");
+    }
+    for (g, perms) in &grants {
+        apply_grant(g, perms, kernel);
+    }
+    Ok(())
 }
 
 fn cmd_link_secure() {
@@ -2718,33 +2934,22 @@ fn cmd_grant(pid_str: &str, obj_ref: &str, perms: &str, kernel: &mut Kernel) {
 }
 
 fn grant_handle(pid: u32, obj_ref: &str, perms: &str, kernel: &mut Kernel) {
-    let perms = if perms.is_empty() { "send,recv" } else { perms };
-    let Some(perms) = crate::agent::parse_permissions(perms) else {
-        crate::println!("grant: bad permissions (use read,write,exec,send,recv,delete or all)");
+    if crate::policy::is_staging() {
+        match crate::policy::stage(pid, obj_ref, perms) {
+            Ok(n) => crate::println!("policy: staged #{} (policy commit to review and apply)", n),
+            Err(e) => crate::println!("policy: {}", e),
+        }
         return;
-    };
-    let id = match kernel.resolve_object_ref(obj_ref) {
-        Ok(id) => id,
+    }
+    let (g, perms) = match proposed_grant(pid, obj_ref, perms, kernel) {
+        Ok(x) => x,
         Err(e) => {
-            crate::println!("grant: object '{}': {:?}", obj_ref, e);
+            crate::println!("grant: {}", e);
             return;
         }
     };
-    let Some(obj) = kernel.for_each_object_find(&id) else {
-        crate::println!("grant: object '{}' not found", obj_ref);
-        return;
-    };
-    match crate::agent::grant(pid, obj, &perms) {
-        Ok(h) => crate::println!(
-            "grant: pid={} handle={} -> {} [{}] (issued, Ed25519+ML-DSA-65)",
-            pid,
-            h,
-            id,
-            crate::agent::permission_names(
-                perms.iter().fold(0, |m, p| m | (1u64 << p.tag()))
-            )
-        ),
-        Err(e) => crate::println!("grant failed: {:?}", e),
+    if crate::policy::review_grants(kernel, &[g.clone()]) {
+        apply_grant(&g, &perms, kernel);
     }
 }
 

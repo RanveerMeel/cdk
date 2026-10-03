@@ -70,6 +70,9 @@ pub enum Error {
     NoLink,
     /// The tool call got no result in time.
     TimedOut,
+    /// The tool's gateway listing changed and the operator has not approved
+    /// it (policy review); calls are blocked until they do.
+    PolicyBlocked,
     /// Unrecognized error code.
     Other(u64),
 }
@@ -87,6 +90,7 @@ impl Error {
             8 => Error::HumanDenied,
             9 => Error::NoLink,
             10 => Error::TimedOut,
+            11 => Error::PolicyBlocked,
             c => Error::Other(c),
         }
     }

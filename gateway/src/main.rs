@@ -105,16 +105,30 @@ fn handle_tool(
 ) -> Vec<Vec<u8>> {
     match tool::decode(msg) {
         Ok(tool::Message::ListRequest) => {
-            let names: Vec<String> = registry
+            // (name, flags, endpoint); MCP tools are reported by server, with
+            // no flags: the gateway cannot know what an MCP server reaches.
+            let listed: Vec<(String, u8, String)> = registry
                 .tool_names()
                 .into_iter()
-                .chain(models.iter().map(models::Backend::tool_name))
-                .filter(|n| allowed(n))
+                .map(|n| {
+                    let server = format!("mcp:{}", registry.server_of(&n).unwrap_or("?"));
+                    (n, 0, server)
+                })
+                .chain(models.iter().map(models::Backend::entry))
+                .filter(|(n, _, _)| allowed(n))
                 .take(tool::MAX_TOOLS)
                 .collect();
-            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-            eprintln!("gateway: <- tools/list, -> {refs:?}");
-            vec![tool::encode_list_response(&refs)
+            let entries: Vec<tool::Entry> = listed
+                .iter()
+                .map(|(name, flags, endpoint)| tool::Entry {
+                    name,
+                    flags: *flags,
+                    endpoint,
+                })
+                .collect();
+            let names: Vec<&str> = entries.iter().map(|e| e.name).collect();
+            eprintln!("gateway: <- tools/list, -> {names:?}");
+            vec![tool::encode_list_response(&entries)
                 .unwrap_or_else(|_| tool::encode_list_response(&[]).unwrap())]
         }
         Ok(tool::Message::CallRequest {
@@ -479,7 +493,14 @@ mod tests {
         let list = handle_tool(&tool::encode_list_request(), &mut r, &[], &allowed);
         match tool::decode(&list[0]).unwrap() {
             tool::Message::ListResponse(names) => {
-                assert_eq!(names.into_iter().collect::<Vec<&str>>(), ["echo"])
+                assert_eq!(
+                    names,
+                    [tool::Entry {
+                        name: "echo",
+                        flags: 0,
+                        endpoint: "mcp:demo"
+                    }]
+                )
             }
             other => panic!("unexpected {other:?}"),
         }

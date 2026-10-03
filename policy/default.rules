@@ -1,0 +1,24 @@
+# CDK boot policy (roadmap 2.9), packed into the ramdisk as policy.rules.
+# Every grant, policy edit, and gateway listing change is checked against
+# these rules before the operator is asked; a change that would break one
+# is refused. If this file is malformed, CDK refuses every change.
+#
+#   deny <label>                no agent may hold any handle on such objects
+#   separate <a> <b>            no agent may hold handles reaching both
+#   approval <label>            exec/send/write/delete on such objects must
+#                               carry the human-approval constraint
+#   label <object-or-kind> <l>  attach a label to an object id or kind
+#
+# Automatic labels: tool, model, credential (the gateway adds a key),
+# remote (requests leave this machine).
+
+# Anything that spends a credential or leaves the machine needs a human
+# decision on every use.
+approval credential
+approval remote
+
+# Example: keep agents that read customer data away from tools and
+# off-machine models.
+#   label obj-2 customer-data
+#   separate customer-data tool
+#   separate customer-data remote

@@ -184,6 +184,11 @@ impl Registry {
         names
     }
 
+    /// Name of the server that provides `tool`.
+    pub fn server_of(&self, tool: &str) -> Option<&str> {
+        self.owner.get(tool).map(|&i| self.servers[i].name.as_str())
+    }
+
     pub fn call(&mut self, tool: &str, args: &[u8]) -> Option<CallOutcome> {
         let idx = *self.owner.get(tool)?;
         Some(self.servers[idx].call(tool, args))

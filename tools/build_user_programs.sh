@@ -51,6 +51,14 @@ else
     echo "note: no $GATEWAY_PUB — the secure link will refuse to connect (run tools/run_gateway.sh --init)" >&2
 fi
 
+# Boot policy (roadmap 2.9): rules every grant and gateway change is checked
+# against. Override with CDK_POLICY_FILE (e.g. a deployment's policy kept
+# outside the repository).
+POLICY_FILE="${CDK_POLICY_FILE:-$ROOT/policy/default.rules}"
+if [ -f "$POLICY_FILE" ]; then
+    cp "$POLICY_FILE" "$STAGE/policy.rules"
+fi
+
 # Reproducible archive: fixed order, owner, and timestamps.
 (cd "$STAGE" && tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner \
     --mtime=@0 -cf "$OUT" -- *)

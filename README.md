@@ -37,6 +37,8 @@ CDK is **open core**. This repository — the kernel, the capability model, the 
 
 **Models on the Host, Credentials in the Gateway** — Large models run on Linux, next to its GPU drivers (vLLM, llama.cpp, Ollama, TensorRT-LLM, or a remote API — anything OpenAI-compatible). `CDK_MODEL="qwen=http://127.0.0.1:11434/v1,model=qwen2.5:3b-instruct" tools/run_gateway.sh` offers a local Ollama model; after `tools-sync` it is the kernel object `model:qwen`. `spawn analyst`, `grant 1 model:qwen exec` (add `,approval` to gate every prompt), `elf-run 1`. For a paid or remote API, add `key-file=PATH` (mode 0600) or `key-env=VAR`: the gateway attaches the key only to that backend's URL, never follows redirects, refuses keys over plaintext http to remote hosts, and scrubs the key from anything it returns. Agents and the kernel never see it.
 
+**Policy Change Review** — Nothing widens an agent's reach silently. `grant 1 model:demo exec` first prints a reach diff (`+ pid 1 'analyst' gains exec on obj-9 (model:demo) [model,credential] via 127.0.0.1:18080, NOT gated`), checks it against the policy rules, and asks before applying; with the default boot policy (`policy/default.rules`: `approval credential`, `approval remote`) that grant is refused until you add `,approval`. Rules are invariants over every agent's handles — `deny <label>`, `separate <a> <b>` (e.g. keep agents that read customer data away from tools), `approval <label>` — and labels come from the gateway (`credential`, `remote`) or the operator (`policy label obj-2 customer-data`). `tools-sync` pins the gateway's listing; if a model later gains a key or moves to another host, CDK shows which agents' reach changes, and calls to it fail with `PolicyBlocked` until the change is approved. `policy begin` … `policy commit` reviews several grants as one change. Use `CDK_POLICY_FILE` to pack your own rules; a malformed policy makes CDK refuse every change.
+
 **Human-Approval Gates** — Grant a handle with the `approval` constraint (`exec requester obj-2 send,approval`). Every `send` through it blocks the agent; the console shows who is asking, the target, and the exact payload (control characters escaped, so an agent can't forge console output), and the kernel performs the send only if the human answers `y`. Otherwise the agent gets `HumanDenied`. The constraint is part of the signed token and survives derivation; requests and decisions are audit-logged (`approval-asked`, `approval-yes`, `approval-no`).
 
 **Native Inference in Agents** — `user/ml` (`cdk-ml`) evaluates int8 linear models (`CDKLM1`) with integer arithmetic only, so agents need no FPU state. An agent embeds its model at build time, so the audit log's `program-loaded` SHA-256 identifies code *and* model. Demo: `send obj-2 server down, production outage`, `send obj-2 lunch menu for friday`, then `exec classify obj-2 recv`. The demo model (`user/models/priority-demo.cdklm`, message priority ROUTINE/URGENT) is synthetic and regenerated reproducibly by `tools/train_demo_model.py`.
@@ -213,7 +215,13 @@ cargo check --features virtio-hw
 | `link-recv` | Show frames received from the gateway (sealed ones are shown decrypted and marked authenticated) |
 | `link-secure` | Post-quantum handshake with the pinned gateway; afterwards all `link-send` traffic is sealed |
 | `tools-sync` | Ask the gateway for its MCP tools and register a `tool:<name>` object for each |
-| `tools` | List registered tool objects |
+| `tools` | List registered tool objects (and whether each is callable or blocked pending review) |
+| `policy` | Rules, labels, review mode, and the pinned gateway listing |
+| `policy check` / `policy reach` | Check all handles against the rules / show what each agent can reach |
+| `policy rule add <deny L \| separate A B \| approval L>`, `policy rule del <n>` | Edit rules (reviewed) |
+| `policy label <obj-or-kind> <l>`, `policy unlabel …` | Attach or remove a label (reviewed) |
+| `policy begin` / `diff` / `commit` / `abort` | Stage several grants and review them as one change |
+| `policy review on\|off` | Ask before applying (off = lab mode; rules stay enforced) |
 | `capsign <id>` | Issue a hybrid post-quantum capability for an object and verify it |
 | `capverify <id>` | Show unsigned, forged, and escalated tokens being rejected |
 | `capbench <id> [n]` | Time *n* capability checks without and with the verified-proof cache |
@@ -319,6 +327,7 @@ The full plan — phases, milestones, and editions — is in [ROADMAP.md](ROADMA
 - [x] Post-quantum secure channel to the gateway: hybrid X25519 + ML-KEM-768, hybrid-signed transcript, pinned gateway identity, ChaCha20-Poly1305 — roadmap milestone 3.2
 - [x] MCP gateway: agent tool calls gated by `exec` capabilities (optionally human-approved), sent sealed to MCP servers, and audit-logged — roadmap milestone 3.3
 - [x] Model inference through Linux-hosted model servers (OpenAI-compatible), per-model capabilities, gateway-side credential injection — roadmap milestone 3.4
+- [x] Policy change review: reach diffs, invariant rules, pinned gateway listings that block changed tools until approved, fail-closed boot policy — roadmap milestone 2.9
 - [x] Framebuffer text rendering (8×16 bitmap font, RGB/BGR/U8 pixel formats, auto-scroll)
 - [x] Network stack integration (loopback interfaces, capability-gated send/recv, object bridge routing, bindings, pump telemetry)
 - [x] External network transport (virtio-net MMIO bring-up path + non-loopback external interfaces via `eth0` default external backend and adapter-based transports)

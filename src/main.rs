@@ -326,6 +326,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
         // Tamper-evident audit log, bound to this issuer.
         cdk::audit::init();
+        // Boot policy (roadmap 2.9) from the ramdisk; logged to the audit log.
+        cdk::policy::load_boot_policy();
     }
 
     // Adopt the bootloader page tables (do not replace CR3) and identity-map

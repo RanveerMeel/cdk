@@ -97,6 +97,12 @@ pub enum EventKind {
     /// A tool call finished. `detail` = status << 32 | result length
     /// (`u64::MAX` = timed out).
     ToolResult = 20,
+    /// A policy change was reviewed and applied (roadmap 2.9). Subject names
+    /// the change; `detail` = first 8 bytes of SHA-256 of the reviewed diff.
+    PolicyApplied = 21,
+    /// A policy change or call was refused. `detail` =
+    /// [`crate::policy::refuse_reason`] code.
+    PolicyRefused = 22,
 }
 
 impl EventKind {
@@ -122,6 +128,8 @@ impl EventKind {
             EventKind::LinkRejected => "link-rejected",
             EventKind::ToolCall => "tool-call",
             EventKind::ToolResult => "tool-result",
+            EventKind::PolicyApplied => "policy-applied",
+            EventKind::PolicyRefused => "policy-refused",
         }
     }
 }
