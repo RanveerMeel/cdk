@@ -159,6 +159,7 @@ const COMMANDS: &[&str] = &[
     "tools",
     "tools-sync",
     "policy",
+    "operators",
     "capbench",
     "audit",
     "audit-verify",
@@ -648,6 +649,7 @@ fn dispatch(
         "tools" => cmd_tools(kernel),
         "tools-sync" => cmd_tools_sync(kernel),
         "policy" => cmd_policy(arg1, arg2, arg3, kernel),
+        "operators" => cmd_operators(),
         "capbench" => cmd_capbench(arg1, arg2, kernel),
         "audit" => cmd_audit(arg1),
         "audit-verify" => cmd_audit_verify(),
@@ -763,6 +765,7 @@ fn cmd_help() {
     crate::println!("  tools-sync        Fetch the gateway's tools and models; review and pin new or changed ones");
     crate::println!("  tools             List registered tool objects (grant with: grant <pid> tool:<name> exec)");
     crate::println!("  policy            Show rules, labels, review mode, and the pinned gateway listing");
+    crate::println!("  operators         Pinned operator keys and open signed-approval requests");
     crate::println!("  policy check      Check every agent's handles against the rules");
     crate::println!("  policy reach      Show what each agent can reach, with labels");
     crate::println!("  policy rule add <deny L | separate A B | approval L>   (reviewed)");
@@ -1317,6 +1320,7 @@ fn cmd_audit(n_str: &str) {
                 crate::audit::EventKind::ProgramLoaded
                     | crate::audit::EventKind::ToolCall
                     | crate::audit::EventKind::PolicyApplied
+                    | crate::audit::EventKind::ApprovalSigned
             ) {
                 crate::print!("sha256:{:016x} ", r.detail);
             } else if r.kind == crate::audit::EventKind::ToolResult {
@@ -1515,15 +1519,10 @@ fn cmd_policy(sub: &str, a: &str, rest: &str, kernel: &mut Kernel) {
             }
         }
         "review" => match a {
-            "on" => {
-                policy::set_review(true);
-                Ok(())
-            }
-            "off" => {
-                crate::println!("policy: review OFF (lab mode) — changes apply without asking; rules are still enforced");
-                policy::set_review(false);
-                Ok(())
-            }
+            "on" => policy::set_review(true),
+            "off" => policy::set_review(false).map(|_| {
+                crate::println!("policy: review OFF (lab mode) — changes apply without asking; rules are still enforced")
+            }),
             _ => Err("usage: policy review on|off"),
         },
         "begin" => policy::begin().map(|_| crate::println!("policy: batch open — grants are staged until policy commit")),
@@ -1553,6 +1552,34 @@ fn cmd_policy(sub: &str, a: &str, rest: &str, kernel: &mut Kernel) {
     }
 }
 
+fn cmd_operators() {
+    if !crate::approvals::signed_mode() {
+        crate::println!("approvals: console mode — no operator keys pinned (lab use; a typed y approves)");
+        crate::println!("           pin keys: cdk-approve init <name>, then rebuild the ramdisk");
+        return;
+    }
+    crate::println!("approvals: signed mode — {} operator key(s) pinned:", crate::approvals::operator_count());
+    crate::approvals::for_each_operator(|name, id| {
+        crate::print!("  {:<16} ", name);
+        print_hex(id);
+        crate::println!();
+    });
+    let mut any = false;
+    crate::approvals::for_each_open(|id, kind, got, quorum| {
+        any = true;
+        crate::println!(
+            "  open request #{} ({}): {} of {} approval(s)",
+            id,
+            if kind == cdk_link::approval::KIND_POLICY { "policy change" } else { "agent action" },
+            got,
+            quorum
+        );
+    });
+    if !any {
+        crate::println!("  no open requests");
+    }
+}
+
 fn policy_show() {
     let p = crate::policy::policy();
     crate::println!(
@@ -1573,6 +1600,18 @@ fn policy_show() {
     }
     for (sel, l) in &p.labels {
         crate::println!("  {} -> {}", sel.as_str(), l.as_str());
+    }
+    if crate::approvals::signed_mode() {
+        crate::print!("approvals: signed by operators; time-out {} s; quorum", p.approval_timeout_s);
+        if p.quorums.is_empty() {
+            crate::print!(" 1 for everything");
+        }
+        for (l, n) in &p.quorums {
+            crate::print!(" {}={}", l.as_str(), n);
+        }
+        crate::println!(" (see operators)");
+    } else {
+        crate::println!("approvals: console (no operator keys pinned)");
     }
     crate::println!("pinned gateway listing:");
     let mut any = false;

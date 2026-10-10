@@ -25,6 +25,8 @@
 //! little-endian `u32`s: handle index and permission mask (bit = permission
 //! tag, as in [`Capability::permission_mask`]).
 
+extern crate alloc;
+
 use spin::Mutex;
 
 use crate::audit::{self, reject_reason, EventKind};
@@ -347,6 +349,11 @@ pub struct Pending {
     cap: Capability,
     payload: heapless::Vec<u8, PENDING_PAYLOAD>,
     pub action: Action,
+    /// Signed-approval request id (roadmap 2.8), when operator keys are
+    /// pinned.
+    signed: Option<u32>,
+    /// Signed mode, but the request could not be sent: denied.
+    unsendable: bool,
 }
 
 impl Pending {
@@ -373,7 +380,50 @@ pub fn has_pending() -> bool {
 /// Ask the human at the console about every pending request, apply each
 /// decision, and resume the waiting processes. Returns how many were decided.
 pub fn resolve_approvals() -> usize {
-    resolve_with(prompt_console)
+    if crate::approvals::signed_mode() {
+        resolve_signed()
+    } else {
+        resolve_with(prompt_console)
+    }
+}
+
+/// Apply every pending request whose signed decision is in (non-blocking).
+fn resolve_signed() -> usize {
+    crate::approvals::pump();
+    let mut n = 0;
+    loop {
+        let ready = {
+            let mut q = PENDING.lock();
+            let pos = q.iter().position(|r| {
+                r.unsendable || r.signed.is_some_and(|id| crate::approvals::outcome(id).is_some())
+            });
+            pos.and_then(|i| {
+                // Deque has no remove(i): rotate the ready request to the front.
+                for _ in 0..i {
+                    let x = q.pop_front()?;
+                    let _ = q.push_back(x);
+                }
+                q.pop_front()
+            })
+        };
+        let Some(req) = ready else {
+            break;
+        };
+        let approved = req
+            .signed
+            .is_some_and(|id| crate::approvals::outcome(id) == Some(crate::approvals::Outcome::Approved));
+        if let Some(id) = req.signed {
+            crate::approvals::close(id);
+        }
+        crate::println!(
+            "  -> request #{} {}",
+            req.id,
+            if approved { "APPROVED by operator signature(s)" } else { "DENIED" }
+        );
+        apply(req, approved);
+        n += 1;
+    }
+    n
 }
 
 /// Decide every pending request with `decide` (tests use a scripted one).
@@ -385,6 +435,15 @@ pub fn resolve_with(mut decide: impl FnMut(&Pending) -> bool) -> usize {
             break;
         };
         let approved = decide(&req);
+        apply(req, approved);
+        n += 1;
+    }
+    n
+}
+
+/// Record the decision on `req`, perform it if approved, resume the agent.
+fn apply(req: Pending, approved: bool) {
+    {
         let kind = if approved {
             EventKind::ApprovalGranted
         } else {
@@ -417,9 +476,7 @@ pub fn resolve_with(mut decide: impl FnMut(&Pending) -> bool) -> usize {
         if let Some(r) = result {
             crate::process::unblock(req.pid, r);
         }
-        n += 1;
     }
-    n
 }
 
 /// Write `bytes` so that nothing an agent sends can move the cursor, clear
@@ -438,40 +495,53 @@ pub fn write_sanitized(bytes: &[u8], mut out: impl FnMut(&str)) {
     }
 }
 
-fn prompt_console(req: &Pending) -> bool {
+/// What a request asks for, as shown to the console and to operators.
+fn describe_request(req: &Pending) -> alloc::string::String {
+    use core::fmt::Write as _;
+    let mut t = alloc::string::String::new();
     let name = crate::process::name_of(req.pid);
-    crate::println!();
-    crate::println!("=== HUMAN APPROVAL REQUIRED (request #{}) ===", req.id);
-    crate::println!(
-        "  agent  : pid {} '{}'",
-        req.pid,
-        name.as_ref().map_or("?", |n| n.as_str())
-    );
+    let _ = writeln!(t, "=== HUMAN APPROVAL REQUIRED (request #{}) ===", req.id);
+    let _ = writeln!(t, "  agent  : pid {} '{}'", req.pid, name.as_ref().map_or("?", |n| n.as_str()));
     match &req.action {
-        Action::Send => crate::println!(
-            "  action : send {} bytes to {} (handle h{})",
-            req.payload.len(),
-            req.object(),
-            req.handle
-        ),
+        Action::Send => {
+            let _ = writeln!(
+                t,
+                "  action : send {} bytes to {} (handle h{})",
+                req.payload.len(),
+                req.object(),
+                req.handle
+            );
+        }
         Action::Tool { tool, .. } => match tool.strip_prefix(cdk_link::tool::MODEL_PREFIX) {
-            Some(model) => crate::println!(
-                "  action : prompt model '{}' ({}, handle h{}) via the gateway",
-                model,
-                req.object(),
-                req.handle
-            ),
-            None => crate::println!(
-                "  action : call tool '{}' ({}, handle h{}) via the gateway",
-                tool,
-                req.object(),
-                req.handle
-            ),
+            Some(model) => {
+                let _ = writeln!(
+                    t,
+                    "  action : prompt model '{}' ({}, handle h{}) via the gateway",
+                    model,
+                    req.object(),
+                    req.handle
+                );
+            }
+            None => {
+                let _ = writeln!(
+                    t,
+                    "  action : call tool '{}' ({}, handle h{}) via the gateway",
+                    tool,
+                    req.object(),
+                    req.handle
+                );
+            }
         },
     }
-    crate::print!("  data   : \"");
-    write_sanitized(&req.payload, |s| crate::print!("{}", s));
-    crate::println!("\"");
+    t.push_str("  data   : \"");
+    write_sanitized(&req.payload, |s| t.push_str(s));
+    t.push_str("\"\n");
+    t
+}
+
+fn prompt_console(req: &Pending) -> bool {
+    crate::println!();
+    crate::print!("{}", describe_request(req));
     crate::print!("Approve? [y/N] ");
     let approved = read_decision();
     crate::println!("  -> {}", if approved { "APPROVED" } else { "DENIED" });
@@ -688,23 +758,55 @@ fn enqueue(pid: u32, handle: u64, cap: Capability, payload: &[u8], action: Actio
     let id = NEXT_REQUEST.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let object = cap.object_id.clone();
     let payload = heapless::Vec::from_slice(payload).map_err(|_| ())?;
-    PENDING
-        .lock()
-        .push_back(Pending {
-            id,
-            pid,
-            handle,
-            cap,
-            payload,
-            action,
-        })
-        .map_err(|_| ())?;
+    let mut req = Pending {
+        id,
+        pid,
+        handle,
+        cap,
+        payload,
+        action,
+        signed: None,
+        unsendable: false,
+    };
     audit::record_fmt(
         EventKind::ApprovalRequested,
         format_args!("pid-{}:req-{}:{}", pid, id, object),
         id as u64,
     );
+    if crate::approvals::signed_mode() {
+        open_signed(&mut req);
+    }
+    PENDING.lock().push_back(req).map_err(|_| ())?;
     Ok(())
+}
+
+/// Show the request and send it for operator signatures (roadmap 2.8).
+fn open_signed(req: &mut Pending) {
+    let text = describe_request(req);
+    crate::println!();
+    crate::print!("{}", text);
+    let (quorum, ttl) = {
+        let policy = crate::policy::policy();
+        let kind: heapless::String<32> = kernel_ref()
+            .and_then(|k| k.for_each_object_find(req.object()))
+            .and_then(|o| heapless::String::try_from(o.kind.as_str()).ok())
+            .unwrap_or_default();
+        let labels = policy.labels_of(req.object(), &kind, crate::tools::pinned_flags(&kind));
+        (policy.quorum_for(&labels), policy.approval_timeout_s)
+    };
+    match crate::approvals::open(
+        cdk_link::approval::KIND_ACTION,
+        quorum,
+        ttl,
+        &req.payload,
+        crate::approvals::fit_text(&text),
+    ) {
+        Ok(sid) => req.signed = Some(sid),
+        Err(e) => {
+            crate::println!("  signed approval: {} — denied", e);
+            req.unsendable = true;
+        }
+    }
 }
 
 /// Queue a tool call on an approval-gated handle; the process blocks until
@@ -902,6 +1004,8 @@ mod tests {
             cap: c,
             payload: heapless::Vec::from_slice(b"transfer 5").unwrap(),
             action: Action::Send,
+            signed: None,
+            unsendable: false,
         });
         let mut seen = std::vec::Vec::new();
         let n = resolve_with(|req| {

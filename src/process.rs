@@ -676,6 +676,11 @@ pub fn run_scheduled(which: Select) -> Result<Vec<(u32, ExitStatus), MAX_PROCESS
                 break;
             }
             crate::agent::resolve_approvals();
+            if crate::approvals::signed_mode() && crate::agent::has_pending() {
+                // Agents waiting on operator signatures (roadmap 2.8).
+                crate::approvals::wait_any();
+                continue;
+            }
             if crate::tools::has_inflight() {
                 // Agents waiting on tool results: wait for one to finish.
                 crate::tools::wait_progress();

@@ -216,19 +216,61 @@ pub struct Change {
     pub gated: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Policy {
     pub rules: Vec<Rule, MAX_RULES>,
     /// `(object id or kind, label)`.
     pub labels: Vec<(String<32>, Label), MAX_LABELS>,
+    /// Signed approvals (roadmap 2.8): distinct operators required for
+    /// actions on objects with the label, or (`policy`) for policy changes.
+    pub quorums: Vec<(Label, u8), 8>,
+    /// Seconds an approval request waits before it is denied.
+    pub approval_timeout_s: u16,
 }
+
+impl Default for Policy {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Default approval time-out.
+pub const DEFAULT_APPROVAL_TIMEOUT_S: u16 = 300;
+/// The pseudo-label `quorum policy <n>` applies to.
+pub const POLICY_QUORUM: &str = "policy";
 
 impl Policy {
     pub const fn new() -> Self {
         Policy {
             rules: Vec::new(),
             labels: Vec::new(),
+            quorums: Vec::new(),
+            approval_timeout_s: DEFAULT_APPROVAL_TIMEOUT_S,
         }
+    }
+
+    /// Operators required for an action on an object with `labels` (at
+    /// least 1).
+    pub fn quorum_for(&self, labels: &[Label]) -> u8 {
+        self.quorums
+            .iter()
+            .filter(|(l, _)| labels.contains(l))
+            .map(|(_, n)| *n)
+            .max()
+            .unwrap_or(1)
+    }
+
+    /// Operators required to approve a policy change.
+    pub fn policy_quorum(&self) -> u8 {
+        self.quorums
+            .iter()
+            .find(|(l, _)| l == POLICY_QUORUM)
+            .map_or(1, |(_, n)| *n)
+    }
+
+    /// The largest quorum any rule asks for.
+    pub fn max_quorum(&self) -> u8 {
+        self.quorums.iter().map(|(_, n)| *n).max().unwrap_or(1)
     }
 
     /// Automatic and operator labels of an object.
@@ -325,7 +367,31 @@ impl Policy {
                 continue;
             }
             let e = |m| (i + 1, m);
-            if let Some(rest) = line.strip_prefix("label ") {
+            if let Some(rest) = line.strip_prefix("quorum ") {
+                let mut w = rest.split_whitespace();
+                let (Some(l), Some(n), None) = (w.next(), w.next(), w.next()) else {
+                    return Err(e("quorum <label|policy> <n>"));
+                };
+                let n: u8 = n
+                    .parse()
+                    .ok()
+                    .filter(|n| (1..=8).contains(n))
+                    .ok_or(e("quorum must be 1..=8"))?;
+                let l = label(l).map_err(e)?;
+                if p.quorums.iter().any(|(x, _)| *x == l) {
+                    return Err(e("quorum for this label already set"));
+                }
+                p.quorums
+                    .push((l, n))
+                    .map_err(|_| e("too many quorum rules"))?;
+            } else if let Some(rest) = line.strip_prefix("approval-timeout ") {
+                p.approval_timeout_s = rest
+                    .trim()
+                    .parse()
+                    .ok()
+                    .filter(|s| (10..=3600).contains(s))
+                    .ok_or(e("approval-timeout must be 10..=3600 seconds"))?;
+            } else if let Some(rest) = line.strip_prefix("label ") {
                 let mut w = rest.split_whitespace();
                 let (Some(sel), Some(l), None) = (w.next(), w.next(), w.next()) else {
                     return Err(e("label <object-or-kind> <label>"));
@@ -457,12 +523,31 @@ pub fn load_boot_policy() {
         .map_err(|_| (0, "not UTF-8"))
         .and_then(Policy::parse);
     match parsed {
+        Ok(p)
+            if crate::approvals::signed_mode()
+                && p.max_quorum() as usize > crate::approvals::operator_count() =>
+        {
+            crate::println!(
+                "policy: {} asks for a quorum of {} but only {} operator key(s) are pinned — refusing all policy changes",
+                POLICY_FILE,
+                p.max_quorum(),
+                crate::approvals::operator_count()
+            );
+            st.broken = true;
+            drop(st);
+            audit::record(
+                EventKind::PolicyRefused,
+                "boot:policy.rules",
+                refuse_reason::POLICY_BROKEN,
+            );
+        }
         Ok(p) => {
             crate::println!(
-                "policy: loaded {} ({} rule(s), {} label(s))",
+                "policy: loaded {} ({} rule(s), {} label(s), {} quorum rule(s))",
                 POLICY_FILE,
                 p.rules.len(),
-                p.labels.len()
+                p.labels.len(),
+                p.quorums.len()
             );
             st.policy = p;
             drop(st);
@@ -574,7 +659,31 @@ pub fn render_change(
 }
 
 /// Ask the operator (unless review is off). Prints the prompt.
-pub fn confirm(question: &str) -> bool {
+pub fn confirm(question: &str, reviewed: &str) -> bool {
+    if crate::approvals::signed_mode() {
+        let p = policy();
+        crate::println!("{} — operator signatures required", question);
+        let text = crate::approvals::fit_text(reviewed);
+        if text.len() < reviewed.len() {
+            crate::println!(
+                "policy: too much to review in one signed request; split it into smaller changes"
+            );
+            return false;
+        }
+        return match crate::approvals::open(
+            cdk_link::approval::KIND_POLICY,
+            p.policy_quorum(),
+            p.approval_timeout_s,
+            reviewed.as_bytes(),
+            text,
+        ) {
+            Ok(id) => crate::approvals::wait(id) == crate::approvals::Outcome::Approved,
+            Err(e) => {
+                crate::println!("policy: {}", e);
+                false
+            }
+        };
+    }
     if !review_enabled() {
         crate::println!("{} [review off: applied]", question);
         return true;
@@ -631,7 +740,7 @@ pub fn review_grants(kernel: &crate::kernel::Kernel, proposed: &[Grant]) -> bool
         audit::record(EventKind::PolicyRefused, &subj, refuse_reason::VIOLATION);
         return false;
     }
-    if !confirm("Apply this policy change?") {
+    if !confirm("Apply this policy change?", &text) {
         crate::println!("policy: declined");
         audit::record(EventKind::PolicyRefused, &subj, refuse_reason::DECLINED);
         return false;
@@ -690,7 +799,7 @@ pub fn edit(kernel: &crate::kernel::Kernel, e: Edit<'_>) -> Result<(), &'static 
         audit::record(EventKind::PolicyRefused, &subj, refuse_reason::VIOLATION);
         return Err("current handles violate the new policy");
     }
-    if !confirm("Apply this policy change?") {
+    if !confirm("Apply this policy change?", &text) {
         audit::record(EventKind::PolicyRefused, &subj, refuse_reason::DECLINED);
         return Err("declined");
     }
@@ -701,10 +810,14 @@ pub fn edit(kernel: &crate::kernel::Kernel, e: Edit<'_>) -> Result<(), &'static 
 }
 
 /// Turn the operator prompt on or off (rules stay enforced either way).
-pub fn set_review(on: bool) {
+pub fn set_review(on: bool) -> Result<(), &'static str> {
+    if !on && crate::approvals::signed_mode() {
+        return Err("review cannot be turned off while operator keys are pinned");
+    }
     STATE.lock().review = on;
     let what = if on { "review:on" } else { "review:off" };
     audit::record(EventKind::PolicyApplied, what, digest(what));
+    Ok(())
 }
 
 // --- staged batches -------------------------------------------------------
@@ -876,6 +989,28 @@ mod tests {
     fn default_policy_file_parses() {
         let p = Policy::parse(include_str!("../policy/default.rules")).unwrap();
         assert_eq!(p.rules.len(), 2);
+    }
+
+    #[test]
+    fn quorum_and_timeout_rules() {
+        let p = policy("quorum credential 2\nquorum policy 3\napproval-timeout 60\nlabel obj-2 customer-data\nquorum customer-data 2\n");
+        assert_eq!(p.approval_timeout_s, 60);
+        assert_eq!(p.policy_quorum(), 3);
+        assert_eq!(p.max_quorum(), 3);
+        let l = p.labels_of("obj-9", "model:paid", FLAG_CREDENTIAL);
+        assert_eq!(p.quorum_for(&l), 2);
+        assert_eq!(p.quorum_for(&p.labels_of("obj-4", "tool:echo", 0)), 1);
+        assert_eq!(Policy::new().approval_timeout_s, DEFAULT_APPROVAL_TIMEOUT_S);
+        for (bad, line) in [
+            ("quorum credential 0\n", 1),
+            ("quorum credential 9\n", 1),
+            ("quorum credential\n", 1),
+            ("quorum a 2\nquorum a 3\n", 2),
+            ("approval-timeout 5\n", 1),
+            ("approval-timeout 4000\n", 1),
+        ] {
+            assert_eq!(Policy::parse(bad).unwrap_err().0, line, "{bad:?}");
+        }
     }
 
     #[test]

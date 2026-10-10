@@ -3,6 +3,7 @@
 
 pub mod acpi;
 pub mod agent;
+pub mod approvals;
 pub mod allocator;
 pub mod audit;
 pub mod capability;

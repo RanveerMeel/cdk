@@ -142,6 +142,11 @@ pub struct Signature {
 }
 
 impl Signature {
+    /// Parse `ed25519 ‖ ml-dsa-65` ([`SIG_LEN`] bytes).
+    pub fn from_slice(b: &[u8]) -> Option<Self> {
+        (b.len() == SIG_LEN).then(|| Self::from_bytes(b))
+    }
+
     fn from_bytes(b: &[u8]) -> Self {
         let mut ed = [0u8; ED_SIG_LEN];
         ed.copy_from_slice(&b[..ED_SIG_LEN]);
@@ -150,7 +155,8 @@ impl Signature {
         Self { ed, ml }
     }
 
-    fn write_to(&self, out: &mut [u8]) {
+    /// Write `ed25519 ‖ ml-dsa-65` into `out[..SIG_LEN]`.
+    pub fn write_to(&self, out: &mut [u8]) {
         out[..ED_SIG_LEN].copy_from_slice(&self.ed);
         out[ED_SIG_LEN..SIG_LEN].copy_from_slice(&self.ml[..]);
     }
@@ -191,12 +197,18 @@ pub mod hybrid {
         }
 
         pub fn sign(&self, digest: &[u8; 32]) -> Signature {
+            self.sign_with(digest, CONTEXT)
+        }
+
+        /// Sign under another FIPS 204 context (e.g. approvals); the
+        /// digest itself must be domain-separated for the Ed25519 half.
+        pub fn sign_with(&self, digest: &[u8; 32], context: &[u8]) -> Signature {
             use ed25519_dalek::Signer;
             let ed = self.ed.sign(digest).to_bytes();
             let sig = self
                 .ml
                 .expanded_key()
-                .sign_deterministic(digest, CONTEXT)
+                .sign_deterministic(digest, context)
                 .expect("context under 255 bytes");
             let mut ml = Box::new([0u8; ML_SIG_LEN]);
             ml.copy_from_slice(&sig.encode());
@@ -206,6 +218,11 @@ pub mod hybrid {
 
     /// Both halves must verify (Ed25519 strictly).
     pub fn verify(id: &Identity, digest: &[u8; 32], sig: &Signature) -> bool {
+        verify_with(id, digest, sig, CONTEXT)
+    }
+
+    /// [`verify`] under another FIPS 204 context.
+    pub fn verify_with(id: &Identity, digest: &[u8; 32], sig: &Signature, context: &[u8]) -> bool {
         let Ok(ed) = ed25519_dalek::VerifyingKey::from_bytes(&id.ed) else {
             return false;
         };
@@ -223,7 +240,7 @@ pub mod hybrid {
             return false;
         };
         match ml_dsa::Signature::<MlDsa65>::decode(&enc) {
-            Some(s) => vk.verify_with_context(digest, CONTEXT, &s),
+            Some(s) => vk.verify_with_context(digest, context, &s),
             None => false,
         }
     }

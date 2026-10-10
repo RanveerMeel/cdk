@@ -236,7 +236,29 @@ The scheduler polls the link while calls are in flight. Each chunk and the final
 
 **Flow.** A `send` through a gated handle copies and validates the payload, queues a `Pending` request (id, pid, handle, token, payload), records `approval-asked`, and blocks. The scheduler loop, which regains control as soon as the agent blocks, prompts on the console: agent pid and name, target object, handle, and the payload with every non-printable byte, `"` and `\` escaped as `\xNN` (an agent cannot inject terminal control sequences or fake console text). `y`/`yes` approves: the kernel performs the send through `Kernel::send_message` (re-verifying the token) and returns its result; anything else returns `HumanDenied` (`-8`). Decisions are recorded as `approval-yes` / `approval-no`. Other agents are paused while the human decides.
 
-**Limits.** One console operator, whose identity is not cryptographically bound to the decision; only `send` is gated; requests wait indefinitely (the CPU-budget watchdog does not tick while blocked). Signed operator approvals and multi-party rules are roadmap item 2.8.
+**Limits (console mode).** Without pinned operator keys, the console operator's identity is not bound to the decision and requests wait indefinitely (the CPU-budget watchdog does not tick while blocked). Pinning operator keys switches to signed approvals (below). `send`, tool calls and model prompts can be gated.
+
+### Signed Operator Approvals (`src/approvals.rs`, `link/src/approval.rs`, `gateway/src/spool.rs`, `gateway/src/bin/cdk-approve.rs`)
+
+Roadmap 2.8. `approvals::load_operators` pins every `operator-<name>.pub` in the ramdisk (a 1984-byte hybrid identity: Ed25519 ‖ ML-DSA-65 public key, made by `cdk-approve init`). With at least one key pinned, approvals are signed:
+
+```
+agent blocks on a gated handle            policy change (grant, edit, listing)
+            └──────── approvals::open(kind, quorum, ttl, payload, text) ────────┘
+                 Request{id, issuer, kind, quorum, ttl_s, sha256(payload), text}
+                       ── sealed ──►  gateway spool  pending/<id>.req
+                                        cdk-approve list / approve / deny  (operator device)
+                       ◄── sealed ──  decisions/*.dec  (DecisionPart × 4)
+     verify(pinned key, statement(request, decision), signature, "CDK-APPROVAL-v1")
+```
+
+**The statement** each operator signs is SHA-256(`CDK-APPROVAL-v1` ‖ 0 ‖ id ‖ kernel issuer id ‖ kind ‖ quorum ‖ ttl ‖ payload digest ‖ text length ‖ text ‖ decision). The issuer id is regenerated every boot, so a decision cannot be replayed into another boot; the id makes it single-use within a boot; the decision byte means an approval can't be turned into a denial or the reverse. `cdk-approve` decodes the request itself, shows its text, and signs the statement it computes from the same bytes, so what the operator sees is what they sign. The signature (3,373 bytes) travels back in four `DecisionPart`s and is reassembled in order on the sealed channel.
+
+**Counting.** A vote counts only if the operator key is pinned, the request is open, and the hybrid signature verifies (both halves; Ed25519 strictly). Any valid denial vetoes the request. It is approved once `quorum` distinct operators have approved, and denied once `approval-timeout` passes. Policy rules: `quorum <label> <n>` for actions on objects with that label (the largest applicable quorum wins, default 1), `quorum policy <n>` for policy changes, `approval-timeout <s>` (10–3600, default 300). A boot policy whose quorum exceeds the number of pinned operators fails closed. `policy review off` is refused in signed mode. The scheduler keeps other agents running while one waits, and idles on the link when all are waiting.
+
+**Audit.** `approval-signed` (subject `req-R:<operator>:yes|no`, detail = first 8 bytes of SHA-256 of the signature), `approval-bad-sig` (detail 1 unknown key, 2 bad signature, 3 duplicate vote, 4 unknown request) and `approval-timeout`, plus the existing `approval-asked` / `approval-yes` / `approval-no` and `policy-applied` / `policy-refused`. The operator key set is recorded at boot (`policy-applied`, subject `operators:N`).
+
+**Trust.** The gateway and the spool are untrusted couriers: they can delay or drop requests (which then time out as denials) but cannot produce or alter a decision. Operator private keys live in 0600 files on the operator's machine; keep them off the gateway host. Hardware tokens (YubiKey, smart cards, HSMs) are the next step for the editions. The kernel holds only public keys, and their trust is only as good as the boot image until measured boot (roadmap 4.2). The audit log keeps a digest of each signature, not the signature itself; the spool's `sent/` directory holds the full decisions.
 
 ### Native Inference (`user/ml`, `user/models`, `tools/train_demo_model.py`)
 

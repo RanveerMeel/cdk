@@ -20,6 +20,7 @@
 
 extern crate alloc;
 
+pub mod approval;
 pub mod secure;
 pub mod tool;
 
