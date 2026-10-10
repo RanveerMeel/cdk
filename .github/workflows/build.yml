@@ -49,7 +49,27 @@ jobs:
         run: cd user/ml && cargo test --target x86_64-unknown-linux-gnu
 
       - name: Link protocol tests
-        run: cd link && cargo test --target x86_64-unknown-linux-gnu
+        run: cd link && cargo test --target x86_64-unknown-linux-gnu --lib
+
+      # NIST ACVP known-answer tests (roadmap 1.5): pinned, SHA-256-checked
+      # vectors; a missing file fails the build.
+      - name: Cache NIST ACVP vectors
+        uses: actions/cache@v4
+        with:
+          path: ~/acvp
+          key: acvp-${{ hashFiles('tools/fetch_acvp_vectors.sh') }}
+
+      - name: Kernel and tests use the same crypto crates
+        run: tools/check_crypto_versions.sh
+
+      - name: NIST ACVP vectors (ML-DSA-65, ML-KEM-768, Ed25519, SHA-256)
+        env:
+          CDK_ACVP_REQUIRED: "1"
+          RUSTFLAGS: --cfg curve25519_dalek_backend="serial"
+        run: |
+          export CDK_ACVP_DIR="$HOME/acvp"
+          tools/fetch_acvp_vectors.sh
+          cd link && cargo test --target x86_64-unknown-linux-gnu --test acvp -- --nocapture
 
       - name: Host gateway tests (runs the demo MCP server)
         run: cd gateway && cargo test --target x86_64-unknown-linux-gnu

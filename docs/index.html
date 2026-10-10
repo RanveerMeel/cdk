@@ -144,6 +144,7 @@
                 <li>Tamper-evident audit log: SHA-256 hash chain with hybrid-signed checkpoints</li>
                 <li>Fault containment: a crashing agent is terminated and logged; the kernel keeps running</li>
                 <li>Key hygiene: zeroized keys, scrubbed crypto stack, zero-on-free heap, known-answer tests</li>
+                <li>Crypto tested against NIST ACVP vectors: ML-DSA-65, ML-KEM-768, Ed25519, SHA-256 (854 test cases)</li>
                 <li>Rust agent programs loaded from a boot ramdisk, each traced to its SHA-256 in the audit log</li>
                 <li>Per-agent capability handles: agents can only derive weaker handles, never stronger ones</li>
                 <li>Preemptive scheduling of agents with a CPU-budget watchdog for runaway agents</li>

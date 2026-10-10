@@ -317,6 +317,7 @@ The full plan — phases, milestones, and editions — is in [ROADMAP.md](ROADMA
 - [x] Issuer-bound hybrid post-quantum capability tokens (Ed25519 + ML-DSA-65, format v1) — roadmap milestone 1.1
 - [x] Tamper-evident audit log with hybrid-signed checkpoints — roadmap milestone 1.2
 - [x] User-fault containment: a crashing ring-3 program is terminated, audit-logged, and the kernel keeps running — roadmap milestone 1.3
+- [x] NIST ACVP test vectors for ML-DSA-65, ML-KEM-768, Ed25519 and SHA-256 (854 test cases) plus RFC vectors for HKDF, X25519 and ChaCha20-Poly1305, run in CI — roadmap milestone 1.5
 - [x] Key hygiene: zeroized keys and seeds, scrubbed crypto stack, zero-on-free heap, RFC 8032 / IETF ML-DSA known-answer tests, verified-proof cache — roadmap milestone 1.4
 - [x] Rust user programs loaded from a boot ramdisk, with SHA-256 provenance in the audit log — roadmap milestone 2.1
 - [x] Per-agent capability handles: grant, list, derive (attenuate only), drop, send/recv — every use verified and audited — roadmap milestone 2.2

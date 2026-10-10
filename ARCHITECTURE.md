@@ -54,7 +54,7 @@ ML-DSA-65 needs more stack than any kernel stack provides (host measurements: ~2
 | No stack residue | The crypto stack is re-painted over the used region after every operation (`issuer` shows peak usage and residue, which is 0) |
 | No heap residue | The kernel allocator zeroes every block on free (volatile writes via `zeroize`), covering ML-DSA's heap-boxed intermediates |
 | Constant time | CDK code makes no secret-dependent comparisons; signature arithmetic and checks are inside `ed25519-dalek` and `ml-dsa` |
-| Known-answer tests | Ed25519: RFC 8032 §7.1 TEST 2 and 3 (also reproduced with OpenSSL). ML-DSA-65: key generation from seed `00..1f` reproduces the IETF LAMPS example public key. NIST ACVP signing/verification vectors are roadmap item 1.5. |
+| Known-answer tests | Ed25519: RFC 8032 §7.1 TEST 2 and 3 (also reproduced with OpenSSL). ML-DSA-65: key generation from seed `00..1f` reproduces the IETF LAMPS example public key. NIST ACVP vectors (roadmap 1.5, `link/tests/acvp.rs`): all ML-DSA-65 keyGen, sigGen and sigVer cases (external pure with contexts — what CDK uses — plus hedged, internal and external-μ; HashML-DSA pre-hash skipped), ML-KEM-768 keyGen and encapsulation/decapsulation including implicit rejection and key checks, Ed25519 keyGen/sigGen/sigVer, and SHA-256 AFT, Monte Carlo and large-data — from a pinned, SHA-256-checked ACVP-Server commit, run in CI with the kernel's portable backends; `tools/check_crypto_versions.sh` checks the kernel links the same crate versions. HKDF-SHA256 (RFC 5869), X25519 (RFC 7748) and ChaCha20-Poly1305 (RFC 8439) use their RFC vectors (`link/tests/rfc_vectors.rs`). Passing published vectors is not a CAVP certificate or FIPS 140 validation. |
 
 #### Verified-proof cache
 
