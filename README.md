@@ -1,6 +1,6 @@
 # CDK — Quantum-Safe Agent Trust Kernel
 
-**Website:** [https://ranveermeel.github.io/cdk/](https://ranveermeel.github.io/cdk/) _(GitHub Pages)_ · **Plan:** [ROADMAP.md](ROADMAP.md) · **Security:** [SECURITY.md](SECURITY.md)
+**Website:** [https://ranveermeel.github.io/cdk/](https://ranveermeel.github.io/cdk/) _(GitHub Pages)_ · **Plan:** [ROADMAP.md](ROADMAP.md) · **Security:** [SECURITY.md](SECURITY.md) · **Review brief:** [SECURITY-REVIEW.md](SECURITY-REVIEW.md)
 
 CDK (Cognitive Distributed Kernel) is an open-source, bare-metal Rust kernel for running **AI agents under kernel-enforced, cryptographically provable permissions**, built on **post-quantum cryptography** from the start.
 
@@ -42,6 +42,8 @@ CDK is **open core**. This repository — the kernel, the capability model, the 
 **Human-Approval Gates** — Grant a handle with the `approval` constraint (`exec requester obj-2 send,approval`). Every `send` through it blocks the agent; the console shows who is asking, the target, and the exact payload (control characters escaped, so an agent can't forge console output), and the kernel performs the send only if the human answers `y`. Otherwise the agent gets `HumanDenied`. The constraint is part of the signed token and survives derivation; requests and decisions are audit-logged (`approval-asked`, `approval-yes`, `approval-no`).
 
 **Signed Operator Approvals** — For real oversight, pin operator keys: `tools/approve.sh init alice` (and `bob`) creates hybrid Ed25519 + ML-DSA-65 keys in `target/operators/`; the public halves are packed into the ramdisk. From then on a typed `y` approves nothing. An approval-gated action or a policy change opens a signed request, which the gateway spools (`target/approvals/`). On the operator's device, `tools/approve.sh list` shows exactly what is asked, and `tools/approve.sh approve 3 --key target/operators/alice.key` (or `deny`) signs it. CDK verifies the signature against the pinned keys. The signed statement binds this boot, the request, the payload digest, the text shown, the quorum and the decision, so a gateway or spool in the middle can't forge or replay one. Add `quorum credential 2` to the policy for two-person control, `quorum policy 2` for policy changes, `approval-timeout 120` to deny unanswered requests. Any valid denial vetoes. Votes, bad signatures, unknown keys and time-outs are all audit-logged. `operators` shows the pinned keys and open requests.
+
+**Fuzzed and Sanitized** — Every place CDK reads bytes it didn't create has a fuzz target: link frames, the handshake, sealed frames, tool/model/approval messages, signature verification, ELF images, the ramdisk, policy files, the approval spool (`tools/fuzz.sh 300` runs them all for five minutes; CI replays past crashes and fuzzes each for 30 s). Inside the kernel, `spawn chaos` / `elf-run` fires 20,000 syscalls with kernel, unmapped, read-only and boundary-straddling pointers. Host test suites also pass under AddressSanitizer. See [SECURITY-REVIEW.md](SECURITY-REVIEW.md) for the threat model and findings.
 
 **Native Inference in Agents** — `user/ml` (`cdk-ml`) evaluates int8 linear models (`CDKLM1`) with integer arithmetic only, so agents need no FPU state. An agent embeds its model at build time, so the audit log's `program-loaded` SHA-256 identifies code *and* model. Demo: `send obj-2 server down, production outage`, `send obj-2 lunch menu for friday`, then `exec classify obj-2 recv`. The demo model (`user/models/priority-demo.cdklm`, message priority ROUTINE/URGENT) is synthetic and regenerated reproducibly by `tools/train_demo_model.py`.
 
@@ -331,6 +333,7 @@ The full plan — phases, milestones, and editions — is in [ROADMAP.md](ROADMA
 - [x] Post-quantum secure channel to the gateway: hybrid X25519 + ML-KEM-768, hybrid-signed transcript, pinned gateway identity, ChaCha20-Poly1305 — roadmap milestone 3.2
 - [x] MCP gateway: agent tool calls gated by `exec` capabilities (optionally human-approved), sent sealed to MCP servers, and audit-logged — roadmap milestone 3.3
 - [x] Model inference through Linux-hosted model servers (OpenAI-compatible), per-model capabilities, gateway-side credential injection — roadmap milestone 3.4
+- [x] Fuzzing of every parser of untrusted bytes (9 libFuzzer targets in CI), an in-kernel syscall fuzzer (`chaos`), AddressSanitizer on host tests — roadmap milestone 4.3 (independent review pending; see [SECURITY-REVIEW.md](SECURITY-REVIEW.md))
 - [x] Signed operator approvals: post-quantum operator signatures, M-of-N quorum, vetoes, time-outs, every vote audit-logged — roadmap milestone 2.8
 - [x] Policy change review: reach diffs, invariant rules, pinned gateway listings that block changed tools until approved, fail-closed boot policy — roadmap milestone 2.9
 - [x] Framebuffer text rendering (8×16 bitmap font, RGB/BGR/U8 pixel formats, auto-scroll)

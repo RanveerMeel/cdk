@@ -276,7 +276,7 @@ pub fn decode(b: &[u8]) -> Result<Message<'_>, ToolMsgError> {
             let r = &r[len as usize..];
             let alen = u16_at(r)?;
             let args = r.get(2..2 + alen).ok_or(bad)?;
-            if r.len() != 2 + alen {
+            if r.len() != 2 + alen || alen > MAX_BODY {
                 return Err(bad);
             }
             Ok(Message::CallRequest {
@@ -292,7 +292,7 @@ pub fn decode(b: &[u8]) -> Result<Message<'_>, ToolMsgError> {
             let status = Status::from_u8(st).ok_or(bad)?;
             let blen = u16_at(r)?;
             let body = r.get(2..2 + blen).ok_or(bad)?;
-            if r.len() != 2 + blen {
+            if r.len() != 2 + blen || blen > MAX_BODY {
                 return Err(bad);
             }
             Ok(Message::CallResponse {
@@ -444,5 +444,19 @@ mod tests {
         ] {
             assert_eq!(decode(b), Err(ToolMsgError::Malformed), "{b:?}");
         }
+    }
+
+    #[test]
+    fn decode_rejects_what_encode_refuses() {
+        // Found by fuzzing (fuzz/fuzz_targets/link_messages.rs): bodies longer
+        // than MAX_BODY used to decode although they cannot be encoded.
+        let mut req = alloc::vec![CALL_REQUEST, 1, 0, 0, 0, 1, b'x'];
+        req.extend_from_slice(&((MAX_BODY + 1) as u16).to_le_bytes());
+        req.resize(req.len() + MAX_BODY + 1, b'a');
+        assert_eq!(decode(&req), Err(ToolMsgError::Malformed));
+        let mut resp = alloc::vec![CALL_RESPONSE, 1, 0, 0, 0, 0];
+        resp.extend_from_slice(&((MAX_BODY + 1) as u16).to_le_bytes());
+        resp.resize(resp.len() + MAX_BODY + 1, b'a');
+        assert_eq!(decode(&resp), Err(ToolMsgError::Malformed));
     }
 }

@@ -117,7 +117,7 @@ copies, address-space teardown. See `README.md` for the full list.
 |---|---|---|
 | 4.1 | ARM64 port (edge / appliance hardware). | ⬜ |
 | 4.2 | Measured and verified boot chain (signed kernel images, hybrid signatures). | ⬜ |
-| 4.3 | Fuzzing (syscalls, ELF loader, token parsing), sanitizers on host tests, independent security review. | ⬜ |
+| 4.3 | **Fuzzing and sanitizers** ✅: nine libFuzzer targets cover every parser of untrusted bytes — link framing, handshake, sealed channel, tool/model/approval messages, hybrid signature verification, ELF loader, ramdisk, policy files, approval spool — with seeds (`tools/gen_fuzz_seeds.py`), replayed regressions and a CI smoke run (`tools/fuzz.sh`); the `chaos` ring-3 program fires 20,000 hostile syscalls in QEMU; host suites run under AddressSanitizer. Found and fixed: the ELF loader could copy a segment into kernel-shared memory (now `elf::validate` checks the whole image first), and a decoder/encoder length mismatch. **Independent security review** ⬜: brief in [SECURITY-REVIEW.md](SECURITY-REVIEW.md). | 🟡 |
 | 4.4 | Research: CDK as a minimal hypervisor with a Linux driver VM (VT-x/EPT, IOMMU passthrough). | ⬜ |
 
 ---

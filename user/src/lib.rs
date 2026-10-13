@@ -220,6 +220,15 @@ pub fn recv(handle: u32, buf: &mut [u8]) -> Result<usize, Error> {
     check(r).map(|n| n as usize)
 }
 
+/// Issue syscall `nr` with raw arguments, bypassing the safe wrappers. For
+/// robustness tests (`chaos`) only: the kernel must reject anything bad.
+///
+/// # Safety
+/// The kernel may write through pointer arguments it accepts.
+pub unsafe fn raw_syscall(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
+    syscall5(nr, a0, a1, a2, a3, a4)
+}
+
 #[inline]
 unsafe fn syscall5(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
     let ret: u64;

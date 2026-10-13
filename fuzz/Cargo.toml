@@ -1,0 +1,85 @@
+[package]
+name = "cdk-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Fuzz targets for every parser of untrusted bytes in CDK (roadmap 4.3)"
+license = "Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+cdk = { path = ".." }
+cdk-link = { path = "../link" }
+
+# Not part of the parent's build.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "frame_decoder"
+path = "fuzz_targets/frame_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "link_messages"
+path = "fuzz_targets/link_messages.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sealed_channel"
+path = "fuzz_targets/sealed_channel.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handshake"
+path = "fuzz_targets/handshake.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hybrid_verify"
+path = "fuzz_targets/hybrid_verify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "elf"
+path = "fuzz_targets/elf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "initrd"
+path = "fuzz_targets/initrd.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "policy"
+path = "fuzz_targets/policy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "spool_decision"
+path = "fuzz_targets/spool_decision.rs"
+test = false
+doc = false
+bench = false
