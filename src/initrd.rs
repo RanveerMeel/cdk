@@ -174,8 +174,19 @@ pub unsafe fn init(addr: u64, len: u64) {
     RAMDISK.call_once(|| core::slice::from_raw_parts(addr as *const u8, len as usize));
 }
 
-/// The raw ramdisk (empty if none was loaded).
+static LOCKED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Hide the ramdisk for the rest of this boot (verified-boot lockdown,
+/// roadmap 4.2): no programs, keys or policy are read from it any more.
+pub fn lock() {
+    LOCKED.store(true, core::sync::atomic::Ordering::SeqCst);
+}
+
+/// The raw ramdisk (empty if none was loaded, or after [`lock`]).
 pub fn archive() -> &'static [u8] {
+    if LOCKED.load(core::sync::atomic::Ordering::SeqCst) {
+        return &[];
+    }
     RAMDISK.get().copied().unwrap_or(&[])
 }
 

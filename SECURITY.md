@@ -42,6 +42,13 @@ In scope: everything in this repository, especially
 CDK is an **early development preview** and is not yet suitable for
 production. Known limitations are tracked in [ROADMAP.md](ROADMAP.md).
 
+## For reviewers
+
+[SECURITY-REVIEW.md](SECURITY-REVIEW.md) describes the threat model, every
+entry point for untrusted bytes and how it is tested (fuzz targets, NIST
+vectors, the `chaos` syscall program, AddressSanitizer), findings so far,
+and the areas that most need an expert. `tools/fuzz.sh` runs the fuzzers.
+
 ## Cryptography
 
 All algorithms and formats are public. CDK uses NIST-standardized

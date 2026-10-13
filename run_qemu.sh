@@ -23,6 +23,11 @@ if ! command -v qemu-system-x86_64 &> /dev/null; then
     exit 1
 fi
 
+# Release signing key (created once). Its public half is compiled into the
+# kernel (build.rs), which then verifies the ramdisk at boot (roadmap 4.2).
+# CDK_RELEASE_PUB=/dev/null builds an unverified development kernel.
+tools/sign.sh init >/dev/null
+
 # Build the kernel
 echo "Building kernel..."
 # Work around an LLVM backend crash observed with curve25519-dalek SIMD codegen
@@ -56,6 +61,8 @@ RAMDISK="target/initrd.tar"
 tools/build_user_programs.sh "$PWD/$RAMDISK"
 rustup run nightly cargo run --manifest-path tools/create_disk_image/Cargo.toml --release --target "$HOST_TARGET" -- \
     "$KERNEL_ELF" "$DISK_IMG" "$RAMDISK"
+# Expected boot measurements, for the gateway's attestation check (--expect).
+tools/sign.sh measure "$KERNEL_ELF" "$RAMDISK"
 
 RUN_IMG="$(mktemp /tmp/cdk_boot.XXXXXX)"
 trap 'rm -f "$RUN_IMG"' EXIT

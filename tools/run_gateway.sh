@@ -29,4 +29,9 @@ for spec in ${CDK_MODEL:-}; do MODELS+=(--model "$spec"); done
 # Signed approvals (roadmap 2.8): requests for operators and their decisions
 # (tools/approve.sh list / approve / deny). Override with CDK_APPROVAL_SPOOL.
 SPOOL=(--spool "${CDK_APPROVAL_SPOOL:-$ROOT/target/approvals}")
-exec "$BIN" "${ID[@]}" "${MCP[@]}" "${MODELS[@]}" "${SPOOL[@]}" ${CDK_MCP_ALLOW:+--allow "$CDK_MCP_ALLOW"} "${1:-$ROOT/target/cdk-link.sock}"
+# Attestation (roadmap 4.2): serve only a CDK whose measured boot matches the
+# build (run_qemu.sh writes target/boot.measurements). CDK_EXPECT=none: log only.
+EXPECT=()
+EXPECT_FILE="${CDK_EXPECT:-$ROOT/target/boot.measurements}"
+if [ "$EXPECT_FILE" != "none" ] && [ -f "$EXPECT_FILE" ]; then EXPECT=(--expect "$EXPECT_FILE"); fi
+exec "$BIN" "${ID[@]}" "${MCP[@]}" "${MODELS[@]}" "${SPOOL[@]}" "${EXPECT[@]}" ${CDK_MCP_ALLOW:+--allow "$CDK_MCP_ALLOW"} "${1:-$ROOT/target/cdk-link.sock}"

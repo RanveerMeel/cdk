@@ -34,6 +34,8 @@ pub enum ElfError {
     Map(PagingError),
     OutOfFrames,
     SegmentOverflow,
+    /// The entry point is not inside an executable `PT_LOAD` segment.
+    BadEntry,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -187,18 +189,21 @@ fn map_zeroed_page(
     Ok(phys)
 }
 
-/// Load all `PT_LOAD` segments into `aspace` (page-aligned map + copy/zero).
-///
-/// Segments and the entry point must lie in the user region
-/// ([`paging::USER_BASE`]..[`paging::USER_TOP`]).
-pub fn load_into(
-    img: &ElfImage<'_>,
-    aspace: &mut AddressSpace,
-    fa: &mut FrameAllocator,
-) -> Result<u64, ElfError> {
-    if !paging::is_user_range(img.entry, 1) {
-        return Err(ElfError::Map(PagingError::OutsideUserRegion));
+/// Most program headers an image may have.
+pub const MAX_PHNUM: u16 = 64;
+
+/// Check an image completely before anything is mapped: every `PT_LOAD`
+/// segment lies inside the user region, clear of the stack and its guard
+/// page, with its file bytes inside the image and sane sizes; the entry
+/// point is inside an executable segment. [`load_into`] calls this first —
+/// without it, a segment at an address the user page tables already
+/// translate (the kernel-shared slots) would have been *copied into*.
+pub fn validate(img: &ElfImage<'_>) -> Result<(), ElfError> {
+    if img.phnum == 0 || img.phnum > MAX_PHNUM {
+        return Err(ElfError::BadPhdr);
     }
+    let stack_low = USER_STACK_TOP - (USER_STACK_PAGES + 1) * FRAME_SIZE;
+    let mut entry_ok = false;
     for i in 0..img.phnum as usize {
         let ph = program_header(img, i)?;
         if ph.p_type != PT_LOAD {
@@ -206,6 +211,44 @@ pub fn load_into(
         }
         if ph.p_memsz < ph.p_filesz || ph.p_memsz > MAX_SEGMENT_BYTES {
             return Err(ElfError::SegmentOverflow);
+        }
+        let file_end = ph
+            .p_offset
+            .checked_add(ph.p_filesz)
+            .ok_or(ElfError::SegmentOverflow)?;
+        if file_end > img.bytes.len() as u64 {
+            return Err(ElfError::Truncated);
+        }
+        let (start, end) = segment_page_span(&ph)?;
+        if end < start || !paging::is_user_range(start, end - start) {
+            return Err(ElfError::Map(PagingError::OutsideUserRegion));
+        }
+        if start < USER_STACK_TOP && end > stack_low {
+            return Err(ElfError::Map(PagingError::OutsideUserRegion));
+        }
+        if ph.p_flags & PF_X != 0 && img.entry >= ph.p_vaddr && img.entry - ph.p_vaddr < ph.p_memsz
+        {
+            entry_ok = true;
+        }
+    }
+    if !entry_ok {
+        return Err(ElfError::BadEntry);
+    }
+    Ok(())
+}
+
+/// Load all `PT_LOAD` segments into `aspace` (page-aligned map + copy/zero)
+/// after [`validate`] accepts the whole image.
+pub fn load_into(
+    img: &ElfImage<'_>,
+    aspace: &mut AddressSpace,
+    fa: &mut FrameAllocator,
+) -> Result<u64, ElfError> {
+    validate(img)?;
+    for i in 0..img.phnum as usize {
+        let ph = program_header(img, i)?;
+        if ph.p_type != PT_LOAD {
+            continue;
         }
         let (start, end) = segment_page_span(&ph)?;
         let mut page = start;
@@ -439,6 +482,83 @@ pub fn load_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The smoke ELF with its only segment's fields patched.
+    fn patched(f: impl FnOnce(&mut [u8])) -> (std::vec::Vec<u8>, Result<(), ElfError>) {
+        let mut blob = [0u8; 256];
+        let n = build_smoke_elf(&mut blob).unwrap();
+        let mut b = blob[..n].to_vec();
+        f(&mut b);
+        let r = parse(&b).and_then(|img| validate(&img));
+        (b, r)
+    }
+
+    fn set_u64(b: &mut [u8], off: usize, v: u64) {
+        b[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    }
+
+    const PH: usize = EHDR_SIZE;
+
+    #[test]
+    fn validate_accepts_the_builtin_programs() {
+        for program in SmokeProgram::ALL {
+            let mut blob = [0u8; 256];
+            let n = build_program_elf(program, &mut blob).unwrap();
+            assert_eq!(validate(&parse(&blob[..n]).unwrap()), Ok(()));
+        }
+    }
+
+    #[test]
+    fn validate_rejects_segments_outside_the_user_region() {
+        // Regression: a segment at an address the user page tables already
+        // translate (kernel-shared slots) used to be copied into.
+        for vaddr in [0x1000, 0x8000, 0xFFFF_8000_0000_0000, paging::USER_TOP] {
+            let (_, r) = patched(|b| {
+                set_u64(b, PH + 16, vaddr);
+                set_u64(b, 24, vaddr); // keep the entry inside the segment
+            });
+            assert_eq!(
+                r,
+                Err(ElfError::Map(PagingError::OutsideUserRegion)),
+                "{vaddr:#x}"
+            );
+        }
+        // Straddling the top of the user region.
+        let (_, r) = patched(|b| {
+            set_u64(b, PH + 16, paging::USER_TOP - 0x10);
+            set_u64(b, 24, paging::USER_TOP - 0x10);
+        });
+        assert_eq!(r, Err(ElfError::Map(PagingError::OutsideUserRegion)));
+        // Over the user stack.
+        let (_, r) = patched(|b| {
+            set_u64(b, PH + 16, USER_STACK_TOP - 0x1000);
+            set_u64(b, 24, USER_STACK_TOP - 0x1000);
+        });
+        assert_eq!(r, Err(ElfError::Map(PagingError::OutsideUserRegion)));
+    }
+
+    #[test]
+    fn validate_rejects_bad_sizes_entries_and_counts() {
+        let (_, r) = patched(|b| set_u64(b, PH + 32, 1 << 20)); // filesz > memsz
+        assert_eq!(r, Err(ElfError::SegmentOverflow));
+        let (_, r) = patched(|b| {
+            set_u64(b, PH + 32, 4000); // file bytes past the end of the image
+            set_u64(b, PH + 40, 4000);
+        });
+        assert_eq!(r, Err(ElfError::Truncated));
+        let (_, r) = patched(|b| set_u64(b, PH + 8, u64::MAX)); // offset overflow
+        assert_eq!(r, Err(ElfError::SegmentOverflow));
+        let (_, r) = patched(|b| set_u64(b, PH + 40, MAX_SEGMENT_BYTES + 1));
+        assert_eq!(r, Err(ElfError::SegmentOverflow));
+        let (_, r) = patched(|b| set_u64(b, 24, SMOKE_VADDR + 0x10_0000)); // entry outside
+        assert_eq!(r, Err(ElfError::BadEntry));
+        let (_, r) = patched(|b| b[PH + 4] = PF_R as u8); // segment not executable
+        assert_eq!(r, Err(ElfError::BadEntry));
+        let (_, r) = patched(|b| b[56..58].copy_from_slice(&0u16.to_le_bytes()));
+        assert_eq!(r, Err(ElfError::BadPhdr));
+        let (_, r) = patched(|b| b[56..58].copy_from_slice(&(MAX_PHNUM + 1).to_le_bytes()));
+        assert_eq!(r, Err(ElfError::BadPhdr));
+    }
 
     #[test]
     fn build_and_parse_smoke_elf() {

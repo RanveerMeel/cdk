@@ -297,6 +297,8 @@ pub enum ProcessError {
     Busy,
     Elf(ElfError),
     Enter(&'static str),
+    /// Boot verification failed (roadmap 4.2): nothing may run.
+    Lockdown,
 }
 
 struct ProcessTable {
@@ -608,6 +610,10 @@ fn register(
     name: &str,
     fa: &mut FrameAllocator,
 ) -> Result<Process, ProcessError> {
+    if crate::boot::lockdown() {
+        aspace.destroy(fa);
+        return Err(ProcessError::Lockdown);
+    }
     let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
     let inserted = {
         let mut table = TABLE.lock();

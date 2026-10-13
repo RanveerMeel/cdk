@@ -326,6 +326,22 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
         // Tamper-evident audit log, bound to this issuer.
         cdk::audit::init();
+        // Verified and measured boot (roadmap 4.2): measure the kernel image
+        // and ramdisk, verify the ramdisk against the release key, and lock
+        // down before any pinned key or program is used if it fails.
+        let kernel_image: &[u8] = if phys_map_ready && boot_info.kernel_len > 0 {
+            // SAFETY: the bootloader keeps the kernel ELF in memory at
+            // kernel_addr (physical) for the kernel's lifetime.
+            unsafe {
+                core::slice::from_raw_parts(
+                    cdk::phys_mem::phys_to_ptr::<u8>(boot_info.kernel_addr),
+                    boot_info.kernel_len as usize,
+                )
+            }
+        } else {
+            &[]
+        };
+        cdk::boot::measure_and_verify(kernel_image);
         // Pinned operator keys (roadmap 2.8), then the boot policy (2.9),
         // whose quorum rules are checked against them.
         cdk::approvals::load_operators();

@@ -19,11 +19,14 @@
 //! * signed approvals (2.8): CDK's approval requests are written to a spool
 //!   directory for operators (`cdk-approve`), and their signed decisions are
 //!   forwarded back; CDK verifies every signature (`spool`).
+//! * attestation (4.2): after each handshake the gateway asks CDK for its
+//!   measured-boot registers; with `--expect FILE` it serves nothing unless
+//!   they match the build (`attestation`).
 //!
 //! ```text
 //! cdk-gateway --init [--identity FILE] [--pub-out FILE]   create identity, export public key
 //! cdk-gateway [--identity FILE] [--mcp NAME=COMMAND]... [--model SPEC]... [--allow t1,t2]
-//!             [--spool DIR] [SOCKET]
+//!             [--spool DIR] [--expect FILE] [SOCKET]
 //! ```
 //! The public key file (1984 bytes) is packed into CDK's ramdisk as
 //! `gateway.pub`; CDK refuses any other gateway.
@@ -39,6 +42,7 @@ use cdk_link::tool::{self, Status};
 use cdk_link::{kind, Decoder, MAX_FRAME};
 use rand_core::{OsRng, RngCore};
 
+mod attestation;
 mod mcp;
 mod models;
 mod spool;
@@ -184,6 +188,20 @@ fn handle_tool(
     }
 }
 
+/// Answer a tool message from an unattested CDK: an empty listing, or
+/// `Refused` for a call.
+fn refuse_unattested(msg: &[u8]) -> Vec<Vec<u8>> {
+    match tool::decode(msg) {
+        Ok(tool::Message::ListRequest) => vec![tool::encode_list_response(&[]).unwrap()],
+        Ok(tool::Message::CallRequest { call_id, .. }) => vec![tool::encode_call_response(
+            call_id,
+            Status::Refused,
+            b"the gateway refuses service: CDK's measured boot did not attest",
+        )],
+        _ => Vec::new(),
+    }
+}
+
 fn connect(path: &str) -> std::io::Result<UnixStream> {
     let deadline = Instant::now() + Duration::from_secs(60); // CDK may still be booting
     loop {
@@ -204,6 +222,7 @@ struct Args {
     models: Vec<String>,
     allow: Option<Vec<String>>,
     spool: PathBuf,
+    expect: Option<PathBuf>,
 }
 
 fn args() -> Args {
@@ -215,6 +234,7 @@ fn args() -> Args {
         mcp: Vec::new(),
         models: Vec::new(),
         spool: PathBuf::from("target/approvals"),
+        expect: None,
         allow: None,
     };
     let mut it = std::env::args().skip(1);
@@ -232,6 +252,7 @@ fn args() -> Args {
                 .models
                 .push(it.next().expect("--model NAME=URL[,options]")),
             "--spool" => a.spool = it.next().expect("--spool DIR").into(),
+            "--expect" => a.expect = Some(it.next().expect("--expect FILE").into()),
             "--allow" => {
                 let list = it.next().expect("--allow tool1,tool2");
                 a.allow = Some(list.split(',').map(str::to_string).collect());
@@ -314,6 +335,23 @@ fn main() -> std::io::Result<()> {
     let mut session: Option<Session> = None;
     let mut announced: Option<String> = None;
     let spool = spool::Spool::open(&a.spool)?;
+    let expect = a.expect.as_ref().map(|p| {
+        let text = std::fs::read_to_string(p).unwrap_or_else(|e| {
+            eprintln!("gateway: --expect {}: {e}", p.display());
+            std::process::exit(2)
+        });
+        cdk_link::attest::parse_expected(&text).unwrap_or_else(|| {
+            eprintln!("gateway: --expect {}: not a measurements file", p.display());
+            std::process::exit(2)
+        })
+    });
+    if let Some(p) = &a.expect {
+        eprintln!(
+            "gateway: attestation required: expected measurements {}",
+            p.display()
+        );
+    }
+    let mut attestor = attestation::Attestor::new(expect);
     eprintln!("gateway: approval spool {}", spool.dir().display());
     // Wake up regularly to forward operators' decisions.
     stream.set_read_timeout(Some(Duration::from_millis(250)))?;
@@ -391,6 +429,13 @@ fn main() -> std::io::Result<()> {
                                             hex(&client.id())
                                         );
                                         session = Some(s);
+                                        // Ask CDK to attest its measured boot.
+                                        if let Some(s) = session.as_mut() {
+                                            let req = attestor.request();
+                                            let mut out = [0u8; cdk_link::MAX_PAYLOAD];
+                                            let len = s.seal(&req, &mut out).expect("fits");
+                                            send(&mut stream, kind::SEALED, 0, &out[..len])?;
+                                        }
                                     }
                                     Err(e) => eprintln!("gateway: handshake rejected: {e:?}"),
                                 }
@@ -441,13 +486,26 @@ fn main() -> std::io::Result<()> {
                         };
                         let mut plain = [0u8; cdk_link::MAX_PAYLOAD];
                         match s.open(&payload, &mut plain) {
+                            Ok(m) if m > 0 && cdk_link::attest::is_attest(&plain[..m]) => {
+                                attestor.on_message(&plain[..m]);
+                            }
                             Ok(m) if m > 0 && cdk_link::approval::is_approval(&plain[..m]) => {
-                                spool.on_message(&plain[..m]);
+                                if attestor.serving() {
+                                    spool.on_message(&plain[..m]);
+                                } else {
+                                    eprintln!(
+                                        "gateway: approval message refused — CDK not attested"
+                                    );
+                                }
                             }
                             Ok(m) if plain[0] <= tool::LIST_RESPONSE && m > 0 => {
-                                for reply in
+                                let replies = if attestor.serving() {
                                     handle_tool(&plain[..m], &mut registry, &backends, &allowed)
-                                {
+                                } else {
+                                    eprintln!("gateway: tool message refused — CDK not attested");
+                                    refuse_unattested(&plain[..m])
+                                };
+                                for reply in replies {
                                     let mut out = [0u8; cdk_link::MAX_PAYLOAD];
                                     let len = s.seal(&reply, &mut out).expect("tool reply fits");
                                     send(&mut stream, kind::SEALED, 0, &out[..len])?;

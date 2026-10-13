@@ -291,7 +291,7 @@ fn review_listing(kernel: &mut Kernel, listed: &[Listed]) {
     let mut subj: String<48> = String::new();
     let _ = write!(subj, "tools:{}-change(s)", pending.len());
     if crate::policy::is_broken() {
-        crate::println!("policy: refused — the boot policy is malformed; these stay blocked");
+        crate::println!("policy: refused — {}; these stay blocked", crate::policy::broken_reason());
         audit::record(
             EventKind::PolicyRefused,
             &subj,

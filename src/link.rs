@@ -83,6 +83,9 @@ pub enum SecureError {
 /// Run the post-quantum handshake with the gateway and keep the session.
 pub fn secure_connect(timeout_ms: u64) -> Result<[u8; 16], SecureError> {
     let result = secure_connect_inner(timeout_ms);
+    if let Ok(id) = &result {
+        answer_attestation(id, 3000);
+    }
     match &result {
         Ok(id) => crate::audit::record_fmt(
             crate::audit::EventKind::LinkEstablished,
@@ -148,6 +151,42 @@ fn secure_connect_inner(timeout_ms: u64) -> Result<[u8; 16], SecureError> {
     *SESSION.lock() = Some(Established { session, gateway });
     EPOCH.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     Ok(id)
+}
+
+/// Answer the gateway's attestation request (roadmap 4.2), which it sends
+/// right after the handshake. A gateway that does not ask is not waited for
+/// beyond `timeout_ms`.
+fn answer_attestation(gateway: &[u8; 16], timeout_ms: u64) {
+    let start = crate::cpu::rdtsc();
+    let mut nonce = None;
+    while nonce.is_none() && crate::cpu::rdtsc().wrapping_sub(start) < timeout_ms * 2_000_000 {
+        recv(|m| {
+            if let Incoming::Sealed(p) = m {
+                if let Some(cdk_link::attest::Message::Request(n)) = cdk_link::attest::decode(p) {
+                    nonce = Some(n);
+                }
+            }
+        });
+        core::hint::spin_loop();
+    }
+    let Some(nonce) = nonce else {
+        crate::println!("link: gateway did not ask for attestation");
+        return;
+    };
+    if send_data(&crate::boot::attestation(&nonce)).is_ok() {
+        crate::println!(
+            "link: attestation sent (boot {}, measured registers)",
+            crate::boot::verdict().name()
+        );
+        crate::audit::record_fmt(
+            crate::audit::EventKind::Attested,
+            format_args!(
+                "gateway:{:02x}{:02x}{:02x}{:02x}",
+                gateway[0], gateway[1], gateway[2], gateway[3]
+            ),
+            crate::boot::verdict() as u64,
+        );
+    }
 }
 
 fn verify_hybrid(id: &Identity, digest: &[u8; 32], sig: &Signature) -> bool {

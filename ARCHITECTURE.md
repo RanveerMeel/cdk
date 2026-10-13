@@ -300,6 +300,25 @@ Roadmap 2.9. A change that could widen any agent's reach is reviewed before it t
 
 **Limits.** The reviewer is the console operator, not yet cryptographically identified (roadmap 2.8 will sign the diff digest). Rules and labels live in kernel memory; runtime edits are lost at reboot unless added to `policy.rules`. MCP tools are listed without flags because the gateway cannot know what an MCP server reaches; label them explicitly. Reach is computed over capability handles, not over what data flows through messages.
 
+### Verified and Measured Boot (`src/boot.rs`, `link/src/attest.rs`, `gateway/src/bin/cdk-sign.rs`, `gateway/src/attestation.rs`)
+
+Roadmap 4.2, with a software root of trust.
+
+**Release key.** `cdk-sign init` creates a hybrid Ed25519 + ML-DSA-65 key (`target/release-signing.key`, 0600; in production an HSM) and its public half `target/release.pub`, which `build.rs` compiles into the kernel (`CDK_RELEASE_PUB` overrides; an empty file builds an unverified kernel). `tools/build_user_programs.sh` runs `cdk-sign manifest` on the staged ramdisk before packing it: `boot.manifest` (`CDK-BOOT-MANIFEST-v1`, then one `<sha256> <name>` line per file, sorted) and `boot.manifest.sig`, the hybrid signature (FIPS 204 context `CDK-BOOT-v1`) over SHA-256(`CDK-BOOT-v1` ‖ 0 ‖ manifest).
+
+**At boot,** right after the audit log starts and before operator keys, the boot policy, the gateway key or any program is read, `boot::measure_and_verify`:
+
+1. extends register 0 with the kernel measurement: SHA-256 over every read-only `PT_LOAD` segment of the kernel ELF still in memory at `BootInfo::kernel_addr` (code, read-only data, headers; writable segments are relocated by the bootloader and change at run time, so they are not measured);
+2. extends register 1 with SHA-256 of the ramdisk archive;
+3. verifies the manifest signature with the compiled-in key and checks the ramdisk holds exactly the listed files with the listed digests (the manifest must be in canonical form);
+4. extends register 2 with the verdict (verified, unverified, failed) and the release key id.
+
+Registers are extended like TPM PCRs (`r = SHA-256(r ‖ digest)`), and every measurement is audit-logged (`boot-measured`, `boot-verified`, `boot-rejected`). On failure the kernel is in **lockdown**: `initrd::lock` hides the ramdisk (no programs, no `gateway.pub` so no link, no operator keys, no boot policy), `process::register` refuses every process (including built-in test programs), and the policy layer refuses every change.
+
+**Attestation.** After each handshake the gateway sends `AttestRequest { nonce }` (sealed); `link::secure_connect` waits up to 3 s for it and answers `Attest { nonce, verdict, release key id, registers, measurement log }`, audit-logged as `attested`. The answer travels inside the session authenticated by the hybrid-signed handshake, so it is bound to the kernel issuer the gateway verified. `cdk-sign measure <kernel ELF> <ramdisk>` writes the registers a correct boot produces (`target/boot.measurements`); `cdk-gateway --expect FILE` compares them exactly and, until they match, answers tool listings with nothing, tool and model calls with `Refused`, and ignores approval requests. A stale nonce is rejected.
+
+**Limits.** The registers are in kernel memory, not a TPM: a modified kernel could report the expected values. Kernel integrity therefore still rests on the boot medium until the registers are also extended into a TPM, or firmware (UEFI Secure Boot) measures and verifies the kernel — both future work. The ramdisk check does not depend on this: without the release key, no change to a program, key or policy passes it. The attestation is not yet an exportable signed quote (it is authenticated by the session, not signed on its own).
+
 ### Audit Log (`src/audit.rs`)
 
 A tamper-evident record of security-relevant events: capability issuance (`cap-issued`), every capability check (`cap-accepted`, or `cap-rejected` with a reason code: 1 invalid signature, 2 unknown issuer, 3 unsupported format), and process `spawned` / `started` / `exited` / `reaped`.
