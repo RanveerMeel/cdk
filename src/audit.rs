@@ -123,6 +123,10 @@ pub enum EventKind {
     /// `gateway:<id>`; `detail` = boot verdict (0 unverified, 1 verified,
     /// 2 failed).
     Attested = 29,
+    /// The TPM holds the boot measurements (PCRs 8-10) and an attestation
+    /// key. Subject `ak:<x prefix>` (or `tpm-failed`); `detail` = TPM
+    /// vendor/device id.
+    TpmReady = 30,
 }
 
 impl EventKind {
@@ -157,6 +161,7 @@ impl EventKind {
             EventKind::BootVerified => "boot-verified",
             EventKind::BootRejected => "boot-rejected",
             EventKind::Attested => "attested",
+            EventKind::TpmReady => "tpm-ready",
         }
     }
 }

@@ -24,6 +24,7 @@ pub mod approval;
 pub mod attest;
 pub mod secure;
 pub mod tool;
+pub mod tpm;
 
 pub const MAGIC: [u8; 4] = *b"CDK1";
 pub const MAX_PAYLOAD: usize = 1024;
