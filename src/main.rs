@@ -326,7 +326,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
         // Tamper-evident audit log, bound to this issuer.
         cdk::audit::init();
-        // Boot policy (roadmap 2.9) from the ramdisk; logged to the audit log.
+        // Pinned operator keys (roadmap 2.8), then the boot policy (2.9),
+        // whose quorum rules are checked against them.
+        cdk::approvals::load_operators();
         cdk::policy::load_boot_policy();
     }
 

@@ -7,13 +7,13 @@ CDK (Cognitive Distributed Kernel) is an open-source, bare-metal Rust kernel for
 - **Agents are isolated processes.** An agent can only reach an object, tool, model, or network endpoint if it holds a capability for it.
 - **Capabilities are issued and verified by the kernel**, signed with hybrid **Ed25519 + ML-DSA-65 (FIPS 204)**, so they can't be forged by classical or future quantum attackers.
 - **Every consequential action is provable** through a tamper-evident, hash-chained audit log with signed checkpoints.
-- **Humans stay in control:** a capability can require human approval for every action; the agent blocks until a person approves the exact payload at the console, enforced by the kernel.
+- **Humans stay in control, provably:** a capability can require human approval for every action. With operator keys pinned, the approval is a post-quantum **signature** from named operators — two-person (M-of-N) rules, vetoes, time-outs — verified by the kernel and kept in the audit trail. Every grant and policy change is shown as a reach diff and checked against invariant rules first.
 
 Heavy AI inference (GPUs, CUDA) runs on Linux next to CDK; CDK is the control plane that decides which agent may use which model and records it. See [ROADMAP.md](ROADMAP.md) for the architecture and milestones.
 
 ## Status
 
-**Early development preview — not for production use.** CDK boots on bare metal (QEMU) with SMP, preemptive scheduling, ring-3 processes in isolated address spaces, and an interactive serial console. The quantum-safe trust core (Phase 1 of the [roadmap](ROADMAP.md)) is being built now: Phase 1 is done. In Phase 2 (agent runtime), Rust agent programs load from the boot ramdisk, act only through kernel-held capability handles, run concurrently under a preemptive scheduler with a CPU-budget watchdog, can run integer-only ML models natively, and can be forced to wait for a human before acting. Interfaces can still change quickly.
+**Early development preview — not for production use.** CDK boots on bare metal (QEMU) with SMP, preemptive scheduling, ring-3 processes in isolated address spaces, and an interactive serial console. The quantum-safe trust core (Phase 1 of the [roadmap](ROADMAP.md)) is being built now: Phase 1 is done. In Phase 2 (agent runtime), Rust agent programs load from the boot ramdisk, act only through kernel-held capability handles, run concurrently under a preemptive scheduler with a CPU-budget watchdog, can run integer-only ML models natively, and can be forced to wait for a signed human decision before acting. In Phase 3 they reach tools and models on Linux through a post-quantum-secured gateway that holds the credentials. Interfaces can still change quickly.
 
 ### Editions
 
@@ -40,6 +40,8 @@ CDK is **open core**. This repository — the kernel, the capability model, the 
 **Policy Change Review** — Nothing widens an agent's reach silently. `grant 1 model:demo exec` first prints a reach diff (`+ pid 1 'analyst' gains exec on obj-9 (model:demo) [model,credential] via 127.0.0.1:18080, NOT gated`), checks it against the policy rules, and asks before applying; with the default boot policy (`policy/default.rules`: `approval credential`, `approval remote`) that grant is refused until you add `,approval`. Rules are invariants over every agent's handles — `deny <label>`, `separate <a> <b>` (e.g. keep agents that read customer data away from tools), `approval <label>` — and labels come from the gateway (`credential`, `remote`) or the operator (`policy label obj-2 customer-data`). `tools-sync` pins the gateway's listing; if a model later gains a key or moves to another host, CDK shows which agents' reach changes, and calls to it fail with `PolicyBlocked` until the change is approved. `policy begin` … `policy commit` reviews several grants as one change. Use `CDK_POLICY_FILE` to pack your own rules; a malformed policy makes CDK refuse every change.
 
 **Human-Approval Gates** — Grant a handle with the `approval` constraint (`exec requester obj-2 send,approval`). Every `send` through it blocks the agent; the console shows who is asking, the target, and the exact payload (control characters escaped, so an agent can't forge console output), and the kernel performs the send only if the human answers `y`. Otherwise the agent gets `HumanDenied`. The constraint is part of the signed token and survives derivation; requests and decisions are audit-logged (`approval-asked`, `approval-yes`, `approval-no`).
+
+**Signed Operator Approvals** — For real oversight, pin operator keys: `tools/approve.sh init alice` (and `bob`) creates hybrid Ed25519 + ML-DSA-65 keys in `target/operators/`; the public halves are packed into the ramdisk. From then on a typed `y` approves nothing. An approval-gated action or a policy change opens a signed request, which the gateway spools (`target/approvals/`). On the operator's device, `tools/approve.sh list` shows exactly what is asked, and `tools/approve.sh approve 3 --key target/operators/alice.key` (or `deny`) signs it. CDK verifies the signature against the pinned keys. The signed statement binds this boot, the request, the payload digest, the text shown, the quorum and the decision, so a gateway or spool in the middle can't forge or replay one. Add `quorum credential 2` to the policy for two-person control, `quorum policy 2` for policy changes, `approval-timeout 120` to deny unanswered requests. Any valid denial vetoes. Votes, bad signatures, unknown keys and time-outs are all audit-logged. `operators` shows the pinned keys and open requests.
 
 **Native Inference in Agents** — `user/ml` (`cdk-ml`) evaluates int8 linear models (`CDKLM1`) with integer arithmetic only, so agents need no FPU state. An agent embeds its model at build time, so the audit log's `program-loaded` SHA-256 identifies code *and* model. Demo: `send obj-2 server down, production outage`, `send obj-2 lunch menu for friday`, then `exec classify obj-2 recv`. The demo model (`user/models/priority-demo.cdklm`, message priority ROUTINE/URGENT) is synthetic and regenerated reproducibly by `tools/train_demo_model.py`.
 
@@ -221,7 +223,8 @@ cargo check --features virtio-hw
 | `policy rule add <deny L \| separate A B \| approval L>`, `policy rule del <n>` | Edit rules (reviewed) |
 | `policy label <obj-or-kind> <l>`, `policy unlabel …` | Attach or remove a label (reviewed) |
 | `policy begin` / `diff` / `commit` / `abort` | Stage several grants and review them as one change |
-| `policy review on\|off` | Ask before applying (off = lab mode; rules stay enforced) |
+| `policy review on\|off` | Ask before applying (off = lab mode; rules stay enforced; refused while operator keys are pinned) |
+| `operators` | Pinned operator keys (signed approvals) and open signed requests |
 | `capsign <id>` | Issue a hybrid post-quantum capability for an object and verify it |
 | `capverify <id>` | Show unsigned, forged, and escalated tokens being rejected |
 | `capbench <id> [n]` | Time *n* capability checks without and with the verified-proof cache |
@@ -317,6 +320,7 @@ The full plan — phases, milestones, and editions — is in [ROADMAP.md](ROADMA
 - [x] Issuer-bound hybrid post-quantum capability tokens (Ed25519 + ML-DSA-65, format v1) — roadmap milestone 1.1
 - [x] Tamper-evident audit log with hybrid-signed checkpoints — roadmap milestone 1.2
 - [x] User-fault containment: a crashing ring-3 program is terminated, audit-logged, and the kernel keeps running — roadmap milestone 1.3
+- [x] NIST ACVP test vectors for ML-DSA-65, ML-KEM-768, Ed25519 and SHA-256 (854 test cases) plus RFC vectors for HKDF, X25519 and ChaCha20-Poly1305, run in CI — roadmap milestone 1.5
 - [x] Key hygiene: zeroized keys and seeds, scrubbed crypto stack, zero-on-free heap, RFC 8032 / IETF ML-DSA known-answer tests, verified-proof cache — roadmap milestone 1.4
 - [x] Rust user programs loaded from a boot ramdisk, with SHA-256 provenance in the audit log — roadmap milestone 2.1
 - [x] Per-agent capability handles: grant, list, derive (attenuate only), drop, send/recv — every use verified and audited — roadmap milestone 2.2
@@ -327,6 +331,7 @@ The full plan — phases, milestones, and editions — is in [ROADMAP.md](ROADMA
 - [x] Post-quantum secure channel to the gateway: hybrid X25519 + ML-KEM-768, hybrid-signed transcript, pinned gateway identity, ChaCha20-Poly1305 — roadmap milestone 3.2
 - [x] MCP gateway: agent tool calls gated by `exec` capabilities (optionally human-approved), sent sealed to MCP servers, and audit-logged — roadmap milestone 3.3
 - [x] Model inference through Linux-hosted model servers (OpenAI-compatible), per-model capabilities, gateway-side credential injection — roadmap milestone 3.4
+- [x] Signed operator approvals: post-quantum operator signatures, M-of-N quorum, vetoes, time-outs, every vote audit-logged — roadmap milestone 2.8
 - [x] Policy change review: reach diffs, invariant rules, pinned gateway listings that block changed tools until approved, fail-closed boot policy — roadmap milestone 2.9
 - [x] Framebuffer text rendering (8×16 bitmap font, RGB/BGR/U8 pixel formats, auto-scroll)
 - [x] Network stack integration (loopback interfaces, capability-gated send/recv, object bridge routing, bindings, pump telemetry)

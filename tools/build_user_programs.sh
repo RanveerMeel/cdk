@@ -59,6 +59,16 @@ if [ -f "$POLICY_FILE" ]; then
     cp "$POLICY_FILE" "$STAGE/policy.rules"
 fi
 
+# Operator public keys for signed approvals (roadmap 2.8), made with
+# tools/approve.sh init <name>. Public halves only; none = console mode.
+OPERATORS_DIR="${CDK_OPERATORS_DIR:-$ROOT/target/operators}"
+if [ -d "$OPERATORS_DIR" ]; then
+    for f in "$OPERATORS_DIR"/*.pub; do
+        [ -f "$f" ] || continue
+        cp "$f" "$STAGE/operator-$(basename "$f")"
+    done
+fi
+
 # Reproducible archive: fixed order, owner, and timestamps.
 (cd "$STAGE" && tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner \
     --mtime=@0 -cf "$OUT" -- *)

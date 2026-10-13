@@ -11,12 +11,12 @@
     <title>CDK — Quantum-Safe Agent Trust Kernel</title>
     <meta
       name="description"
-      content="CDK is an open-source Rust kernel that runs AI agents under kernel-enforced, post-quantum-signed capabilities: hybrid Ed25519 + ML-DSA-65 tokens, isolated agent processes, and a provable audit trail."
+      content="CDK is an open-source Rust kernel that runs AI agents under kernel-enforced, post-quantum-signed capabilities, with signed human approvals (M-of-N), reviewed policy changes, and a provable audit trail."
     />
     <meta property="og:title" content="CDK — Quantum-Safe Agent Trust Kernel" />
     <meta
       property="og:description"
-      content="Open-source Rust kernel for AI agents: kernel-enforced permissions, hybrid post-quantum capability tokens, provable actions."
+      content="Open-source Rust kernel for AI agents: kernel-enforced permissions, post-quantum capability tokens, signed human approvals, provable actions."
     />
     <link rel="stylesheet" href="./styles.css" />
   </head>
@@ -30,7 +30,9 @@
           CDK is a bare-metal Rust kernel where an agent can only do what the
           kernel has <strong>cryptographically allowed</strong> it to do. Its
           permissions are signed with hybrid classical and post-quantum
-          cryptography, and the kernel checks them on every action.
+          cryptography, and the kernel checks them on every action. When an
+          action matters, it waits for a <strong>signed decision from named
+          people</strong> — and the kernel verifies that too.
         </p>
         <div class="cta-row">
           <a class="btn primary" href="https://github.com/RanveerMeel/cdk">View on GitHub</a>
@@ -70,7 +72,33 @@
               <p>
                 Capability tokens carry hybrid <strong>Ed25519 + ML-DSA-65</strong>
                 (NIST FIPS 204) signatures. Both must verify, so forging one means
-                breaking both schemes.
+                breaking both schemes. The crypto is tested against NIST's
+                published ACVP vectors.
+              </p>
+            </article>
+            <article class="card">
+              <h3>People decide, provably</h3>
+              <p>
+                High-impact actions wait for operators to approve them with
+                post-quantum signatures from their own devices. Two-person
+                rules, vetoes, and time-outs are enforced by the kernel, and
+                every vote is in the audit log.
+              </p>
+            </article>
+            <article class="card">
+              <h3>Nothing widens silently</h3>
+              <p>
+                Every grant, rule change, or change to a tool or model is shown
+                as a diff of the new access it adds, checked against invariant
+                rules, and applied only after review.
+              </p>
+            </article>
+            <article class="card">
+              <h3>Secrets stay out of agents</h3>
+              <p>
+                Models and tools run on Linux behind a post-quantum-secured
+                gateway that holds the API keys. Agents get results, never
+                credentials.
               </p>
             </article>
           </div>
@@ -108,6 +136,48 @@
 
       <section class="section">
         <div class="container">
+          <h2>How a human approval works</h2>
+          <p class="muted narrow">
+            With operator keys pinned, typing <code>y</code> at a console
+            approves nothing. Approval is a signature the kernel can check.
+          </p>
+          <ol class="steps">
+            <li>
+              <span class="step-title">The agent asks</span>
+              An agent with an approval-gated capability tries to act, say, to
+              prompt a model that carries a payment provider's key. The kernel
+              blocks it and opens a signed request.
+            </li>
+            <li>
+              <span class="step-title">Operators see exactly what they sign</span>
+              The request travels sealed through the gateway to each
+              operator's device. <code>cdk-approve</code> shows the agent, the
+              action, and the data, and signs a statement bound to this boot,
+              this request, the payload's digest, the text shown, and the
+              decision.
+            </li>
+            <li>
+              <span class="step-title">The kernel counts verified votes</span>
+              Each signature (Ed25519 + ML-DSA-65) is checked against the
+              pinned operator keys. A quorum approves, any denial vetoes, and
+              silence times out as a denial. The gateway can't forge or replay
+              a vote.
+            </li>
+          </ol>
+          <pre><code>cdk&gt; elf-run 1
+=== HUMAN APPROVAL REQUIRED (request #1) ===
+  agent  : pid 1 'analyst'
+  action : prompt model 'demo' (obj-8, handle h0) via the gateway
+  signed approval: request #3 needs 2 operator signature(s) within 15 s
+approvals: request #3: signature does not verify (operator bf807944) — ignored
+approvals: request #3: alice APPROVED (signature verified, 1 of 2)
+approvals: request #3: bob APPROVED (signature verified, 2 of 2)
+  -&gt; request #1 APPROVED by operator signature(s)</code></pre>
+        </div>
+      </section>
+
+      <section class="section alt">
+        <div class="container">
           <h2>Where CDK fits</h2>
           <p class="muted narrow">
             CDK isn't a GPU driver project or a Linux replacement. Heavy inference
@@ -115,17 +185,18 @@
             decides which agent may use which model or tool, with what data, and
             records that it happened.
           </p>
-          <pre class="diagram" aria-label="Target architecture: CDK trust kernel beside Linux, connected over virtio-vsock"><code>┌──────────── CDK (trust kernel) ────────────┐     ┌──────── Linux ────────┐
-│ agents = isolated ring-3 processes         │     │ GPU driver + CUDA/... │
-│ hybrid PQ-signed capability tokens         │     │ inference servers     │
-│ policy + human-approval gates              │     │ MCP tool servers      │
-│ tamper-evident signed audit log            │     └───────────▲───────────┘
-│ PQ-secure channel X25519+ML-KEM            │◄── virtio-console ┘
-└────────────────────────────────────────────┘</code></pre>
+          <pre class="diagram" aria-label="CDK trust kernel beside Linux: a post-quantum-secured virtio-console link to the gateway, which holds API keys and the approval spool that operators sign from"><code>┌──────────── CDK (trust kernel) ────────────┐     ┌────────── Linux ───────────┐
+│ agents = isolated ring-3 processes         │     │ GPU driver + CUDA/...      │
+│ hybrid PQ-signed capability tokens         │     │ model servers, MCP tools   │
+│ policy review + invariant rules            │     │ gateway: API keys +        │
+│ signed human approvals (M-of-N)            │     │ approval spool             │
+│ tamper-evident signed audit log            │     └─────▲───────────────▲──────┘
+│ PQ-secure link X25519+ML-KEM-768           │◄──────────┘               │
+└────────────────────────────────────────────┘   operators (cdk-approve)─┘</code></pre>
         </div>
       </section>
 
-      <section class="section alt">
+      <section class="section">
         <div class="container">
           <h2>Status</h2>
           <p class="muted narrow">
@@ -144,6 +215,7 @@
                 <li>Tamper-evident audit log: SHA-256 hash chain with hybrid-signed checkpoints</li>
                 <li>Fault containment: a crashing agent is terminated and logged; the kernel keeps running</li>
                 <li>Key hygiene: zeroized keys, scrubbed crypto stack, zero-on-free heap, known-answer tests</li>
+                <li>Crypto tested against NIST ACVP vectors: ML-DSA-65, ML-KEM-768, Ed25519, SHA-256 (854 test cases)</li>
                 <li>Rust agent programs loaded from a boot ramdisk, each traced to its SHA-256 in the audit log</li>
                 <li>Per-agent capability handles: agents can only derive weaker handles, never stronger ones</li>
                 <li>Preemptive scheduling of agents with a CPU-budget watchdog for runaway agents</li>
@@ -153,14 +225,15 @@
                 <li>MCP gateway: agent tool calls gated by capabilities and human approval, sealed and audit-logged</li>
                 <li>Models on Linux GPUs, granted per model; API keys stay in the gateway, never in the agent</li>
                 <li>Policy change review: every grant shown as a reach diff, checked against invariant rules, approved before it applies</li>
+                <li>Signed operator approvals: post-quantum operator signatures, two-person (M-of-N) rules, vetoes, time-outs, every vote audit-logged</li>
               </ul>
             </div>
             <div>
               <h3 class="status-head next">Next on the roadmap</h3>
               <ul class="checklist todo">
-                <li>Signed operator approvals; agents on every CPU</li>
+                <li>Operator keys on hardware tokens; agents on every CPU</li>
                 <li>Distributed capabilities across CDK nodes</li>
-                <li>Native CPU inference demo; ARM64 port</li>
+                <li>Measured boot, fuzzing, ARM64 port</li>
               </ul>
             </div>
           </div>
@@ -170,7 +243,7 @@
         </div>
       </section>
 
-      <section class="section">
+      <section class="section alt">
         <div class="container">
           <h2>Kernel architecture</h2>
           <figure class="architecture">
@@ -185,7 +258,7 @@
         </div>
       </section>
 
-      <section class="section alt">
+      <section class="section">
         <div class="container">
           <h2>Quick start</h2>
           <pre><code>rustup target add x86_64-unknown-none
@@ -193,16 +266,20 @@ rustup toolchain install nightly
 rustup component add rust-src llvm-tools-preview --toolchain nightly
 sudo apt install qemu-system-x86
 
-./run_qemu.sh</code></pre>
+./run_qemu.sh                    # terminal 1: CDK
+tools/run_gateway.sh            # terminal 2: host gateway (tools, models)
+tools/approve.sh init alice     # optional: pin an operator key, then rebuild</code></pre>
           <p class="muted">
-            At the <code>cdk&gt;</code> prompt try <code>issuer</code>,
-            <code>capverify obj-1</code>, and <code>elf-smoke</code>, or type
-            <code>help</code>.
+            At the <code>cdk&gt;</code> prompt try <code>capverify obj-1</code>,
+            <code>link-secure</code>, <code>tools-sync</code>,
+            <code>policy</code>, and <code>operators</code>, or type
+            <code>help</code>. The README walks through agents, tools, models,
+            and approvals.
           </p>
         </div>
       </section>
 
-      <section class="section">
+      <section class="section alt">
         <div class="container">
           <h2>Open core</h2>
           <div class="grid two">
@@ -219,8 +296,8 @@ sudo apt install qemu-system-x86
               <p>
                 For finance and defense: quantum key distribution (QKD)
                 integration (always combined with ML-KEM), hardware security
-                modules (HSMs), certified builds, sector policy packs, and
-                support.
+                modules (HSMs) and hardware-token operator keys, certified
+                builds, sector policy packs, and support.
               </p>
             </article>
           </div>

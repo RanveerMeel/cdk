@@ -177,6 +177,10 @@ pub fn sync(kernel: &mut Kernel) -> Result<heapless::Vec<Listed, 16>, &'static s
             let crate::link::Incoming::Sealed(p) = m else {
                 return;
             };
+            if cdk_link::approval::is_approval(p) {
+                crate::approvals::on_message(p);
+                return;
+            }
             match tool::decode(p) {
                 Ok(Message::ListResponse(list)) => {
                     let mut v = heapless::Vec::new();
@@ -313,7 +317,7 @@ fn review_listing(kernel: &mut Kernel, listed: &[Listed]) {
         );
         return;
     }
-    if !crate::policy::confirm("Pin this gateway listing?") {
+    if !crate::policy::confirm("Pin this gateway listing?", &text) {
         crate::println!("policy: declined — calls to these stay blocked (EPOLICY)");
         audit::record(
             EventKind::PolicyRefused,
@@ -510,6 +514,10 @@ pub fn poll() -> usize {
     let mut done = 0;
     crate::link::recv(|m| {
         if let crate::link::Incoming::Sealed(p) = m {
+            if cdk_link::approval::is_approval(p) {
+                crate::approvals::on_message(p);
+                return;
+            }
             match tool::decode(p) {
                 Ok(Message::CallResponse { .. }) => {
                     deliver(p);
@@ -541,6 +549,11 @@ pub fn poll() -> usize {
         done += 1;
     }
     done
+}
+
+/// Receive whatever the gateway sent: tool results and approval decisions.
+pub fn pump() -> usize {
+    poll()
 }
 
 /// Poll until at least one call finishes (or they all time out).

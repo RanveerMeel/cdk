@@ -16,10 +16,14 @@
 //! * model backends (3.4): OpenAI-compatible model servers appear to CDK as
 //!   tools `model:<name>`; the gateway injects each backend's credential,
 //!   which CDK never sees (`models`). Long results are chunked.
+//! * signed approvals (2.8): CDK's approval requests are written to a spool
+//!   directory for operators (`cdk-approve`), and their signed decisions are
+//!   forwarded back; CDK verifies every signature (`spool`).
 //!
 //! ```text
 //! cdk-gateway --init [--identity FILE] [--pub-out FILE]   create identity, export public key
-//! cdk-gateway [--identity FILE] [--mcp NAME=COMMAND]... [--model SPEC]... [--allow t1,t2] [SOCKET]
+//! cdk-gateway [--identity FILE] [--mcp NAME=COMMAND]... [--model SPEC]... [--allow t1,t2]
+//!             [--spool DIR] [SOCKET]
 //! ```
 //! The public key file (1984 bytes) is packed into CDK's ramdisk as
 //! `gateway.pub`; CDK refuses any other gateway.
@@ -37,6 +41,7 @@ use rand_core::{OsRng, RngCore};
 
 mod mcp;
 mod models;
+mod spool;
 
 fn send(stream: &mut UnixStream, k: u8, flags: u8, payload: &[u8]) -> std::io::Result<()> {
     let mut buf = [0u8; MAX_FRAME];
@@ -198,6 +203,7 @@ struct Args {
     mcp: Vec<(String, String)>,
     models: Vec<String>,
     allow: Option<Vec<String>>,
+    spool: PathBuf,
 }
 
 fn args() -> Args {
@@ -208,6 +214,7 @@ fn args() -> Args {
         socket: "target/cdk-link.sock".to_string(),
         mcp: Vec::new(),
         models: Vec::new(),
+        spool: PathBuf::from("target/approvals"),
         allow: None,
     };
     let mut it = std::env::args().skip(1);
@@ -224,6 +231,7 @@ fn args() -> Args {
             "--model" => a
                 .models
                 .push(it.next().expect("--model NAME=URL[,options]")),
+            "--spool" => a.spool = it.next().expect("--spool DIR").into(),
             "--allow" => {
                 let list = it.next().expect("--allow tool1,tool2");
                 a.allow = Some(list.split(',').map(str::to_string).collect());
@@ -305,9 +313,44 @@ fn main() -> std::io::Result<()> {
     let mut handshake = Handshake::Idle;
     let mut session: Option<Session> = None;
     let mut announced: Option<String> = None;
+    let spool = spool::Spool::open(&a.spool)?;
+    eprintln!("gateway: approval spool {}", spool.dir().display());
+    // Wake up regularly to forward operators' decisions.
+    stream.set_read_timeout(Some(Duration::from_millis(250)))?;
     let mut buf = [0u8; 8192];
     loop {
-        let n = stream.read(&mut buf)?;
+        let n = match stream.read(&mut buf) {
+            Ok(n) => n,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                if let Some(s) = session.as_mut() {
+                    for d in spool.take_decisions() {
+                        eprintln!(
+                            "gateway: -> decision on request #{} ({}) from operator {}",
+                            d.id,
+                            if d.approve { "approve" } else { "deny" },
+                            hex(&d.operator[..4])
+                        );
+                        for part in cdk_link::approval::encode_decision(
+                            d.id,
+                            d.operator,
+                            d.approve,
+                            &d.signature,
+                        ) {
+                            let mut out = [0u8; cdk_link::MAX_PAYLOAD];
+                            let len = s.seal(&part, &mut out).expect("decision part fits");
+                            send(&mut stream, kind::SEALED, 0, &out[..len])?;
+                        }
+                    }
+                }
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         if n == 0 {
             eprintln!("gateway: CDK closed the link");
             return Ok(());
@@ -398,6 +441,9 @@ fn main() -> std::io::Result<()> {
                         };
                         let mut plain = [0u8; cdk_link::MAX_PAYLOAD];
                         match s.open(&payload, &mut plain) {
+                            Ok(m) if m > 0 && cdk_link::approval::is_approval(&plain[..m]) => {
+                                spool.on_message(&plain[..m]);
+                            }
                             Ok(m) if plain[0] <= tool::LIST_RESPONSE && m > 0 => {
                                 for reply in
                                     handle_tool(&plain[..m], &mut registry, &backends, &allowed)

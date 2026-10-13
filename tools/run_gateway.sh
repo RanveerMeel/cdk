@@ -26,4 +26,7 @@ MCP=(--mcp "${CDK_MCP:-demo=python3 $ROOT/gateway/examples/demo_mcp_server.py}")
 MODELS=()
 for spec in ${CDK_MODEL:-}; do MODELS+=(--model "$spec"); done
 # CDK_MCP_ALLOW limits what CDK may reach (tool names and model:<name>).
-exec "$BIN" "${ID[@]}" "${MCP[@]}" "${MODELS[@]}" ${CDK_MCP_ALLOW:+--allow "$CDK_MCP_ALLOW"} "${1:-$ROOT/target/cdk-link.sock}"
+# Signed approvals (roadmap 2.8): requests for operators and their decisions
+# (tools/approve.sh list / approve / deny). Override with CDK_APPROVAL_SPOOL.
+SPOOL=(--spool "${CDK_APPROVAL_SPOOL:-$ROOT/target/approvals}")
+exec "$BIN" "${ID[@]}" "${MCP[@]}" "${MODELS[@]}" "${SPOOL[@]}" ${CDK_MCP_ALLOW:+--allow "$CDK_MCP_ALLOW"} "${1:-$ROOT/target/cdk-link.sock}"

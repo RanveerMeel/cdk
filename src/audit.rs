@@ -103,6 +103,14 @@ pub enum EventKind {
     /// A policy change or call was refused. `detail` =
     /// [`crate::policy::refuse_reason`] code.
     PolicyRefused = 22,
+    /// A verified operator vote (roadmap 2.8). Subject `req-R:<operator>:yes|no`;
+    /// `detail` = first 8 bytes of SHA-256 of the signature.
+    ApprovalSigned = 23,
+    /// A decision that did not count. Subject `req-R:op-<id>`; `detail` =
+    /// [`crate::approvals::reject`] code.
+    ApprovalRejected = 24,
+    /// An approval request expired unanswered. `detail` = time-out in seconds.
+    ApprovalTimeout = 25,
 }
 
 impl EventKind {
@@ -130,6 +138,9 @@ impl EventKind {
             EventKind::ToolResult => "tool-result",
             EventKind::PolicyApplied => "policy-applied",
             EventKind::PolicyRefused => "policy-refused",
+            EventKind::ApprovalSigned => "approval-signed",
+            EventKind::ApprovalRejected => "approval-bad-sig",
+            EventKind::ApprovalTimeout => "approval-timeout",
         }
     }
 }
