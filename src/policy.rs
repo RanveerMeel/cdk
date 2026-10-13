@@ -513,6 +513,10 @@ pub fn load_boot_policy() {
         return;
     }
     st.loaded = true;
+    if crate::boot::lockdown() {
+        st.broken = true;
+        return;
+    }
     let Some(file) = crate::initrd::find(POLICY_FILE) else {
         return; // no boot policy: no rules, review still on
     };
@@ -582,6 +586,15 @@ pub fn policy() -> Policy {
 
 pub fn review_enabled() -> bool {
     STATE.lock().review
+}
+
+/// Why every change is refused (see [`is_broken`]).
+pub fn broken_reason() -> &'static str {
+    if crate::boot::lockdown() {
+        "boot verification failed (lockdown)"
+    } else {
+        "the boot policy is malformed"
+    }
 }
 
 pub fn is_broken() -> bool {
@@ -698,7 +711,7 @@ pub fn confirm(question: &str, reviewed: &str) -> bool {
 pub fn review_grants(kernel: &crate::kernel::Kernel, proposed: &[Grant]) -> bool {
     load_boot_policy();
     if is_broken() {
-        crate::println!("policy: refused — the boot policy is malformed");
+        crate::println!("policy: refused — {}", broken_reason());
         audit::record(
             EventKind::PolicyRefused,
             "grant",
@@ -762,7 +775,7 @@ pub enum Edit<'a> {
 pub fn edit(kernel: &crate::kernel::Kernel, e: Edit<'_>) -> Result<(), &'static str> {
     load_boot_policy();
     if is_broken() {
-        return Err("the boot policy is malformed");
+        return Err(broken_reason());
     }
     let mut candidate = policy();
     let mut text: String<96> = String::new();

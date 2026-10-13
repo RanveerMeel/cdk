@@ -227,6 +227,7 @@ approvals: request #3: bob APPROVED (signature verified, 2 of 2)
                 <li>Policy change review: every grant shown as a reach diff, checked against invariant rules, approved before it applies</li>
                 <li>Signed operator approvals: post-quantum operator signatures, two-person (M-of-N) rules, vetoes, time-outs, every vote audit-logged</li>
                 <li>Every parser of untrusted bytes fuzzed in CI, an in-kernel syscall fuzzer, and AddressSanitizer on host tests</li>
+                <li>Verified and measured boot: a release-signed ramdisk the kernel checks before trusting any key (lockdown on failure), attested to the gateway on every connection</li>
               </ul>
             </div>
             <div>
@@ -234,7 +235,7 @@ approvals: request #3: bob APPROVED (signature verified, 2 of 2)
               <ul class="checklist todo">
                 <li>Operator keys on hardware tokens; agents on every CPU</li>
                 <li>Distributed capabilities across CDK nodes</li>
-                <li>Independent security review; measured boot; ARM64 port</li>
+                <li>Independent security review; TPM-rooted measurements; ARM64 port</li>
               </ul>
             </div>
           </div>

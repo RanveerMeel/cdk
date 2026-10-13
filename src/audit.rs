@@ -111,6 +111,18 @@ pub enum EventKind {
     ApprovalRejected = 24,
     /// An approval request expired unanswered. `detail` = time-out in seconds.
     ApprovalTimeout = 25,
+    /// A boot measurement (roadmap 4.2). Subject `reg-N:<what>`; `detail` =
+    /// first 8 bytes of the measured digest.
+    BootMeasured = 26,
+    /// The ramdisk matched the manifest signed by the release key. Subject
+    /// `release:<id>`; `detail` = files covered.
+    BootVerified = 27,
+    /// Boot verification failed; the kernel is in lockdown.
+    BootRejected = 28,
+    /// The kernel answered a gateway's attestation request. Subject
+    /// `gateway:<id>`; `detail` = boot verdict (0 unverified, 1 verified,
+    /// 2 failed).
+    Attested = 29,
 }
 
 impl EventKind {
@@ -141,6 +153,10 @@ impl EventKind {
             EventKind::ApprovalSigned => "approval-signed",
             EventKind::ApprovalRejected => "approval-bad-sig",
             EventKind::ApprovalTimeout => "approval-timeout",
+            EventKind::BootMeasured => "boot-measured",
+            EventKind::BootVerified => "boot-verified",
+            EventKind::BootRejected => "boot-rejected",
+            EventKind::Attested => "attested",
         }
     }
 }

@@ -88,7 +88,18 @@ def spool():
     write("spool_decision", "approve", struct.pack("<I", 3) + b"\x44" * 16 + b"\x01" + b"\x55" * (64 + 3309))
 
 
+def boot():
+    import hashlib
+    files = sorted([("hello", b"elf"), ("policy.rules", b"approval credential\n")])
+    m = "CDK-BOOT-MANIFEST-v1\n" + "".join(f"{hashlib.sha256(d).hexdigest()} {n}\n" for n, d in files)
+    write("boot_attest", "manifest", m.encode())
+    write("boot_attest", "expected", "".join(f"register {i} {'ab' * 32}\n" for i in range(3)).encode())
+    k = ROOT / "target/x86_64-unknown-none/release/cdk"
+    if k.exists() and k.stat().st_size < 4 << 20:
+        write("boot_attest", "kernel-head", k.read_bytes()[:65536])
+
+
 if __name__ == "__main__":
-    frames(); messages(); ustar(); elves(); policies(); spool()
+    frames(); messages(); ustar(); elves(); policies(); spool(); boot()
     n = sum(1 for _ in OUT.rglob("*") if _.is_file())
     print(f"wrote {n} seed files to {OUT.relative_to(ROOT)}")

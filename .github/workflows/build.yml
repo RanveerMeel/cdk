@@ -45,6 +45,14 @@ jobs:
       - name: User programs and ramdisk
         run: tools/build_user_programs.sh
 
+      - name: Verified boot tooling (sign, verify, detect tampering)
+        run: |
+          tools/sign.sh init --key "$RUNNER_TEMP/release.key" --pub-out "$RUNNER_TEMP/release.pub"
+          tools/sign.sh manifest target/initrd --key "$RUNNER_TEMP/release.key"
+          tools/sign.sh verify target/initrd --pub "$RUNNER_TEMP/release.pub"
+          echo "tampered" >> target/initrd/policy.rules
+          if tools/sign.sh verify target/initrd --pub "$RUNNER_TEMP/release.pub"; then exit 1; fi
+
       - name: Inference runtime tests
         run: cd user/ml && cargo test --target x86_64-unknown-linux-gnu
 

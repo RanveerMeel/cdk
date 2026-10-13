@@ -160,6 +160,7 @@ const COMMANDS: &[&str] = &[
     "tools-sync",
     "policy",
     "operators",
+    "boot",
     "capbench",
     "audit",
     "audit-verify",
@@ -650,6 +651,7 @@ fn dispatch(
         "tools-sync" => cmd_tools_sync(kernel),
         "policy" => cmd_policy(arg1, arg2, arg3, kernel),
         "operators" => cmd_operators(),
+        "boot" => crate::boot::report(|s| crate::print!("{}", s)),
         "capbench" => cmd_capbench(arg1, arg2, kernel),
         "audit" => cmd_audit(arg1),
         "audit-verify" => cmd_audit_verify(),
@@ -766,6 +768,7 @@ fn cmd_help() {
     crate::println!("  tools             List registered tool objects (grant with: grant <pid> tool:<name> exec)");
     crate::println!("  policy            Show rules, labels, review mode, and the pinned gateway listing");
     crate::println!("  operators         Pinned operator keys and open signed-approval requests");
+    crate::println!("  boot              Verified-boot verdict, release key, measured registers and log");
     crate::println!("  policy check      Check every agent's handles against the rules");
     crate::println!("  policy reach      Show what each agent can reach, with labels");
     crate::println!("  policy rule add <deny L | separate A B | approval L>   (reviewed)");
@@ -1585,7 +1588,11 @@ fn policy_show() {
     crate::println!(
         "policy: review {}{}",
         if crate::policy::review_enabled() { "ON (every change is shown and must be approved)" } else { "OFF (lab mode)" },
-        if crate::policy::is_broken() { "; BOOT POLICY MALFORMED — all changes refused" } else { "" }
+        if crate::policy::is_broken() {
+            if crate::boot::lockdown() { "; BOOT VERIFICATION FAILED — all changes refused" } else { "; BOOT POLICY MALFORMED — all changes refused" }
+        } else {
+            ""
+        }
     );
     crate::println!("rules:");
     if p.rules.is_empty() {

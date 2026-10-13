@@ -69,6 +69,16 @@ if [ -d "$OPERATORS_DIR" ]; then
     done
 fi
 
+# Verified boot (roadmap 4.2): sign a manifest of every file above with the
+# release key (tools/sign.sh init). The kernel checks it before trusting any
+# pinned key or program; without a key the ramdisk is unsigned (development).
+RELEASE_KEY="${CDK_RELEASE_KEY:-$ROOT/target/release-signing.key}"
+if [ -f "$RELEASE_KEY" ]; then
+    "$ROOT/tools/sign.sh" manifest "$STAGE" --key "$RELEASE_KEY"
+else
+    echo "note: no release key ($RELEASE_KEY) — ramdisk unsigned; boot will be unverified" >&2
+fi
+
 # Reproducible archive: fixed order, owner, and timestamps.
 (cd "$STAGE" && tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner \
     --mtime=@0 -cf "$OUT" -- *)

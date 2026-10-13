@@ -83,3 +83,10 @@ path = "fuzz_targets/spool_decision.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "boot_attest"
+path = "fuzz_targets/boot_attest.rs"
+test = false
+doc = false
+bench = false

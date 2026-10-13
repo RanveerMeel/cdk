@@ -52,6 +52,7 @@ tools/build_user_programs.sh       # user programs + ramdisk (user/)
 tools/fetch_acvp_vectors.sh && (cd link && RUSTFLAGS='--cfg curve25519_dalek_backend="serial"' cargo test --target x86_64-unknown-linux-gnu --test acvp)   # NIST ACVP vectors (downloads ~17.5 MB once)
 tools/check_crypto_versions.sh     # kernel links the crypto crate versions the vectors test
 tools/approve.sh init alice        # optional: pin an operator key (signed approvals) before ./run_qemu.sh
+tools/sign.sh verify target/initrd # check the staged ramdisk against the release key (verified boot)
 tools/fuzz.sh 60                   # fuzz every parser for 60 s (cargo install cargo-fuzz); --replay for regressions
 (cd gateway && cargo test --target x86_64-unknown-linux-gnu)   # MCP gateway (needs python3)
 python3 tools/train_demo_model.py && git diff --exit-code user/models  # demo model is reproducible

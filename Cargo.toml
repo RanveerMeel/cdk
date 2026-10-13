@@ -3,6 +3,7 @@ name = "cdk"
 version = "0.1.0"
 edition = "2021"
 description = "Cognitive Distributed Kernel — a bare-metal capability-based OS"
+build = "build.rs"
 
 [package.metadata.bootimage]
 test-args = [

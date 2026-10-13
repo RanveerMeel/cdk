@@ -33,7 +33,7 @@ CAVP certificate or FIPS 140 validation.
 **Out of scope today:** physical attacks, DMA from malicious devices (no
 IOMMU yet), side channels between agents on one CPU (no constant-time
 review of the kernel paths yet), a compromised boot image (measured boot is
-roadmap 4.2), and denial of service by the host (it can always drop the link).
+roadmap 4.2 has a software root only; see §6), and denial of service by the host (it can always drop the link).
 
 ## 3. Entry points for untrusted bytes, and how each is tested
 
@@ -48,6 +48,7 @@ roadmap 4.2), and denial of service by the host (it can always drop the link).
 | Boot ramdisk (ustar) | `src/initrd.rs` | `initrd` (every entry inside the archive) |
 | Boot policy and runtime policy edits | `src/policy.rs` | `policy` (bounds, rules round-trip) |
 | Approval spool decision files | `gateway/src/spool.rs` | `spool_decision` |
+| Boot manifest, kernel ELF measurement, attestation messages, expected-measurements file | `link/src/attest.rs`, `src/boot.rs` | `boot_attest` (accepted manifest ⇒ canonical; attestations re-encode exactly); QEMU tests: weakened policy, smuggled operator key, manifest re-signed with another key all lock down; unverified kernel refused by the gateway |
 | Syscalls (every argument) | `src/syscall.rs`, `src/agent.rs`, `src/tools.rs`, `src/paging.rs` | `chaos` ring-3 program in QEMU: 20,000 syscalls with kernel, unmapped, read-only and boundary-straddling pointers, huge lengths, unknown numbers and handles |
 | MCP and model server responses | `gateway/src/mcp.rs`, `gateway/src/models.rs` | Gateway tests (status mapping, wrong-key redaction, redirects); not yet fuzzed |
 
@@ -63,7 +64,8 @@ host test suites also run under AddressSanitizer
 |---|---|---|
 | Code review during 4.3 | The ELF loader checked only the entry point against the user region. A `PT_LOAD` segment at an address the user page tables already translate (the kernel-shared slots) would have had file bytes **copied into kernel memory**. | Fixed: `elf::validate` checks every segment (user region, stack, file range, sizes, executable entry, at most 64 headers) before anything is mapped; regression tests |
 | `link_messages` fuzzer (seconds) | `tool::decode` accepted call arguments and response bodies longer than `MAX_BODY`, which the encoder can never produce. Bounded by the frame size, so not exploitable, but a parser/encoder mismatch. | Fixed; regression test and `fuzz/regressions/link_messages/` |
-| All nine fuzz targets, 10 minutes each after the fixes (about 296 million executions: `spool_decision` 139 M, `initrd` 82 M, `policy` 36 M, `link_messages` 21 M, `frame_decoder` 7.9 M, `sealed_channel` 6.4 M, `elf` 1.9 M, `hybrid_verify` 1.5 M, `handshake` 0.7 M) | No crashes, sanitizer reports, or property violations | — |
+| `boot_attest` fuzzer (4.2, under a minute) | The manifest checker accepted non-canonical spellings (uppercase hex, CRLF). Not exploitable — the release signature covers the exact bytes — but one set of files should have exactly one valid manifest. | Fixed: canonical form required; regression test and replayed input |
+| The nine 4.3 fuzz targets, 10 minutes each after the fixes (about 296 million executions: `spool_decision` 139 M, `initrd` 82 M, `policy` 36 M, `link_messages` 21 M, `frame_decoder` 7.9 M, `sealed_channel` 6.4 M, `elf` 1.9 M, `hybrid_verify` 1.5 M, `handshake` 0.7 M) | No crashes, sanitizer reports, or property violations | — |
 | `chaos` in QEMU (20,000 syscalls; with h0 granted and two messages queued) | Every hostile call rejected: bad buffers `-3`, escalating derives `-2`, unknown handles and syscalls `-1`, empty queue `-5`; valid calls succeeded; read-only canary intact; the kernel kept running programs; 940 audit records with 8 signed checkpoints verified | — |
 | AddressSanitizer: kernel host tests (279), link (21 + 3 RFC), gateway (8) | No reports | — |
 
@@ -94,5 +96,7 @@ host test suites also run under AddressSanitizer
   `policy.rules`.
 - MCP tools are listed without `credential`/`remote` flags; the operator must
   label them.
-- No measured boot yet: pinned keys (gateway, operators) are only as
-  trustworthy as the boot image.
+- Verified and measured boot have a software root only: the ramdisk is
+  checked against the release key compiled into the kernel, but the kernel
+  itself is trusted from the boot medium, and its measurement registers are
+  not in a TPM (a modified kernel could report expected values).
