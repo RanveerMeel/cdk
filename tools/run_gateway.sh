@@ -34,4 +34,10 @@ SPOOL=(--spool "${CDK_APPROVAL_SPOOL:-$ROOT/target/approvals}")
 EXPECT=()
 EXPECT_FILE="${CDK_EXPECT:-$ROOT/target/boot.measurements}"
 if [ "$EXPECT_FILE" != "none" ] && [ -f "$EXPECT_FILE" ]; then EXPECT=(--expect "$EXPECT_FILE"); fi
+# TPM quote (roadmap 4.2): when CDK runs with a TPM (run_qemu.sh starts swtpm),
+# require a quote from the enrolled machine; the first valid quote enrolls it
+# into target/tpm-enrollment. CDK_TPM=0: don't require one.
+if [ "${CDK_TPM:-1}" != "0" ] && command -v swtpm &> /dev/null; then
+    EXPECT+=(--tpm "${CDK_TPM_ENROLLMENT:-$ROOT/target/tpm-enrollment}")
+fi
 exec "$BIN" "${ID[@]}" "${MCP[@]}" "${MODELS[@]}" "${SPOOL[@]}" "${EXPECT[@]}" ${CDK_MCP_ALLOW:+--allow "$CDK_MCP_ALLOW"} "${1:-$ROOT/target/cdk-link.sock}"

@@ -402,8 +402,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 ),
             }
         }
+        // TPM 2.0 TIS registers (roadmap 4.2): uncached, then replay the
+        // boot measurements into the TPM before anything else runs.
+        match pt.identity_map_mmio_page(cdk::tpm::TIS_BASE, &mut *fa) {
+            Ok(()) => cdk::paging::flush_tlb_page(cdk::tpm::TIS_BASE),
+            Err(e) => cdk::println!("TPM: WARNING — TIS map failed: {:?}", e),
+        }
         *PAGE_TABLE.lock() = Some(pt);
     }
+    cdk::boot::tpm_commit();
 
     // Phase 16 / M11: calibrate BSP LAPIC, arm it, drive BSP via lapic-local.
     {

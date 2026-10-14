@@ -173,10 +173,15 @@ fn answer_attestation(gateway: &[u8; 16], timeout_ms: u64) {
         crate::println!("link: gateway did not ask for attestation");
         return;
     };
+    let quoted = match crate::boot::tpm_quote(&nonce) {
+        Some(q) => send_data(&q).is_ok(),
+        None => false,
+    };
     if send_data(&crate::boot::attestation(&nonce)).is_ok() {
         crate::println!(
-            "link: attestation sent (boot {}, measured registers)",
-            crate::boot::verdict().name()
+            "link: attestation sent (boot {}, measured registers{})",
+            crate::boot::verdict().name(),
+            if quoted { " + TPM quote" } else { "" }
         );
         crate::audit::record_fmt(
             crate::audit::EventKind::Attested,

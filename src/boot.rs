@@ -45,6 +45,12 @@ static RELEASE_PUB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/release.pu
 static LOCKDOWN: AtomicBool = AtomicBool::new(false);
 
 struct State {
+    /// `(register, digest)` in the order they were extended, so they can be
+    /// replayed into the TPM once its registers are mapped.
+    events: alloc::vec::Vec<(usize, [u8; 32])>,
+    /// The TPM attestation key, once the TPM holds the measurements.
+    ak: Option<crate::tpm::Ak>,
+    tpm_note: &'static str,
     verdict: Verdict,
     release_id: [u8; 16],
     registers: [[u8; 32]; REGISTERS],
@@ -53,6 +59,9 @@ struct State {
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
+    events: alloc::vec::Vec::new(),
+    ak: None,
+    tpm_note: "not probed",
     verdict: Verdict::Unverified,
     release_id: [0; 16],
     registers: [[0; 32]; REGISTERS],
@@ -75,6 +84,7 @@ fn prefix(d: &[u8; 32]) -> u64 {
 
 fn measure(st: &mut State, reg: usize, name: &str, digest: &[u8; 32]) {
     attest::extend(&mut st.registers[reg], digest);
+    st.events.push((reg, *digest));
     let _ = writeln!(st.log, "{} {} {}", reg, name, attest::hex(&digest[..8]));
     let mut subj: heapless::String<48> = heapless::String::new();
     let _ = write!(subj, "reg-{}:{}", reg, name);
@@ -93,7 +103,9 @@ fn verify(key: &Identity) -> Result<usize, &'static str> {
         .and_then(|f| Signature::from_slice(f.data))
         .ok_or("no valid boot.manifest.sig in the ramdisk")?;
     let digest = attest::manifest_digest(manifest.data);
-    let ok = crate::issuer::crypto_stack::run(|| hybrid::verify_with(key, &digest, &sig, attest::MANIFEST_CONTEXT));
+    let ok = crate::issuer::crypto_stack::run(|| {
+        hybrid::verify_with(key, &digest, &sig, attest::MANIFEST_CONTEXT)
+    });
     if !ok {
         return Err("manifest signature does not verify against the release key");
     }
@@ -115,11 +127,22 @@ pub fn measure_and_verify(kernel_image: &[u8]) {
     // Read-only segments only: the bootloader relocates the writable ones.
     let kernel = attest::kernel_measurement(kernel_image).unwrap_or([0; 32]);
     measure(&mut st, attest::REG_KERNEL, "kernel", &kernel);
-    measure(&mut st, attest::REG_RAMDISK, "ramdisk", &Sha256::digest(ramdisk).into());
+    measure(
+        &mut st,
+        attest::REG_RAMDISK,
+        "ramdisk",
+        &Sha256::digest(ramdisk).into(),
+    );
 
     let (verdict, release_id, reason) = match Identity::from_bytes(RELEASE_PUB) {
-        None if RELEASE_PUB.is_empty() => (Verdict::Unverified, [0; 16], "no release key compiled in"),
-        None => (Verdict::Failed, [0; 16], "the compiled-in release key is malformed"),
+        None if RELEASE_PUB.is_empty() => {
+            (Verdict::Unverified, [0; 16], "no release key compiled in")
+        }
+        None => (
+            Verdict::Failed,
+            [0; 16],
+            "the compiled-in release key is malformed",
+        ),
         Some(key) => {
             let id = key.id();
             drop(st);
@@ -139,7 +162,12 @@ pub fn measure_and_verify(kernel_image: &[u8]) {
     st.verdict = verdict;
     st.release_id = release_id;
     st.reason = reason;
-    measure(&mut st, attest::REG_VERDICT, verdict.name(), &attest::verdict_digest(verdict, &release_id));
+    measure(
+        &mut st,
+        attest::REG_VERDICT,
+        verdict.name(),
+        &attest::verdict_digest(verdict, &release_id),
+    );
     drop(st);
 
     match verdict {
@@ -158,6 +186,80 @@ pub fn measure_and_verify(kernel_image: &[u8]) {
     }
 }
 
+/// Replay the boot measurements into TPM PCRs 8–10 and create the
+/// attestation key. Call once, after the TIS page is mapped and before any
+/// program runs. Without a TPM, attestation stays software-only.
+pub fn tpm_commit() {
+    if !crate::tpm::probe() {
+        STATE.lock().tpm_note = "no TPM found";
+        crate::println!("TPM: none — measurements are software-only");
+        return;
+    }
+    let r = (|| -> Result<crate::tpm::Ak, crate::tpm::TpmError> {
+        crate::tpm::startup()?;
+        let events = STATE.lock().events.clone();
+        for (reg, digest) in &events {
+            crate::tpm::pcr_extend(cdk_link::tpm::CDK_PCRS[*reg], digest)?;
+        }
+        let pcrs = crate::tpm::pcr_read_0_to_10()?;
+        let regs = STATE.lock().registers;
+        for (i, reg) in regs.iter().enumerate() {
+            if pcrs[cdk_link::tpm::CDK_PCRS[i] as usize] != *reg {
+                // PCRs 8-10 were not at zero: something extended them first.
+                return Err(crate::tpm::TpmError::BadResponse);
+            }
+        }
+        crate::tpm::create_ak()
+    })();
+    match r {
+        Ok(ak) => {
+            crate::println!(
+                "TPM: {:08x} — measurements extended into PCRs 8-10 (match the registers); attestation key {}…",
+                crate::tpm::did_vid(),
+                attest::hex(&ak.x[..6])
+            );
+            let mut subj: heapless::String<48> = heapless::String::new();
+            let _ = write!(subj, "ak:{}", attest::hex(&ak.x[..8]));
+            audit::record(EventKind::TpmReady, &subj, crate::tpm::did_vid() as u64);
+            let mut st = STATE.lock();
+            st.ak = Some(ak);
+            st.tpm_note = "PCRs 8-10 hold the measurements";
+        }
+        Err(e) => {
+            crate::println!(
+                "TPM: present but unusable ({:?}) — measurements are software-only",
+                e
+            );
+            STATE.lock().tpm_note = "TPM present but unusable";
+            audit::record(EventKind::TpmReady, "tpm-failed", 0);
+        }
+    }
+}
+
+/// A TPM quote of PCRs 0..=10 over the gateway's `nonce`, if the TPM holds
+/// the measurements.
+pub fn tpm_quote(nonce: &[u8; 32]) -> Option<alloc::vec::Vec<u8>> {
+    let ak = STATE.lock().ak?;
+    let r =
+        crate::tpm::pcr_read_0_to_10().and_then(|p| crate::tpm::quote(&ak, nonce).map(|q| (p, q)));
+    let (pcrs, (attest_bytes, r, s)) = match r {
+        Ok(v) => v,
+        Err(e) => {
+            crate::println!("TPM: quote failed: {:?}", e);
+            return None;
+        }
+    };
+    cdk_link::tpm::encode_quote(&cdk_link::tpm::Quote {
+        nonce: *nonce,
+        ak_x: ak.x,
+        ak_y: ak.y,
+        pcrs,
+        attest: &attest_bytes,
+        sig_r: &r,
+        sig_s: &s,
+    })
+}
+
 /// The attestation answer to a gateway's `nonce`.
 pub fn attestation(nonce: &[u8; 32]) -> alloc::vec::Vec<u8> {
     let st = STATE.lock();
@@ -174,12 +276,27 @@ pub fn attestation(nonce: &[u8; 32]) -> alloc::vec::Vec<u8> {
 pub fn report(mut f: impl FnMut(&str)) {
     let st = STATE.lock();
     let mut s = String::new();
-    let _ = writeln!(s, "boot: {}{}{}", st.verdict.name(), if st.reason.is_empty() { "" } else { " — " }, st.reason);
+    let _ = writeln!(
+        s,
+        "boot: {}{}{}",
+        st.verdict.name(),
+        if st.reason.is_empty() { "" } else { " — " },
+        st.reason
+    );
     if st.verdict != Verdict::Unverified {
         let _ = writeln!(s, "release key: {}", attest::hex(&st.release_id));
     }
     for (i, r) in st.registers.iter().enumerate() {
         let _ = writeln!(s, "register {} {}", i, attest::hex(r));
+    }
+    let _ = writeln!(s, "tpm: {}", st.tpm_note);
+    if let Some(ak) = &st.ak {
+        let _ = writeln!(
+            s,
+            "tpm attestation key: {}{}",
+            attest::hex(&ak.x),
+            attest::hex(&ak.y)
+        );
     }
     s.push_str("measurement log:\n");
     for line in st.log.lines() {

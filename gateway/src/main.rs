@@ -21,12 +21,13 @@
 //!   forwarded back; CDK verifies every signature (`spool`).
 //! * attestation (4.2): after each handshake the gateway asks CDK for its
 //!   measured-boot registers; with `--expect FILE` it serves nothing unless
-//!   they match the build (`attestation`).
+//!   they match the build; with `--tpm FILE` it also requires a TPM quote
+//!   from the enrolled machine (`attestation`).
 //!
 //! ```text
 //! cdk-gateway --init [--identity FILE] [--pub-out FILE]   create identity, export public key
 //! cdk-gateway [--identity FILE] [--mcp NAME=COMMAND]... [--model SPEC]... [--allow t1,t2]
-//!             [--spool DIR] [--expect FILE] [SOCKET]
+//!             [--spool DIR] [--expect FILE] [--tpm FILE] [SOCKET]
 //! ```
 //! The public key file (1984 bytes) is packed into CDK's ramdisk as
 //! `gateway.pub`; CDK refuses any other gateway.
@@ -223,6 +224,7 @@ struct Args {
     allow: Option<Vec<String>>,
     spool: PathBuf,
     expect: Option<PathBuf>,
+    tpm: Option<PathBuf>,
 }
 
 fn args() -> Args {
@@ -235,6 +237,7 @@ fn args() -> Args {
         models: Vec::new(),
         spool: PathBuf::from("target/approvals"),
         expect: None,
+        tpm: None,
         allow: None,
     };
     let mut it = std::env::args().skip(1);
@@ -253,6 +256,7 @@ fn args() -> Args {
                 .push(it.next().expect("--model NAME=URL[,options]")),
             "--spool" => a.spool = it.next().expect("--spool DIR").into(),
             "--expect" => a.expect = Some(it.next().expect("--expect FILE").into()),
+            "--tpm" => a.tpm = Some(it.next().expect("--tpm ENROLLMENT-FILE").into()),
             "--allow" => {
                 let list = it.next().expect("--allow tool1,tool2");
                 a.allow = Some(list.split(',').map(str::to_string).collect());
@@ -351,7 +355,18 @@ fn main() -> std::io::Result<()> {
             p.display()
         );
     }
-    let mut attestor = attestation::Attestor::new(expect);
+    if let Some(p) = &a.tpm {
+        eprintln!(
+            "gateway: TPM quote required: enrollment {} ({})",
+            p.display(),
+            if p.exists() {
+                "enrolled"
+            } else {
+                "first valid quote enrolls"
+            }
+        );
+    }
+    let mut attestor = attestation::Attestor::new(expect, a.tpm.as_deref());
     eprintln!("gateway: approval spool {}", spool.dir().display());
     // Wake up regularly to forward operators' decisions.
     stream.set_read_timeout(Some(Duration::from_millis(250)))?;
@@ -486,6 +501,9 @@ fn main() -> std::io::Result<()> {
                         };
                         let mut plain = [0u8; cdk_link::MAX_PAYLOAD];
                         match s.open(&payload, &mut plain) {
+                            Ok(m) if m > 0 && cdk_link::tpm::is_quote(&plain[..m]) => {
+                                attestor.on_quote(&plain[..m]);
+                            }
                             Ok(m) if m > 0 && cdk_link::attest::is_attest(&plain[..m]) => {
                                 attestor.on_message(&plain[..m]);
                             }

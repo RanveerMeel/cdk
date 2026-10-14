@@ -91,6 +91,22 @@ LINK_ARGS=(-device virtio-serial-pci
     -chardev "socket,id=cdklink,path=$LINK_SOCK,server=on,wait=off"
     -device virtconsole,chardev=cdklink)
 
+# TPM 2.0 (roadmap 4.2): a software TPM (swtpm) when installed, with state in
+# target/tpm/ so the attestation key persists like a real chip's.
+# CDK_TPM=0 disables it.
+TPM_ARGS=()
+if [[ "${CDK_TPM:-1}" != "0" ]] && command -v swtpm &> /dev/null; then
+    TPM_DIR="$PWD/target/tpm"
+    mkdir -p "$TPM_DIR"
+    rm -f "$TPM_DIR/swtpm-sock"
+    swtpm socket --tpm2 --tpmstate dir="$TPM_DIR" --ctrl type=unixio,path="$TPM_DIR/swtpm-sock" \
+        --terminate --log file="$TPM_DIR/swtpm.log",level=1 &
+    for _ in $(seq 1 50); do [ -S "$TPM_DIR/swtpm-sock" ] && break; sleep 0.1; done
+    TPM_ARGS=(-chardev "socket,id=chrtpm,path=$TPM_DIR/swtpm-sock"
+        -tpmdev emulator,id=tpm0,chardev=chrtpm -device tpm-tis,tpmdev=tpm0)
+    echo "TPM: swtpm (state in $TPM_DIR)"
+fi
+
 qemu-system-x86_64 \
     -cpu max \
     -drive format=raw,file="$RUN_IMG",snapshot=on \
@@ -98,6 +114,7 @@ qemu-system-x86_64 \
     "${SMP_ARGS[@]}" \
     "${GPU_ARGS[@]}" \
     "${LINK_ARGS[@]}" \
+    "${TPM_ARGS[@]}" \
     "${DISPLAY_ARGS[@]}" \
     -no-reboot \
     -no-shutdown

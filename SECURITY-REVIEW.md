@@ -33,7 +33,7 @@ CAVP certificate or FIPS 140 validation.
 **Out of scope today:** physical attacks, DMA from malicious devices (no
 IOMMU yet), side channels between agents on one CPU (no constant-time
 review of the kernel paths yet), a compromised boot image (measured boot is
-roadmap 4.2 has a software root only; see §6), and denial of service by the host (it can always drop the link).
+the kernel measures itself; see §6), and denial of service by the host (it can always drop the link).
 
 ## 3. Entry points for untrusted bytes, and how each is tested
 
@@ -48,6 +48,7 @@ roadmap 4.2 has a software root only; see §6), and denial of service by the hos
 | Boot ramdisk (ustar) | `src/initrd.rs` | `initrd` (every entry inside the archive) |
 | Boot policy and runtime policy edits | `src/policy.rs` | `policy` (bounds, rules round-trip) |
 | Approval spool decision files | `gateway/src/spool.rs` | `spool_decision` |
+| TPM quotes at the gateway (`TPMS_ATTEST`, ECDSA signature, enrollment) | `link/src/tpm.rs`, `gateway/src/attestation.rs` | `boot_attest` (quote decode/re-encode, attest parsing); gateway tests: other TPM, changed firmware, kernel report ≠ TPM, missing or tampered quote; QEMU + swtpm: enroll, same machine, other TPM, no TPM; AK template cross-checked with tpm2-tools |
 | Boot manifest, kernel ELF measurement, attestation messages, expected-measurements file | `link/src/attest.rs`, `src/boot.rs` | `boot_attest` (accepted manifest ⇒ canonical; attestations re-encode exactly); QEMU tests: weakened policy, smuggled operator key, manifest re-signed with another key all lock down; unverified kernel refused by the gateway |
 | Syscalls (every argument) | `src/syscall.rs`, `src/agent.rs`, `src/tools.rs`, `src/paging.rs` | `chaos` ring-3 program in QEMU: 20,000 syscalls with kernel, unmapped, read-only and boundary-straddling pointers, huge lengths, unknown numbers and handles |
 | MCP and model server responses | `gateway/src/mcp.rs`, `gateway/src/models.rs` | Gateway tests (status mapping, wrong-key redaction, redirects); not yet fuzzed |
@@ -96,7 +97,7 @@ host test suites also run under AddressSanitizer
   `policy.rules`.
 - MCP tools are listed without `credential`/`remote` flags; the operator must
   label them.
-- Verified and measured boot have a software root only: the ramdisk is
-  checked against the release key compiled into the kernel, but the kernel
-  itself is trusted from the boot medium, and its measurement registers are
-  not in a TPM (a modified kernel could report expected values).
+- The kernel measures itself (into TPM PCRs 8–10 when a TPM is present);
+  a kernel modified from the start could extend the expected digests. A
+  measuring bootloader is future work. TPM enrollment is trust-on-first-use
+  (no endorsement-certificate check yet).

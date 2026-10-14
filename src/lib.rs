@@ -43,6 +43,7 @@ pub mod scheduler;
 pub mod serial;
 pub mod syscall;
 pub mod tools;
+pub mod tpm;
 pub mod policy;
 pub mod um;
 pub mod vga_buffer;
