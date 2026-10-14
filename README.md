@@ -1,6 +1,6 @@
 # CDK — Quantum-Safe Agent Trust Kernel
 
-**Website:** [https://ranveermeel.github.io/cdk/](https://ranveermeel.github.io/cdk/) _(GitHub Pages)_ · **Plan:** [ROADMAP.md](ROADMAP.md) · **Security:** [SECURITY.md](SECURITY.md) · **Review brief:** [SECURITY-REVIEW.md](SECURITY-REVIEW.md)
+**Website:** [https://ranveermeel.github.io/cdk/](https://ranveermeel.github.io/cdk/) _(GitHub Pages)_ · **Demo:** [DEMO.md](DEMO.md) · **Plan:** [ROADMAP.md](ROADMAP.md) · **Security:** [SECURITY.md](SECURITY.md) · **Review brief:** [SECURITY-REVIEW.md](SECURITY-REVIEW.md)
 
 CDK (Cognitive Distributed Kernel) is an open-source, bare-metal Rust kernel for running **AI agents under kernel-enforced, cryptographically provable permissions**, built on **post-quantum cryptography** from the start.
 
@@ -10,6 +10,10 @@ CDK (Cognitive Distributed Kernel) is an open-source, bare-metal Rust kernel for
 - **Humans stay in control, provably:** a capability can require human approval for every action. With operator keys pinned, the approval is a post-quantum **signature** from named operators — two-person (M-of-N) rules, vetoes, time-outs — verified by the kernel and kept in the audit trail. Every grant and policy change is shown as a reach diff and checked against invariant rules first.
 
 Heavy AI inference (GPUs, CUDA) runs on Linux next to CDK; CDK is the control plane that decides which agent may use which model and records it. See [ROADMAP.md](ROADMAP.md) for the architecture and milestones.
+
+## See It Work
+
+`tools/demo_fraud.sh --auto` runs a fraud-prevention scenario end to end on synthetic data: a triage agent scores transactions (native model, rules, local LLM), a responder freezes accounts and requests refunds, operators alice and bob sign the decisions (two signatures to move money, any denial vetoes), a prompt-injected transaction can't make any agent move money because policy never lets the agent that read it hold a money tool — all on a verified, TPM-attested boot, with a verified audit trail and a case file at the end. See [DEMO.md](DEMO.md).
 
 ## Status
 
@@ -336,6 +340,7 @@ The full plan — phases, milestones, and editions — is in [ROADMAP.md](ROADMA
 - [x] Post-quantum secure channel to the gateway: hybrid X25519 + ML-KEM-768, hybrid-signed transcript, pinned gateway identity, ChaCha20-Poly1305 — roadmap milestone 3.2
 - [x] MCP gateway: agent tool calls gated by `exec` capabilities (optionally human-approved), sent sealed to MCP servers, and audit-logged — roadmap milestone 3.3
 - [x] Model inference through Linux-hosted model servers (OpenAI-compatible), per-model capabilities, gateway-side credential injection — roadmap milestone 3.4
+- [x] Fraud-prevention demo: two agents, signed two-person approvals, a prompt-injection that can't move money, case file — `tools/demo_fraud.sh --auto` ([DEMO.md](DEMO.md))
 - [x] Verified and measured boot: release-signed ramdisk manifest checked by the kernel (lockdown on failure), measurements extended into TPM PCRs and attested with TPM quotes from an enrolled machine — roadmap milestone 4.2 (measuring bootloader pending)
 - [x] Fuzzing of every parser of untrusted bytes (10 libFuzzer targets in CI), an in-kernel syscall fuzzer (`chaos`), AddressSanitizer on host tests — roadmap milestone 4.3 (independent review pending; see [SECURITY-REVIEW.md](SECURITY-REVIEW.md))
 - [x] Signed operator approvals: post-quantum operator signatures, M-of-N quorum, vetoes, time-outs, every vote audit-logged — roadmap milestone 2.8

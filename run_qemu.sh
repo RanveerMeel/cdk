@@ -107,14 +107,24 @@ if [[ "${CDK_TPM:-1}" != "0" ]] && command -v swtpm &> /dev/null; then
     echo "TPM: swtpm (state in $TPM_DIR)"
 fi
 
-qemu-system-x86_64 \
-    -cpu max \
-    -drive format=raw,file="$RUN_IMG",snapshot=on \
-    -serial stdio \
-    "${SMP_ARGS[@]}" \
-    "${GPU_ARGS[@]}" \
-    "${LINK_ARGS[@]}" \
-    "${TPM_ARGS[@]}" \
-    "${DISPLAY_ARGS[@]}" \
-    -no-reboot \
+QEMU_ARGS=(
+    -cpu max
+    -drive format=raw,file="$RUN_IMG",snapshot=on
+    -serial stdio
+    "${SMP_ARGS[@]}"
+    "${GPU_ARGS[@]}"
+    "${LINK_ARGS[@]}"
+    "${TPM_ARGS[@]}"
+    "${DISPLAY_ARGS[@]}"
+    -no-reboot
     -no-shutdown
+)
+if [[ -n "${CDK_QEMU_PIDFILE:-}" ]]; then
+    # Scripted runs (tools/demo_fraud.sh --auto): console input comes from a
+    # pipe; run QEMU in the background so the driver can stop it.
+    qemu-system-x86_64 "${QEMU_ARGS[@]}" <&0 &
+    echo $! > "$CDK_QEMU_PIDFILE"
+    wait $!
+else
+    qemu-system-x86_64 "${QEMU_ARGS[@]}"
+fi

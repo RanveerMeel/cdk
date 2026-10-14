@@ -416,8 +416,9 @@ fn resolve_signed() -> usize {
             crate::approvals::close(id);
         }
         crate::println!(
-            "  -> request #{} {}",
+            "  -> agent request #{} (signed request #{}) {}",
             req.id,
+            req.signed.unwrap_or(0),
             if approved { "APPROVED by operator signature(s)" } else { "DENIED" }
         );
         apply(req, approved);

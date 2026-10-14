@@ -1,0 +1,27 @@
+# Fraud-prevention demo policy (tools/demo_fraud.sh). Packed as policy.rules
+# with CDK_POLICY_FILE=policy/fraud-demo.rules. Checked on every grant and
+# gateway listing change; a change that breaks a rule is refused outright.
+
+# What the objects and tools are.
+label txn-queue customer-data
+label tool:lookup_account customer-data
+label tool:freeze_account account-action
+label tool:wire_transfer money-movement
+
+# Whatever reads customer data can never move money, and customer data
+# never goes to an off-machine model. Even if a transaction memo talks the
+# LLM into "wiring now", the agent that read it holds no way to do so.
+separate customer-data money-movement
+separate customer-data remote
+
+# Human control, signed by operators (roadmap 2.8): one signature to freeze
+# an account, two different operators to move money, one for any policy
+# change; any signed denial vetoes; unanswered requests are denied.
+approval account-action
+approval money-movement
+approval credential
+approval remote
+quorum account-action 1
+quorum money-movement 2
+quorum policy 1
+approval-timeout 120

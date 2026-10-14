@@ -999,6 +999,25 @@ mod tests {
     }
 
     #[test]
+    fn fraud_demo_policy_file_parses_and_separates() {
+        let p = Policy::parse(include_str!("../policy/fraud-demo.rules")).unwrap();
+        assert_eq!(
+            p.quorum_for(&p.labels_of("obj-9", "tool:wire_transfer", 0)),
+            2
+        );
+        assert_eq!(
+            p.quorum_for(&p.labels_of("obj-8", "tool:freeze_account", 0)),
+            1
+        );
+        // Reading the transaction queue and holding a money tool: refused.
+        let v = p.violations(&[
+            Grant::new(1, "obj-5", "txn-queue", 0, 1 << 5),
+            Grant::new(1, "obj-9", "tool:wire_transfer", 0, (1 << 3) | (1 << 7)),
+        ]);
+        assert!(v.iter().any(|v| matches!(v, Violation::Separated { .. })));
+    }
+
+    #[test]
     fn default_policy_file_parses() {
         let p = Policy::parse(include_str!("../policy/default.rules")).unwrap();
         assert_eq!(p.rules.len(), 2);

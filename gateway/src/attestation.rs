@@ -282,7 +282,11 @@ impl Attestor {
                 }
                 for i in 0..8 {
                     if e.firmware[i] != seen.firmware[i] {
-                        eprintln!("gateway: firmware PCR {i} differs from enrollment");
+                        eprintln!(
+                            "gateway: firmware PCR {i} differs from enrollment: {} (enrolled {})",
+                            attest::hex(&seen.firmware[i][..8]),
+                            attest::hex(&e.firmware[i][..8])
+                        );
                     }
                 }
                 false

@@ -1898,6 +1898,9 @@ fn cmd_send(id: &str, text: &str, kernel: &mut Kernel) {
         crate::println!("Usage: send <id> <text>");
         return;
     }
+    // Accept an object id or a unique name (`send txn-queue ...`).
+    let resolved = kernel.resolve_object_ref(id);
+    let id = resolved.as_ref().map_or(id, |s| s.as_str());
     match Message::text("console", id, text) {
         Ok(msg) => match kernel.send_message_direct(id, msg) {
             Ok(()) => crate::println!("Sent to {}", id),
