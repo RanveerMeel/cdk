@@ -97,6 +97,13 @@ pub fn parse_cap_bytes(bytes: &[u8]) -> Option<VirtioPciCap> {
 }
 
 /// Absolute MMIO address for a capability given BAR bases `[bar0..bar5]`.
+/// Kernel virtual window where device registers are mapped: a register at
+/// physical address `p` is at `MMIO_WINDOW + p`. Identity mapping is not
+/// safe: UEFI firmware places 64-bit BARs at 512 GiB and above, which would
+/// land in the user region's PML4 slot (`paging::USER_PML4_SLOT`).
+pub const MMIO_WINDOW: u64 = 0x0000_4000_0000_0000;
+
+/// Kernel virtual address of a capability's registers (in [`MMIO_WINDOW`]).
 pub fn cap_mmio(cap: &VirtioPciCap, bars: &[u64; 6]) -> Result<u64, VirtioPciError> {
     if (cap.bar as usize) >= 6 {
         return Err(VirtioPciError::BadBar);
@@ -105,7 +112,7 @@ pub fn cap_mmio(cap: &VirtioPciCap, bars: &[u64; 6]) -> Result<u64, VirtioPciErr
     if base == 0 {
         return Err(VirtioPciError::BadBar);
     }
-    Ok(base.wrapping_add(cap.offset as u64))
+    Ok(MMIO_WINDOW + base.wrapping_add(cap.offset as u64))
 }
 
 /// Read all six memory BARs (0 if absent / I/O).
@@ -173,7 +180,8 @@ pub fn discover_modern(addr: PciAddress) -> Result<VirtioModernBars, VirtioPciEr
     })
 }
 
-/// Map every page touched by a capability window.
+/// Map every page touched by a capability window (`mmio_base` as returned
+/// by [`cap_mmio`]) to its physical registers, uncached.
 pub fn map_cap_window(
     page_table: &mut crate::paging::PageTableManager,
     frame_alloc: &mut crate::allocator::FrameAllocator,
@@ -187,7 +195,7 @@ pub fn map_cap_window(
         & !0xfff;
     let mut page = start;
     while page < end {
-        let _ = page_table.identity_map_mmio_page(page, frame_alloc);
+        let _ = page_table.map_mmio_page(page, page - MMIO_WINDOW, frame_alloc);
         crate::paging::flush_tlb_page(page);
         page = page.wrapping_add(0x1000);
     }
@@ -259,6 +267,6 @@ mod tests {
         let cap = parse_cap_bytes(&raw).unwrap();
         assert_eq!(cap.notify_off_multiplier, 4);
         let bars = [0xE000_0000, 0xE001_0000, 0, 0, 0, 0];
-        assert_eq!(cap_mmio(&cap, &bars).unwrap(), 0xE001_0000 + 0x3000);
+        assert_eq!(cap_mmio(&cap, &bars).unwrap(), MMIO_WINDOW + 0xE001_0000 + 0x3000);
     }
 }

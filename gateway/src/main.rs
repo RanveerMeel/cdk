@@ -339,16 +339,24 @@ fn main() -> std::io::Result<()> {
     let mut session: Option<Session> = None;
     let mut announced: Option<String> = None;
     let spool = spool::Spool::open(&a.spool)?;
-    let expect = a.expect.as_ref().map(|p| {
-        let text = std::fs::read_to_string(p).unwrap_or_else(|e| {
+    let expect_text = a.expect.as_ref().map(|p| {
+        std::fs::read_to_string(p).unwrap_or_else(|e| {
             eprintln!("gateway: --expect {}: {e}", p.display());
-            std::process::exit(2)
-        });
-        cdk_link::attest::parse_expected(&text).unwrap_or_else(|| {
-            eprintln!("gateway: --expect {}: not a measurements file", p.display());
             std::process::exit(2)
         })
     });
+    let expect = expect_text.as_deref().map(|text| {
+        cdk_link::attest::parse_expected(text).unwrap_or_else(|| {
+            eprintln!("gateway: --expect: not a measurements file");
+            std::process::exit(2)
+        })
+    });
+    let expect_loader = expect_text
+        .as_deref()
+        .and_then(cdk_link::attest::parse_expected_loader);
+    if expect_loader.is_some() {
+        eprintln!("gateway: expecting a UEFI boot measured by CDK's loader (PCRs 11-12)");
+    }
     if let Some(p) = &a.expect {
         eprintln!(
             "gateway: attestation required: expected measurements {}",
@@ -366,7 +374,7 @@ fn main() -> std::io::Result<()> {
             }
         );
     }
-    let mut attestor = attestation::Attestor::new(expect, a.tpm.as_deref());
+    let mut attestor = attestation::Attestor::new(expect, expect_loader, a.tpm.as_deref());
     eprintln!("gateway: approval spool {}", spool.dir().display());
     // Wake up regularly to forward operators' decisions.
     stream.set_read_timeout(Some(Duration::from_millis(250)))?;

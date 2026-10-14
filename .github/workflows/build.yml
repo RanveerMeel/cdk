@@ -42,6 +42,9 @@ jobs:
       - name: Host unit tests
         run: cargo test-host
 
+      - name: Measuring UEFI loader builds (boot/uefi-loader)
+        run: cd boot/uefi-loader && cargo build --release --target x86_64-unknown-uefi -Zbuild-std=core -Zbuild-std-features=compiler-builtins-mem
+
       - name: User programs and ramdisk
         run: tools/build_user_programs.sh
 

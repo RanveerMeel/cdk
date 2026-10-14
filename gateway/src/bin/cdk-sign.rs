@@ -4,8 +4,10 @@
 //! cdk-sign init [--key FILE] [--pub-out FILE]      create the release key (0600) once
 //! cdk-sign manifest <ramdisk-stage-dir> [--key FILE]
 //!                                                  write boot.manifest + boot.manifest.sig
-//! cdk-sign measure <kernel-elf> <ramdisk.tar> [--pub FILE] [--out FILE]
+//! cdk-sign measure <kernel-elf> <ramdisk.tar> [--pub FILE] [--out FILE] [--loader]
 //!                                                  expected measurement registers
+//!                                                  (--loader: also PCRs 11-12 from
+//!                                                  the measuring UEFI loader)
 //! cdk-sign verify <ramdisk-stage-dir> [--pub FILE] check a staged ramdisk
 //! ```
 //!
@@ -164,7 +166,7 @@ fn verify(dir: &Path, pubf: &Path) {
     }
 }
 
-fn measure(kernel: &Path, ramdisk: &Path, pubf: &Path, out: &Path) {
+fn measure(kernel: &Path, ramdisk: &Path, pubf: &Path, out: &Path, loader: bool) {
     let k = std::fs::read(kernel).unwrap_or_else(|e| die(&format!("{}: {e}", kernel.display())));
     let r = std::fs::read(ramdisk).unwrap_or_else(|e| die(&format!("{}: {e}", ramdisk.display())));
     let (verdict, release_id) = match load_pub(pubf) {
@@ -181,6 +183,14 @@ fn measure(kernel: &Path, ramdisk: &Path, pubf: &Path, out: &Path) {
     );
     for (i, reg) in regs.iter().enumerate() {
         text.push_str(&format!("register {i} {}\n", attest::hex(reg)));
+    }
+    if loader {
+        // UEFI boot: CDK's measuring loader extends PCRs 11 and 12 with the
+        // kernel file and the ramdisk before the kernel runs.
+        let pcrs = cdk_link::tpm::expected_loader_pcrs(&k, &r);
+        for (pcr, v) in cdk_link::tpm::LOADER_PCRS.iter().zip(pcrs) {
+            text.push_str(&format!("loader {pcr} {}\n", attest::hex(&v)));
+        }
     }
     std::fs::write(out, text).unwrap_or_else(|e| die(&e.to_string()));
     println!(
@@ -210,6 +220,7 @@ fn main() {
             &arg(2),
             &pubf,
             &opt("--out", "target/boot.measurements"),
+            args.iter().any(|a| a == "--loader"),
         ),
         _ => usage(),
     }

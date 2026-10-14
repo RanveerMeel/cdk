@@ -506,6 +506,16 @@ impl PageTableManager {
         }
     }
 
+    /// Map `virt` to the MMIO page `phys` (uncached, writable, NX); an
+    /// existing mapping is left alone.
+    pub fn map_mmio_page<A: FrameSource>(&mut self, virt: u64, phys: u64, alloc: &mut A) -> PagingResult<()> {
+        match self.map(virt, phys, MapFlags::kernel_mmio(), alloc) {
+            Ok(()) => Ok(()),
+            Err(PagingError::AlreadyMapped) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Identity-map an MMIO page (uncached, writable, NX).
     pub fn identity_map_mmio_page<A: FrameSource>(
         &mut self,
@@ -743,6 +753,12 @@ impl PageTableManager {
     }
 
     /// Same as `entry_ptr_mut` but returns a shared pointer.
+    /// Whether top-level (PML4) entry `idx` maps anything.
+    pub fn pml4_slot_used(&self, idx: usize) -> bool {
+        // SAFETY: the PML4 is a valid frame owned or adopted by this manager.
+        idx < 512 && unsafe { !(*Self::entry_ptr(self.pml4_phys(), idx)).is_unused() }
+    }
+
     unsafe fn entry_ptr(phys: u64, idx: usize) -> *const PageTableEntry {
         crate::phys_mem::phys_to_ptr::<PageTableEntry>(phys).add(idx)
     }

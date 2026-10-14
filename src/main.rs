@@ -22,6 +22,13 @@ static BOOTLOADER_CONFIG: BootloaderConfig = {
     // The kernel dereferences physical frame addresses through a configured
     // physical-memory mapping offset from BootInfo.
     config.mappings.physical_memory = Some(Mapping::Dynamic);
+    // Keep every bootloader-chosen mapping (physical memory, boot info,
+    // framebuffer, ramdisk) out of PML4 slots 0-1: slot 1 is the user region
+    // (`paging::USER_PML4_SLOT`). The BIOS loader happened to avoid it; the
+    // UEFI loader does not without this.
+    config.mappings.dynamic_range_start = Some(0x0000_0100_0000_0000);
+    // ...and below the device-register window (`virtio_pci::MMIO_WINDOW`).
+    config.mappings.dynamic_range_end = Some(0x0000_3fff_ffff_f000);
     config
 };
 
@@ -407,6 +414,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         match pt.identity_map_mmio_page(cdk::tpm::TIS_BASE, &mut *fa) {
             Ok(()) => cdk::paging::flush_tlb_page(cdk::tpm::TIS_BASE),
             Err(e) => cdk::println!("TPM: WARNING — TIS map failed: {:?}", e),
+        }
+        // The user region needs its own PML4 slot; say so at boot if the
+        // bootloader left anything there (processes would fail to load).
+        {
+            let mut used: heapless::Vec<usize, 16> = heapless::Vec::new();
+            for idx in (0..512usize).filter(|&i| pt.pml4_slot_used(i)) {
+                let _ = used.push(idx);
+            }
+            if used.contains(&cdk::paging::USER_PML4_SLOT) {
+                cdk::println!(
+                    "Page table: WARNING — PML4 slot {} (user region) is in use by boot mappings; PML4 slots in use: {:?}",
+                    cdk::paging::USER_PML4_SLOT,
+                    used
+                );
+            }
         }
         *PAGE_TABLE.lock() = Some(pt);
     }

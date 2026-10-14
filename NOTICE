@@ -13,5 +13,12 @@ upstream license terms should be consulted in:
 - Cargo.toml / Cargo.lock
 - Dependency source repositories on crates.io
 
+boot/uefi-loader/ is a fork of bootloader-x86_64-uefi 0.11.17 from the
+rust-osdev bootloader project (https://github.com/rust-osdev/bootloader),
+Copyright (c) the rust-osdev bootloader authors, licensed under MIT OR
+Apache-2.0 (see boot/uefi-loader/LICENSE-MIT and LICENSE-APACHE). CDK's
+changes add TPM measurement of the kernel and ramdisk and are marked in
+boot/uefi-loader/src/main.rs.
+
 No trademark rights in the name "CDK" or related logos are granted by this
 notice or by the Apache License.

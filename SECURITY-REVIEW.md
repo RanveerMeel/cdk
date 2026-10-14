@@ -33,7 +33,7 @@ CAVP certificate or FIPS 140 validation.
 **Out of scope today:** physical attacks, DMA from malicious devices (no
 IOMMU yet), side channels between agents on one CPU (no constant-time
 review of the kernel paths yet), a compromised boot image (measured boot is
-the kernel measures itself; see §6), and denial of service by the host (it can always drop the link).
+the measurement chain and its limits are in §6), and denial of service by the host (it can always drop the link).
 
 ## 3. Entry points for untrusted bytes, and how each is tested
 
@@ -49,6 +49,7 @@ the kernel measures itself; see §6), and denial of service by the host (it can 
 | Boot policy and runtime policy edits | `src/policy.rs` | `policy` (bounds, rules round-trip) |
 | Approval spool decision files | `gateway/src/spool.rs` | `spool_decision` |
 | TPM quotes at the gateway (`TPMS_ATTEST`, ECDSA signature, enrollment) | `link/src/tpm.rs`, `gateway/src/attestation.rs` | `boot_attest` (quote decode/re-encode, attest parsing); gateway tests: other TPM, changed firmware, kernel report ≠ TPM, missing or tampered quote; QEMU + swtpm: enroll, same machine, other TPM, no TPM; AK template cross-checked with tpm2-tools |
+| Measuring UEFI loader (kernel and ramdisk files from the boot medium) | `boot/uefi-loader/src/main.rs` (`measure`) | QEMU + OVMF + swtpm: PCRs 11–12 match `cdk-sign measure --loader`; the kernel's PCR 12 cross-check; gateway test: other kernel, BIOS boot (empty PCRs) refused |
 | Boot manifest, kernel ELF measurement, attestation messages, expected-measurements file | `link/src/attest.rs`, `src/boot.rs` | `boot_attest` (accepted manifest ⇒ canonical; attestations re-encode exactly); QEMU tests: weakened policy, smuggled operator key, manifest re-signed with another key all lock down; unverified kernel refused by the gateway |
 | Syscalls (every argument) | `src/syscall.rs`, `src/agent.rs`, `src/tools.rs`, `src/paging.rs` | `chaos` ring-3 program in QEMU: 20,000 syscalls with kernel, unmapped, read-only and boundary-straddling pointers, huge lengths, unknown numbers and handles |
 | MCP and model server responses | `gateway/src/mcp.rs`, `gateway/src/models.rs` | Gateway tests (status mapping, wrong-key redaction, redirects); not yet fuzzed |
@@ -65,6 +66,7 @@ host test suites also run under AddressSanitizer
 |---|---|---|
 | Code review during 4.3 | The ELF loader checked only the entry point against the user region. A `PT_LOAD` segment at an address the user page tables already translate (the kernel-shared slots) would have had file bytes **copied into kernel memory**. | Fixed: `elf::validate` checks every segment (user region, stack, file range, sizes, executable entry, at most 64 headers) before anything is mapped; regression tests |
 | `link_messages` fuzzer (seconds) | `tool::decode` accepted call arguments and response bodies longer than `MAX_BODY`, which the encoder can never produce. Bounded by the frame size, so not exploitable, but a parser/encoder mismatch. | Fixed; regression test and `fuzz/regressions/link_messages/` |
+| Diff security review (2026-10-14; verified boot, gateway attestation with `--expect`, ELF `validate()`, tool decoder bounds — the 4.3 and 4.2 changes) | No medium, high or critical findings. Gaps it noted were already documented: TPM-less measurements, `--expect` being optional, a software-only root at the time (since then the TPM root and the measuring loader address the last). Not the independent review below; the TPM-root and fraud-demo changes were not in its scope. | — |
 | `boot_attest` fuzzer (4.2, under a minute) | The manifest checker accepted non-canonical spellings (uppercase hex, CRLF). Not exploitable — the release signature covers the exact bytes — but one set of files should have exactly one valid manifest. | Fixed: canonical form required; regression test and replayed input |
 | The nine 4.3 fuzz targets, 10 minutes each after the fixes (about 296 million executions: `spool_decision` 139 M, `initrd` 82 M, `policy` 36 M, `link_messages` 21 M, `frame_decoder` 7.9 M, `sealed_channel` 6.4 M, `elf` 1.9 M, `hybrid_verify` 1.5 M, `handshake` 0.7 M) | No crashes, sanitizer reports, or property violations | — |
 | `chaos` in QEMU (20,000 syscalls; with h0 granted and two messages queued) | Every hostile call rejected: bad buffers `-3`, escalating derives `-2`, unknown handles and syscalls `-1`, empty queue `-5`; valid calls succeeded; read-only canary intact; the kernel kept running programs; 940 audit records with 8 signed checkpoints verified | — |
@@ -97,7 +99,9 @@ host test suites also run under AddressSanitizer
   `policy.rules`.
 - MCP tools are listed without `credential`/`remote` flags; the operator must
   label them.
-- The kernel measures itself (into TPM PCRs 8–10 when a TPM is present);
-  a kernel modified from the start could extend the expected digests. A
-  measuring bootloader is future work. TPM enrollment is trust-on-first-use
-  (no endorsement-certificate check yet).
+- Under UEFI the kernel and ramdisk are measured by CDK's loader, which
+  the firmware measures; under BIOS the kernel only measures itself (the
+  gateway refuses BIOS boots when it expects loader measurements). UEFI
+  Secure Boot is not enabled, so a changed loader is detected (PCR 4) but
+  not prevented. TPM enrollment is trust-on-first-use (no
+  endorsement-certificate check yet).

@@ -59,10 +59,31 @@ tools/run_gateway.sh --init
 echo "Building user programs..."
 RAMDISK="target/initrd.tar"
 tools/build_user_programs.sh "$PWD/$RAMDISK"
+# Boot path (roadmap 4.2): UEFI when OVMF is installed — the firmware
+# measures CDK's measuring loader (boot/uefi-loader), which measures the
+# kernel and ramdisk into TPM PCRs 11-12 before the kernel runs. The same
+# image also boots with BIOS (CDK_BOOT=bios), without that loader stage.
+OVMF_CODE="${CDK_OVMF_CODE:-/usr/share/OVMF/OVMF_CODE_4M.fd}"
+OVMF_VARS="${CDK_OVMF_VARS:-/usr/share/OVMF/OVMF_VARS_4M.fd}"
+BOOT_MODE="${CDK_BOOT:-}"
+if [[ -z "$BOOT_MODE" ]]; then
+    if [[ -f "$OVMF_CODE" && -f "$OVMF_VARS" ]]; then BOOT_MODE=uefi; else BOOT_MODE=bios; fi
+fi
+UEFI_LOADER=()
+if [[ "$BOOT_MODE" == "uefi" ]]; then
+    echo "Building the measuring UEFI loader..."
+    (cd boot/uefi-loader && rustup run nightly cargo build --release --quiet --target x86_64-unknown-uefi \
+        -Zbuild-std=core -Zbuild-std-features=compiler-builtins-mem)
+    UEFI_LOADER=("$CARGO_TARGET_DIR/x86_64-unknown-uefi/release/cdk-uefi-loader.efi")
+fi
 rustup run nightly cargo run --manifest-path tools/create_disk_image/Cargo.toml --release --target "$HOST_TARGET" -- \
-    "$KERNEL_ELF" "$DISK_IMG" "$RAMDISK"
+    "$KERNEL_ELF" "$DISK_IMG" "$RAMDISK" "${UEFI_LOADER[@]}"
 # Expected boot measurements, for the gateway's attestation check (--expect).
-tools/sign.sh measure "$KERNEL_ELF" "$RAMDISK"
+if [[ "$BOOT_MODE" == "uefi" ]]; then
+    tools/sign.sh measure "$KERNEL_ELF" "$RAMDISK" --loader
+else
+    tools/sign.sh measure "$KERNEL_ELF" "$RAMDISK"
+fi
 
 RUN_IMG="$(mktemp /tmp/cdk_boot.XXXXXX)"
 trap 'rm -f "$RUN_IMG"' EXIT
@@ -107,7 +128,19 @@ if [[ "${CDK_TPM:-1}" != "0" ]] && command -v swtpm &> /dev/null; then
     echo "TPM: swtpm (state in $TPM_DIR)"
 fi
 
+FIRMWARE_ARGS=()
+if [[ "$BOOT_MODE" == "uefi" ]]; then
+    # A fresh copy of the variable store each run keeps firmware PCRs stable.
+    cp "$OVMF_VARS" "$PWD/target/ovmf-vars.fd"
+    FIRMWARE_ARGS=(-drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE"
+        -drive "if=pflash,format=raw,file=$PWD/target/ovmf-vars.fd")
+    echo "Boot: UEFI (OVMF) with CDK's measuring loader"
+else
+    echo "Boot: BIOS"
+fi
+
 QEMU_ARGS=(
+    "${FIRMWARE_ARGS[@]}"
     -cpu max
     -drive format=raw,file="$RUN_IMG",snapshot=on
     -serial stdio
