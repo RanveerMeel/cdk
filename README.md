@@ -1,6 +1,6 @@
 # CDK — Quantum-Safe Agent Trust Kernel
 
-**Website:** [https://ranveermeel.github.io/cdk/](https://ranveermeel.github.io/cdk/) _(GitHub Pages)_ · **Demo:** [DEMO.md](DEMO.md) · **Plan:** [ROADMAP.md](ROADMAP.md) · **Security:** [SECURITY.md](SECURITY.md) · **Review brief:** [SECURITY-REVIEW.md](SECURITY-REVIEW.md)
+**Website:** [https://ranveermeel.github.io/cdk/](https://ranveermeel.github.io/cdk/) _(GitHub Pages)_ · **Release:** [v0.1.0 preview](https://github.com/RanveerMeel/cdk/releases/tag/v0.1.0) · **Demo:** [DEMO.md](DEMO.md) · **Plan:** [ROADMAP.md](ROADMAP.md) · **Security:** [SECURITY.md](SECURITY.md) · **Review brief:** [SECURITY-REVIEW.md](SECURITY-REVIEW.md)
 
 CDK (Cognitive Distributed Kernel) is an open-source, bare-metal Rust kernel for running **AI agents under kernel-enforced, cryptographically provable permissions**, built on **post-quantum cryptography** from the start.
 
@@ -125,6 +125,18 @@ CDK is **open core**. This repository — the kernel, the capability model, the 
 
 ## Quick Start
 
+### Try a release
+
+The [v0.1.0 preview](https://github.com/RanveerMeel/cdk/releases/tag/v0.1.0) ships a ready-to-boot evaluation image, built reproducibly (two independent builds are byte-identical) and with an SBOM. Check its signed checksums before running it; the release key ID `0b57f6795dcdf315f2512079b8e16ba8` is stated in the [release notes](docs/releases/v0.1.0.md):
+
+```bash
+sha256sum -c SHA256SUMS
+tools/sign.sh verify-file SHA256SUMS --pub cdk-release.pub   # from a source checkout
+qemu-system-x86_64 -cpu max -drive format=raw,file=cdk-0.1.0-eval.img -serial stdio -display none
+```
+
+To cut a release yourself: `tools/release.sh VERSION` (see [CHANGELOG.md](CHANGELOG.md)).
+
 ### Prerequisites
 
 ```bash
@@ -140,7 +152,7 @@ sudo apt install qemu-system-x86
 ./run_qemu.sh
 ```
 
-This builds the kernel, creates a BIOS-bootable disk image, and launches QEMU with **2 vCPUs** (`-smp 2`) and the serial console connected to your terminal. Override with `CDK_QEMU_SMP=4 ./run_qemu.sh`. Type `help` at the `cdk>` prompt.
+This builds the kernel, creates a disk image that boots under both BIOS and UEFI (UEFI via OVMF when it is installed; `CDK_BOOT=bios` forces BIOS), and launches QEMU with **2 vCPUs** (`-smp 2`) and the serial console connected to your terminal. Override with `CDK_QEMU_SMP=4 ./run_qemu.sh`. Type `help` at the `cdk>` prompt.
 
 For a graphical QEMU window instead:
 
@@ -407,7 +419,7 @@ Run once after cloning:
 The installer sets both hooks:
 
 - `.githooks/commit-msg` -> enforces commit message standard
-- `.githooks/pre-push` -> blocks direct pushes to `main` and requires branch + PR workflow
+- `.githooks/pre-push` -> blocks any push that updates `main` (tags and branches can be pushed from any checkout) and requires branch + PR workflow
 
 ### Branch Protection Workflow
 
