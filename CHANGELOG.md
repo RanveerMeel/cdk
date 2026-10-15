@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- TPM endorsement (roadmap 4.2): `cdk-gateway --tpm-ca DIR` requires the
+  TPM's endorsement-key certificate to chain to a manufacturer CA in DIR and
+  proves the attestation key is in that TPM (`TPM2_MakeCredential` /
+  `TPM2_ActivateCredential`) before serving or enrolling; enrollment is no
+  longer trust-on-first-use. `tools/tpm_manufacture.sh` gives swtpm EK
+  certificates from a test manufacturer CA; new fuzz target `ek_certificate`.
+
 ## v0.1.0 — preview (2026-10)
 
 First public preview. See [docs/releases/v0.1.0.md](docs/releases/v0.1.0.md)

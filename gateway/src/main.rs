@@ -22,12 +22,14 @@
 //! * attestation (4.2): after each handshake the gateway asks CDK for its
 //!   measured-boot registers; with `--expect FILE` it serves nothing unless
 //!   they match the build; with `--tpm FILE` it also requires a TPM quote
-//!   from the enrolled machine (`attestation`).
+//!   from the enrolled machine; with `--tpm-ca DIR`, proof that the quoting
+//!   key is in a TPM certified by a manufacturer CA in DIR (`attestation`,
+//!   `ekcert`, `credential`).
 //!
 //! ```text
 //! cdk-gateway --init [--identity FILE] [--pub-out FILE]   create identity, export public key
 //! cdk-gateway [--identity FILE] [--mcp NAME=COMMAND]... [--model SPEC]... [--allow t1,t2]
-//!             [--spool DIR] [--expect FILE] [--tpm FILE] [SOCKET]
+//!             [--spool DIR] [--expect FILE] [--tpm FILE] [--tpm-ca DIR] [SOCKET]
 //! ```
 //! The public key file (1984 bytes) is packed into CDK's ramdisk as
 //! `gateway.pub`; CDK refuses any other gateway.
@@ -44,6 +46,8 @@ use cdk_link::{kind, Decoder, MAX_FRAME};
 use rand_core::{OsRng, RngCore};
 
 mod attestation;
+mod credential;
+mod ekcert;
 mod mcp;
 mod models;
 mod spool;
@@ -225,6 +229,7 @@ struct Args {
     spool: PathBuf,
     expect: Option<PathBuf>,
     tpm: Option<PathBuf>,
+    tpm_ca: Option<PathBuf>,
 }
 
 fn args() -> Args {
@@ -238,6 +243,7 @@ fn args() -> Args {
         spool: PathBuf::from("target/approvals"),
         expect: None,
         tpm: None,
+        tpm_ca: None,
         allow: None,
     };
     let mut it = std::env::args().skip(1);
@@ -257,6 +263,7 @@ fn args() -> Args {
             "--spool" => a.spool = it.next().expect("--spool DIR").into(),
             "--expect" => a.expect = Some(it.next().expect("--expect FILE").into()),
             "--tpm" => a.tpm = Some(it.next().expect("--tpm ENROLLMENT-FILE").into()),
+            "--tpm-ca" => a.tpm_ca = Some(it.next().expect("--tpm-ca DIR").into()),
             "--allow" => {
                 let list = it.next().expect("--allow tool1,tool2");
                 a.allow = Some(list.split(',').map(str::to_string).collect());
@@ -374,7 +381,19 @@ fn main() -> std::io::Result<()> {
             }
         );
     }
-    let mut attestor = attestation::Attestor::new(expect, expect_loader, a.tpm.as_deref());
+    let trust = a.tpm_ca.as_deref().map(|dir| {
+        let store = ekcert::TrustStore::load(dir).unwrap_or_else(|e| {
+            eprintln!("gateway: --tpm-ca: {e}");
+            std::process::exit(2)
+        });
+        let (roots, intermediates) = store.len();
+        eprintln!(
+            "gateway: TPM endorsement required: {roots} manufacturer root CA(s), {intermediates} intermediate(s) from {}",
+            dir.display()
+        );
+        store
+    });
+    let mut attestor = attestation::Attestor::new(expect, expect_loader, a.tpm.as_deref(), trust);
     eprintln!("gateway: approval spool {}", spool.dir().display());
     // Wake up regularly to forward operators' decisions.
     stream.set_read_timeout(Some(Duration::from_millis(250)))?;
@@ -510,7 +529,14 @@ fn main() -> std::io::Result<()> {
                         let mut plain = [0u8; cdk_link::MAX_PAYLOAD];
                         match s.open(&payload, &mut plain) {
                             Ok(m) if m > 0 && cdk_link::tpm::is_quote(&plain[..m]) => {
-                                attestor.on_quote(&plain[..m]);
+                                if let Some(challenge) = attestor.on_quote(&plain[..m]) {
+                                    let mut out = [0u8; cdk_link::MAX_PAYLOAD];
+                                    let len = s.seal(&challenge, &mut out).expect("challenge fits");
+                                    send(&mut stream, kind::SEALED, 0, &out[..len])?;
+                                }
+                            }
+                            Ok(m) if m > 0 && cdk_link::tpm::is_endorsement(&plain[..m]) => {
+                                attestor.on_endorsement(&plain[..m]);
                             }
                             Ok(m) if m > 0 && cdk_link::attest::is_attest(&plain[..m]) => {
                                 attestor.on_message(&plain[..m]);

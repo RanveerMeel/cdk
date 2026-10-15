@@ -11,10 +11,17 @@ cdk-link = { path = "../link" }
 rand_core = { version = "0.6", features = ["getrandom"] }
 serde_json = "1"
 sha2 = "0.10"
+aes = "0.8"
+base64 = "0.22"
+hmac = "0.12"
+ring = "0.17"
 ureq = { version = "2", default-features = false, features = ["tls"] }
 zeroize = "1"
 # TPM quote signatures (ECDSA P-256), roadmap 4.2.
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+
+[dev-dependencies]
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std", "ecdh"] }
 
 [profile.dev.package.ml-kem]
 opt-level = 3

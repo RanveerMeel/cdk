@@ -113,11 +113,19 @@ LINK_ARGS=(-device virtio-serial-pci
     -device virtconsole,chardev=cdklink)
 
 # TPM 2.0 (roadmap 4.2): a software TPM (swtpm) when installed, with state in
-# target/tpm/ so the attestation key persists like a real chip's.
-# CDK_TPM=0 disables it.
+# target/tpm/ so the attestation key persists like a real chip's. A new one is
+# "manufactured" with EK certificates from a test CA (tools/tpm_manufacture.sh,
+# needs swtpm-tools and tpm2-tools) so the gateway can check it is genuine.
+# CDK_TPM_DIR overrides the state directory; CDK_TPM=0 disables the TPM.
 TPM_ARGS=()
 if [[ "${CDK_TPM:-1}" != "0" ]] && command -v swtpm &> /dev/null; then
-    TPM_DIR="$PWD/target/tpm"
+    TPM_DIR="${CDK_TPM_DIR:-$PWD/target/tpm}"
+    if [[ ! -e "$TPM_DIR/tpm2-00.permall" ]] && command -v swtpm_setup &> /dev/null \
+        && command -v tpm2_createek &> /dev/null; then
+        tools/tpm_manufacture.sh "$TPM_DIR" || echo "TPM: manufacturing failed; using an uncertified swtpm"
+    elif [[ ! -e "$TPM_DIR/.ek-certified" ]]; then
+        echo "TPM: this software TPM has no EK certificate (remove $TPM_DIR and the TPM enrollment files to manufacture a certified one)"
+    fi
     mkdir -p "$TPM_DIR"
     rm -f "$TPM_DIR/swtpm-sock"
     swtpm socket --tpm2 --tpmstate dir="$TPM_DIR" --ctrl type=unixio,path="$TPM_DIR/swtpm-sock" \

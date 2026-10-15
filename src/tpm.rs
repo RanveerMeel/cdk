@@ -10,7 +10,11 @@
 //!   supplies; the same template gives the same key on every boot; `noDA`
 //!   since its authorization is empty;
 //! * `TPM2_PCR_Read` and `TPM2_Quote` — PCRs 0..=12 signed over the
-//!   gateway's nonce.
+//!   gateway's nonce;
+//! * endorsement (`cdk-gateway --tpm-ca`): `TPM2_NV_Read` of the
+//!   manufacturer's EK certificate, `TPM2_CreatePrimary` of the standard
+//!   ECC endorsement key, and `TPM2_ActivateCredential` (authorized by a
+//!   `PolicySecret(endorsement)` session) to answer the gateway's challenge.
 //!
 //! Commands are built by hand (big-endian, TPM 2.0 Part 3) with the empty
 //! password session, since CDK sets no TPM authorization values.
@@ -42,20 +46,19 @@ const CC_PCR_EXTEND: u32 = 0x182;
 const CC_PCR_READ: u32 = 0x17E;
 const CC_CREATE_PRIMARY: u32 = 0x131;
 const CC_QUOTE: u32 = 0x158;
+const CC_NV_READ_PUBLIC: u32 = 0x169;
+const CC_NV_READ: u32 = 0x14E;
+const CC_START_AUTH_SESSION: u32 = 0x176;
+const CC_POLICY_SECRET: u32 = 0x151;
+const CC_ACTIVATE_CREDENTIAL: u32 = 0x147;
+const CC_FLUSH_CONTEXT: u32 = 0x165;
+const RH_NULL: u32 = 0x4000_0007;
+const SE_POLICY: u8 = 0x01;
 const RH_ENDORSEMENT: u32 = 0x4000_000B;
 const RS_PW: u32 = 0x4000_0009;
 const ALG_SHA256: u16 = 0x000B;
-const ALG_ECC: u16 = 0x0023;
 const ALG_ECDSA: u16 = 0x0018;
 const ALG_NULL: u16 = 0x0010;
-const ECC_NIST_P256: u16 = 0x0003;
-/// fixedTPM | fixedParent | sensitiveDataOrigin | userWithAuth | noDA |
-/// restricted | sign. `noDA`: the key has an empty authorization value, so
-/// there is nothing to guess; without it the TPM's dictionary-attack
-/// protection, which counts every unclean power-off, eventually refuses
-/// quotes (TPM_RC_LOCKOUT).
-const AK_ATTRIBUTES: u32 =
-    0x0000_0002 | 0x0000_0010 | 0x0000_0020 | 0x0000_0040 | 0x0000_0400 | 0x0001_0000 | 0x0004_0000;
 /// TPM_RC_INITIALIZE: TPM2_Startup was already done (by the firmware).
 const RC_INITIALIZE: u32 = 0x100;
 
@@ -347,30 +350,16 @@ pub struct Ak {
     pub y: [u8; 32],
 }
 
-/// `TPM2_CreatePrimary` of the AK under the endorsement hierarchy.
-pub fn create_ak() -> Result<Ak> {
-    let mut public = Cmd::new(0, 0); // reuse the builder for the TPMT_PUBLIC body
-    public.0.clear();
-    let public = public
-        .u16(ALG_ECC)
-        .u16(ALG_SHA256)
-        .u32(AK_ATTRIBUTES)
-        .u16(0) // authPolicy
-        .u16(ALG_NULL) // symmetric
-        .u16(ALG_ECDSA)
-        .u16(ALG_SHA256) // scheme
-        .u16(ECC_NIST_P256)
-        .u16(ALG_NULL) // kdf
-        .u16(0)
-        .u16(0) // unique x, y
-        .0;
+/// `TPM2_CreatePrimary` under the endorsement hierarchy with `template`;
+/// returns the handle and the public area the TPM created.
+fn create_primary(template: &[u8]) -> Result<(u32, Vec<u8>)> {
     let cmd = Cmd::new(ST_SESSIONS, CC_CREATE_PRIMARY)
         .u32(RH_ENDORSEMENT)
         .password_session()
         .u16(4)
         .u16(0)
         .u16(0) // inSensitive: empty auth and data
-        .tpm2b(&public)
+        .tpm2b(template)
         .u16(0) // outsideInfo
         .u32(0) // creationPCR
         .finish();
@@ -378,30 +367,163 @@ pub fn create_ak() -> Result<Ak> {
     let mut p = Resp::new(&r);
     let handle = p.u32()?;
     p.u32()?; // parameterSize
-    let pubarea = p.tpm2b()?;
-    let mut q = Resp(pubarea, 0);
-    if q.u16()? != ALG_ECC {
+    Ok((handle, p.tpm2b()?.to_vec()))
+}
+
+/// The P-256 point at the end of an ECC public area (`unique`).
+fn ecc_point(public: &[u8]) -> Result<([u8; 32], [u8; 32])> {
+    let n = public.len();
+    let tail = public
+        .get(n.wrapping_sub(68)..)
+        .ok_or(TpmError::BadResponse)?;
+    if tail[..2] != [0, 32] || tail[34..36] != [0, 32] {
         return Err(TpmError::BadResponse);
     }
+    let x = tail[2..34].try_into().map_err(|_| TpmError::BadResponse)?;
+    let y = tail[36..68].try_into().map_err(|_| TpmError::BadResponse)?;
+    Ok((x, y))
+}
+
+/// `TPM2_CreatePrimary` of the AK under the endorsement hierarchy. The
+/// public area the TPM returns must be exactly the template with a point.
+pub fn create_ak() -> Result<Ak> {
+    let (handle, public) = create_primary(&cdk_link::tpm::ak_public(None))?;
+    let (x, y) = ecc_point(&public)?;
+    if public != cdk_link::tpm::ak_public(Some((&x, &y))) {
+        return Err(TpmError::BadResponse);
+    }
+    Ok(Ak { handle, x, y })
+}
+
+/// The endorsement key (standard template L-2) as a transient object.
+pub struct Ek {
+    pub handle: u32,
+    pub x: [u8; 32],
+    pub y: [u8; 32],
+}
+
+/// `TPM2_CreatePrimary` of the EK. Flush it with [`flush`] after use.
+pub fn create_ek() -> Result<Ek> {
+    let (handle, public) = create_primary(&cdk_link::tpm::ek_public(&[0; 32], &[0; 32]))?;
+    let checked = ecc_point(&public).and_then(|(x, y)| {
+        if public == cdk_link::tpm::ek_public(&x, &y) {
+            Ok((x, y))
+        } else {
+            Err(TpmError::BadResponse)
+        }
+    });
+    match checked {
+        Ok((x, y)) => Ok(Ek { handle, x, y }),
+        Err(e) => {
+            let _ = flush(handle);
+            Err(e)
+        }
+    }
+}
+
+/// `TPM2_FlushContext`.
+pub fn flush(handle: u32) -> Result<()> {
+    transmit(
+        &Cmd::new(ST_NO_SESSIONS, CC_FLUSH_CONTEXT)
+            .u32(handle)
+            .finish(),
+    )
+    .map(|_| ())
+}
+
+/// The contents of an NV index readable with its own (empty) authorization,
+/// such as the manufacturer's EK certificate.
+pub fn nv_read(index: u32, max: usize) -> Result<Vec<u8>> {
+    let r = transmit(
+        &Cmd::new(ST_NO_SESSIONS, CC_NV_READ_PUBLIC)
+            .u32(index)
+            .finish(),
+    )?;
+    let mut p = Resp::new(&r);
+    let public = p.tpm2b()?;
+    let mut q = Resp(public, 0);
+    q.u32()?; // nvIndex
     q.u16()?; // nameAlg
     q.u32()?; // attributes
     q.tpm2b()?; // authPolicy
-    if q.u16()? != ALG_NULL {
-        return Err(TpmError::BadResponse); // symmetric must be NULL for a signing key
-    }
-    if q.u16()? != ALG_ECDSA {
+    let size = q.u16()? as usize;
+    if size == 0 || size > max {
         return Err(TpmError::BadResponse);
     }
-    q.u16()?; // scheme hash
-    if q.u16()? != ECC_NIST_P256 {
-        return Err(TpmError::BadResponse);
+    let mut out = Vec::with_capacity(size);
+    while out.len() < size {
+        let n = (size - out.len()).min(512);
+        let cmd = Cmd::new(ST_SESSIONS, CC_NV_READ)
+            .u32(index) // authHandle: the index itself
+            .u32(index)
+            .password_session()
+            .u16(n as u16)
+            .u16(out.len() as u16)
+            .finish();
+        let r = transmit(&cmd)?;
+        let mut p = Resp::new(&r);
+        p.u32()?; // parameterSize
+        let data = p.tpm2b()?;
+        if data.is_empty() || data.len() > n {
+            return Err(TpmError::BadResponse);
+        }
+        out.extend_from_slice(data);
     }
-    if q.u16()? != ALG_NULL {
-        return Err(TpmError::BadResponse); // kdf
+    Ok(out)
+}
+
+/// `TPM2_ActivateCredential`: recover the gateway's secret, which only the
+/// TPM holding both `ek` and `ak` can. The EK's policy is
+/// `PolicySecret(TPM_RH_ENDORSEMENT)`, satisfied in a fresh policy session.
+pub fn activate_credential(ak: &Ak, ek: &Ek, id_object: &[u8], secret: &[u8]) -> Result<Vec<u8>> {
+    let r = transmit(
+        &Cmd::new(ST_NO_SESSIONS, CC_START_AUTH_SESSION)
+            .u32(RH_NULL) // tpmKey: unsalted
+            .u32(RH_NULL) // bind: unbound
+            .tpm2b(&[0x5A; 16]) // nonceCaller (no HMAC is computed)
+            .u16(0) // encryptedSalt
+            .u8(SE_POLICY)
+            .u16(ALG_NULL) // symmetric
+            .u16(ALG_SHA256)
+            .finish(),
+    )?;
+    let session = Resp::new(&r).u32()?;
+    let result = (|| {
+        transmit(
+            &Cmd::new(ST_SESSIONS, CC_POLICY_SECRET)
+                .u32(RH_ENDORSEMENT)
+                .u32(session)
+                .password_session()
+                .u16(0) // nonceTPM
+                .u16(0) // cpHashA
+                .u16(0) // policyRef
+                .u32(0) // expiration
+                .finish(),
+        )?;
+        let cmd = Cmd::new(ST_SESSIONS, CC_ACTIVATE_CREDENTIAL)
+            .u32(ak.handle) // activateHandle (ADMIN role: the AK's empty password)
+            .u32(ek.handle) // keyHandle (USER role: the policy session)
+            .u32(18)
+            .u32(RS_PW)
+            .u16(0)
+            .u8(0)
+            .u16(0)
+            .u32(session)
+            .u16(0)
+            .u8(0) // continueSession clear: the TPM ends the session
+            .u16(0)
+            .tpm2b(id_object)
+            .tpm2b(secret)
+            .finish();
+        let r = transmit(&cmd)?;
+        let mut p = Resp::new(&r);
+        p.u32()?; // parameterSize
+        Ok(p.tpm2b()?.to_vec())
+    })();
+    if result.is_err() {
+        let _ = flush(session);
     }
-    let x: [u8; 32] = q.tpm2b()?.try_into().map_err(|_| TpmError::BadResponse)?;
-    let y: [u8; 32] = q.tpm2b()?.try_into().map_err(|_| TpmError::BadResponse)?;
-    Ok(Ak { handle, x, y })
+    result
 }
 
 /// `TPM2_Quote` of PCRs 0..=12 with `nonce` as qualifying data. Returns the

@@ -30,7 +30,7 @@
 //! gateway verified.
 //!
 //! ```text
-//! AttestRequest : 0x30 | nonce [32]
+//! AttestRequest : 0x30 | nonce [32] [| flags u8]   (flags: tpm::PROVE_ENDORSEMENT)
 //! Attest        : 0x31 | nonce [32] | verdict u8 | release id [16]
 //!                      | registers [3 × 32] | log_len u16 | log (UTF-8)
 //! ```
@@ -278,9 +278,13 @@ pub struct Attestation<'a> {
 const ATTEST_HEADER: usize = 1 + 32 + 1 + 16 + 32 * REGISTERS + 2;
 pub const MAX_LOG: usize = crate::secure::MAX_PLAINTEXT - ATTEST_HEADER;
 
-pub fn encode_request(nonce: &[u8; 32]) -> Vec<u8> {
+/// An attestation request; `flags` 0 encodes the original 33-byte form.
+pub fn encode_request(nonce: &[u8; 32], flags: u8) -> Vec<u8> {
     let mut m = alloc::vec![ATTEST_REQUEST];
     m.extend_from_slice(nonce);
+    if flags != 0 {
+        m.push(flags);
+    }
     m
 }
 
@@ -306,7 +310,8 @@ pub fn encode_attestation(a: &Attestation<'_>) -> Vec<u8> {
 }
 
 pub enum Message<'a> {
-    Request([u8; 32]),
+    /// Nonce and flags.
+    Request([u8; 32], u8),
     Attestation(Attestation<'a>),
 }
 
@@ -317,7 +322,10 @@ pub fn is_attest(msg: &[u8]) -> bool {
 pub fn decode(b: &[u8]) -> Option<Message<'_>> {
     let (&tag, r) = b.split_first()?;
     match tag {
-        ATTEST_REQUEST if r.len() == 32 => Some(Message::Request(r.try_into().ok()?)),
+        ATTEST_REQUEST if r.len() == 32 || r.len() == 33 => Some(Message::Request(
+            r[..32].try_into().ok()?,
+            r.get(32).copied().unwrap_or(0),
+        )),
         ATTEST => {
             let nonce: [u8; 32] = r.get(..32)?.try_into().ok()?;
             let verdict = Verdict::from_u8(*r.get(32)?)?;
@@ -547,7 +555,8 @@ mod tests {
                 <= crate::secure::MAX_PLAINTEXT
         );
         assert!(
-            matches!(decode(&encode_request(&[9; 32])), Some(Message::Request(n)) if n == [9; 32])
+            matches!(decode(&encode_request(&[9; 32], 0)), Some(Message::Request(n, 0)) if n == [9; 32])
+                && matches!(decode(&encode_request(&[9; 32], 1)), Some(Message::Request(n, 1)) if n == [9; 32])
         );
         let text = (0..REGISTERS)
             .map(|i| alloc::format!("register {i} {}\n", hex(&r[i])))

@@ -157,21 +157,26 @@ fn secure_connect_inner(timeout_ms: u64) -> Result<[u8; 16], SecureError> {
 /// right after the handshake. A gateway that does not ask is not waited for
 /// beyond `timeout_ms`.
 fn answer_attestation(gateway: &[u8; 16], timeout_ms: u64) {
-    let start = crate::cpu::rdtsc();
-    let mut nonce = None;
-    while nonce.is_none() && crate::cpu::rdtsc().wrapping_sub(start) < timeout_ms * 2_000_000 {
-        recv(|m| {
-            if let Incoming::Sealed(p) = m {
-                if let Some(cdk_link::attest::Message::Request(n)) = cdk_link::attest::decode(p) {
-                    nonce = Some(n);
-                }
-            }
-        });
-        core::hint::spin_loop();
-    }
-    let Some(nonce) = nonce else {
+    let mut request = None;
+    wait_sealed(timeout_ms, |p| match cdk_link::attest::decode(p) {
+        Some(cdk_link::attest::Message::Request(n, flags)) => {
+            request = Some((n, flags));
+            true
+        }
+        _ => false,
+    });
+    let Some((nonce, flags)) = request else {
         crate::println!("link: gateway did not ask for attestation");
         return;
+    };
+    // Endorsement (gateway --tpm-ca): the EK and its certificate go first,
+    // so the gateway can challenge the AK as soon as the quote arrives.
+    let endorsement = if flags & cdk_link::tpm::PROVE_ENDORSEMENT != 0 {
+        crate::boot::tpm_endorsement()
+            .filter(|(_, msgs)| msgs.iter().all(|m| send_data(m).is_ok()))
+            .map(|(ek, _)| ek)
+    } else {
+        None
     };
     let quoted = match crate::boot::tpm_quote(&nonce) {
         Some(q) => send_data(&q).is_ok(),
@@ -191,6 +196,41 @@ fn answer_attestation(gateway: &[u8; 16], timeout_ms: u64) {
             ),
             crate::boot::verdict() as u64,
         );
+    }
+    if let Some(ek) = endorsement {
+        let mut proof = None;
+        wait_sealed(10_000, |p| {
+            if p.first() == Some(&cdk_link::tpm::CHALLENGE) {
+                proof = Some(crate::boot::tpm_activate(&ek, p));
+                true
+            } else {
+                false
+            }
+        });
+        let _ = crate::tpm::flush(ek.handle);
+        match proof {
+            Some(Some(m)) if send_data(&m).is_ok() => {
+                crate::println!("link: endorsement proven (TPM credential activation)")
+            }
+            Some(_) => crate::println!("link: endorsement challenge could not be answered"),
+            None => crate::println!("link: gateway sent no endorsement challenge"),
+        }
+    }
+}
+
+/// Poll for sealed messages until `f` accepts one or `timeout_ms` passes.
+fn wait_sealed(timeout_ms: u64, mut f: impl FnMut(&[u8]) -> bool) {
+    let start = crate::cpu::rdtsc();
+    let mut done = false;
+    while !done && crate::cpu::rdtsc().wrapping_sub(start) < timeout_ms * 2_000_000 {
+        recv(|m| {
+            if let Incoming::Sealed(p) = m {
+                if !done {
+                    done = f(p);
+                }
+            }
+        });
+        core::hint::spin_loop();
     }
 }
 

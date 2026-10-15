@@ -18,7 +18,7 @@ OUT="$ROOT/target/demo"
 export CDK_POLICY_FILE="$ROOT/policy/fraud-demo.rules"
 # The demo's own TPM enrollment: the first run enrolls this machine (as
 # booted by run_qemu.sh); later runs must match it.
-export CDK_TPM_ENROLLMENT="$ROOT/target/tpm-enrollment-demo"
+export CDK_TPM_ENROLLMENT="${CDK_TPM_ENROLLMENT:-$ROOT/target/tpm-enrollment-demo}"
 
 # Operators alice and bob (public keys go into the boot ramdisk).
 for who in alice bob; do

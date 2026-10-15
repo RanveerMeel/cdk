@@ -13,6 +13,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "aes"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b169f7a6d4742236a0a00c541b845991d0ac43e546831af1249753ab4c3aa3a0"
+dependencies = [
+ "cfg-if",
+ "cipher",
+ "cpufeatures 0.2.17",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -68,9 +79,13 @@ dependencies = [
 name = "cdk-gateway"
 version = "0.1.0"
 dependencies = [
+ "aes",
+ "base64",
  "cdk-link",
+ "hmac",
  "p256",
  "rand_core 0.6.4",
+ "ring",
  "serde_json",
  "sha2",
  "ureq",
@@ -337,6 +352,7 @@ dependencies = [
  "ff",
  "generic-array",
  "group",
+ "hkdf",
  "pkcs8 0.10.2",
  "rand_core 0.6.4",
  "sec1",

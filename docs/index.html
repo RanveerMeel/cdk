@@ -278,7 +278,7 @@ audit: OK — 97 records (seq 0..96), 0 evicted, 1 checkpoint(s) valid</code></p
                 <li>Policy change review: every grant shown as a reach diff, checked against invariant rules, approved before it applies</li>
                 <li>Signed operator approvals: post-quantum operator signatures, two-person (M-of-N) rules, vetoes, time-outs, every vote audit-logged</li>
                 <li>Every parser of untrusted bytes fuzzed in CI, an in-kernel syscall fuzzer, and AddressSanitizer on host tests</li>
-                <li>Verified and measured boot: a release-signed ramdisk the kernel checks before trusting any key (lockdown on failure); a measured chain from firmware to loader to kernel in TPM PCRs, attested with TPM quotes from an enrolled machine</li>
+                <li>Verified and measured boot: a release-signed ramdisk the kernel checks before trusting any key (lockdown on failure); a measured chain from firmware to loader to kernel in TPM PCRs, attested with TPM quotes from an enrolled machine whose TPM proves it is genuine (manufacturer certificate chain and credential activation)</li>
               </ul>
             </div>
             <div>
