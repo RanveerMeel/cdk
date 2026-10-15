@@ -9,6 +9,8 @@
 //!                                                  (--loader: also PCRs 11-12 from
 //!                                                  the measuring UEFI loader)
 //! cdk-sign verify <ramdisk-stage-dir> [--pub FILE] check a staged ramdisk
+//! cdk-sign sign-file <file> [--key FILE]           write <file>.sig (release files)
+//! cdk-sign verify-file <file> [--pub FILE]         check <file> against <file>.sig
 //! ```
 //!
 //! Defaults: `target/release-signing.key`, `target/release.pub` (compiled
@@ -139,6 +141,73 @@ fn manifest(dir: &Path, key: &Path) {
     );
 }
 
+/// FIPS 204 context of release-file signatures.
+const RELEASE_CONTEXT: &[u8] = b"CDK-RELEASE-v1";
+
+/// What a release-file signature covers: SHA-256(context ‖ 0 ‖ file name ‖ 0 ‖ contents).
+fn release_digest(name: &str, data: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(RELEASE_CONTEXT);
+    h.update([0]);
+    h.update(name.as_bytes());
+    h.update([0]);
+    h.update(data);
+    h.finalize().into()
+}
+
+fn file_name(p: &Path) -> String {
+    p.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+fn sign_file(file: &Path, key: &Path) {
+    let kp = load_key(key);
+    let data = std::fs::read(file).unwrap_or_else(|e| die(&format!("{}: {e}", file.display())));
+    let sig = kp.sign_with(&release_digest(&file_name(file), &data), RELEASE_CONTEXT);
+    let mut b = vec![0u8; SIG_LEN];
+    sig.write_to(&mut b);
+    let out = PathBuf::from(format!("{}.sig", file.display()));
+    std::fs::write(&out, &b).unwrap_or_else(|e| die(&e.to_string()));
+    println!(
+        "signed {} -> {} (Ed25519 + ML-DSA-65, release key {})",
+        file.display(),
+        out.display(),
+        attest::hex(&kp.public().id()[..4])
+    );
+}
+
+fn verify_file(file: &Path, pubf: &Path) {
+    let id = load_pub(pubf)
+        .unwrap_or_else(|| die(&format!("{}: not a release public key", pubf.display())));
+    let data = std::fs::read(file).unwrap_or_else(|e| die(&format!("{}: {e}", file.display())));
+    let sigf = PathBuf::from(format!("{}.sig", file.display()));
+    let sig = std::fs::read(&sigf)
+        .ok()
+        .and_then(|b| Signature::from_slice(&b))
+        .unwrap_or_else(|| {
+            die(&format!(
+                "{}: missing or malformed signature",
+                sigf.display()
+            ))
+        });
+    if hybrid::verify_with(
+        &id,
+        &release_digest(&file_name(file), &data),
+        &sig,
+        RELEASE_CONTEXT,
+    ) {
+        println!(
+            "ok: {} is signed by release key {}",
+            file.display(),
+            attest::hex(&id.id())
+        );
+    } else {
+        die(&format!("{}: signature does NOT verify", file.display()));
+    }
+}
+
 fn verify(dir: &Path, pubf: &Path) {
     let id = load_pub(pubf)
         .unwrap_or_else(|| die(&format!("{}: not a release public key", pubf.display())));
@@ -215,6 +284,8 @@ fn main() {
         Some("init") => init(&key, &opt("--pub-out", "target/release.pub")),
         Some("manifest") => manifest(&arg(1), &key),
         Some("verify") => verify(&arg(1), &pubf),
+        Some("sign-file") => sign_file(&arg(1), &key),
+        Some("verify-file") => verify_file(&arg(1), &pubf),
         Some("measure") => measure(
             &arg(1),
             &arg(2),
