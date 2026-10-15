@@ -42,6 +42,9 @@ jobs:
       - name: Host unit tests
         run: cargo test-host
 
+      - name: Measuring UEFI loader builds (boot/uefi-loader)
+        run: cd boot/uefi-loader && cargo build --release --target x86_64-unknown-uefi -Zbuild-std=core -Zbuild-std-features=compiler-builtins-mem
+
       - name: User programs and ramdisk
         run: tools/build_user_programs.sh
 
@@ -85,8 +88,11 @@ jobs:
       - name: Demo MCP and model servers compile
         run: python3 -m py_compile gateway/examples/demo_mcp_server.py gateway/examples/demo_model_server.py
 
-      - name: Demo model is reproducible
-        run: python3 tools/train_demo_model.py && git diff --exit-code user/models
+      - name: Demo models are reproducible
+        run: python3 tools/train_demo_model.py && python3 tools/train_fraud_demo_model.py && git diff --exit-code user/models
+
+      - name: Fraud demo scripts compile
+        run: python3 -m py_compile gateway/examples/demo_bank_server.py tools/demo_driver.py tools/train_fraud_demo_model.py && bash -n tools/demo_fraud.sh
 
   # Roadmap 4.3: replay every seed and past crash, then fuzz each parser of
   # untrusted bytes briefly. Long campaigns run locally (tools/fuzz.sh).

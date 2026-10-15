@@ -9,7 +9,7 @@
 //!   only sign structures it generated itself (quotes), never data CDK
 //!   supplies; the same template gives the same key on every boot; `noDA`
 //!   since its authorization is empty;
-//! * `TPM2_PCR_Read` and `TPM2_Quote` — PCRs 0..=10 signed over the
+//! * `TPM2_PCR_Read` and `TPM2_Quote` — PCRs 0..=12 signed over the
 //!   gateway's nonce.
 //!
 //! Commands are built by hand (big-endian, TPM 2.0 Part 3) with the empty
@@ -327,10 +327,10 @@ fn pcr_read_one(select: &[u8; 3]) -> Result<Vec<[u8; 32]>> {
     Ok(out)
 }
 
-/// PCRs 0..=10 (SHA-256).
-pub fn pcr_read_0_to_10() -> Result<[[u8; 32]; cdk_link::tpm::QUOTED_PCRS]> {
+/// The quoted PCRs 0..=12 (SHA-256).
+pub fn pcr_read_quoted() -> Result<[[u8; 32]; cdk_link::tpm::QUOTED_PCRS]> {
     let mut v = pcr_read_one(&[0xFF, 0x00, 0x00])?;
-    v.extend(pcr_read_one(&[0x00, 0x07, 0x00])?);
+    v.extend(pcr_read_one(&[0x00, 0x1F, 0x00])?);
     let mut out = [[0u8; 32]; cdk_link::tpm::QUOTED_PCRS];
     if v.len() != out.len() {
         return Err(TpmError::BadResponse);
@@ -404,7 +404,7 @@ pub fn create_ak() -> Result<Ak> {
     Ok(Ak { handle, x, y })
 }
 
-/// `TPM2_Quote` of PCRs 0..=10 with `nonce` as qualifying data. Returns the
+/// `TPM2_Quote` of PCRs 0..=12 with `nonce` as qualifying data. Returns the
 /// `TPMS_ATTEST` and the ECDSA signature `(r, s)`.
 pub fn quote(ak: &Ak, nonce: &[u8; 32]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
     let cmd = Cmd::new(ST_SESSIONS, CC_QUOTE)

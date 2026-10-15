@@ -6,23 +6,38 @@
 //!
 //! CDK replays its three boot measurements into PCRs [`CDK_PCRS`] (8, 9,
 //! 10), so they equal the software registers of [`crate::attest`]; the
-//! firmware measures early boot into PCRs 0–7. A quote covers PCRs 0–10.
+//! firmware measures early boot into PCRs 0–7 (under UEFI, PCR 4 includes
+//! CDK's measuring loader), and that loader measures the kernel file and
+//! the ramdisk into [`LOADER_PCRS`] (11, 12) before the kernel runs. A
+//! quote covers PCRs 0–12.
 //!
 //! ```text
 //! Quote : 0x32 | nonce [32] | AK x [32] | AK y [32] | PCR 0..=10 [11 × 32]
 //!              | attest_len u16 | TPMS_ATTEST | r_len u8 | r | s_len u8 | s
+//!   (PCRs are 0..=12: 13 × 32 bytes)
 //! ```
 
 use alloc::vec::Vec;
 use sha2::{Digest, Sha256};
 
 pub const QUOTE: u8 = 0x32;
-/// PCRs a quote covers: 0..=10.
-pub const QUOTED_PCRS: usize = 11;
+/// PCRs a quote covers: 0..=12.
+pub const QUOTED_PCRS: usize = 13;
 /// PCRs CDK extends with its measurement registers.
 pub const CDK_PCRS: [u32; 3] = [8, 9, 10];
-/// `TPMS_PCR_SELECT` bitmap for PCRs 0..=10.
-pub const PCR_SELECT: [u8; 3] = [0xFF, 0x07, 0x00];
+/// PCRs CDK's measuring UEFI loader extends before the kernel runs: the
+/// kernel ELF file and the ramdisk.
+pub const LOADER_PCRS: [u32; 2] = [11, 12];
+/// `TPMS_PCR_SELECT` bitmap for PCRs 0..=12.
+pub const PCR_SELECT: [u8; 3] = [0xFF, 0x1F, 0x00];
+
+/// What the measuring loader puts in PCRs 11 and 12 for these files.
+pub fn expected_loader_pcrs(kernel_file: &[u8], ramdisk: &[u8]) -> [[u8; 32]; 2] {
+    let mut out = [[0u8; 32]; 2];
+    crate::attest::extend(&mut out[0], &Sha256::digest(kernel_file).into());
+    crate::attest::extend(&mut out[1], &Sha256::digest(ramdisk).into());
+    out
+}
 
 pub const TPM_GENERATED_VALUE: u32 = 0xff54_4347;
 pub const TPM_ST_ATTEST_QUOTE: u16 = 0x8018;
@@ -172,7 +187,7 @@ pub fn check_quote_contents(q: &Quote<'_>) -> Result<(), &'static str> {
         return Err("quote is not for this nonce");
     }
     if info.selection.len() != 1 || info.selection[0] != (TPM_ALG_SHA256, &PCR_SELECT[..]) {
-        return Err("quote covers other PCRs");
+        return Err("quote covers other PCRs (expected 0-12)");
     }
     if info.pcr_digest != pcr_digest(&q.pcrs) {
         return Err("reported PCR values do not match the quoted digest");

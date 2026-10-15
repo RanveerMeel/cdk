@@ -51,6 +51,7 @@ struct State {
     /// The TPM attestation key, once the TPM holds the measurements.
     ak: Option<crate::tpm::Ak>,
     tpm_note: &'static str,
+    loader_note: &'static str,
     verdict: Verdict,
     release_id: [u8; 16],
     registers: [[u8; 32]; REGISTERS],
@@ -62,6 +63,7 @@ static STATE: Mutex<State> = Mutex::new(State {
     events: alloc::vec::Vec::new(),
     ak: None,
     tpm_note: "not probed",
+    loader_note: "",
     verdict: Verdict::Unverified,
     release_id: [0; 16],
     registers: [[0; 32]; REGISTERS],
@@ -201,7 +203,7 @@ pub fn tpm_commit() {
         for (reg, digest) in &events {
             crate::tpm::pcr_extend(cdk_link::tpm::CDK_PCRS[*reg], digest)?;
         }
-        let pcrs = crate::tpm::pcr_read_0_to_10()?;
+        let pcrs = crate::tpm::pcr_read_quoted()?;
         let regs = STATE.lock().registers;
         for (i, reg) in regs.iter().enumerate() {
             if pcrs[cdk_link::tpm::CDK_PCRS[i] as usize] != *reg {
@@ -209,6 +211,17 @@ pub fn tpm_commit() {
                 return Err(crate::tpm::TpmError::BadResponse);
             }
         }
+        // A measuring loader (UEFI boot) put the ramdisk into PCR 12; it
+        // hashed the same bytes the kernel measured into register 1.
+        let loader = pcrs[cdk_link::tpm::LOADER_PCRS[1] as usize];
+        let note = if loader == [0; 32] {
+            "no measuring loader (PCRs 11-12 empty: BIOS boot or no TPM in the loader)"
+        } else if loader == regs[attest::REG_RAMDISK] {
+            "loader measured kernel and ramdisk into PCRs 11-12 (ramdisk matches)"
+        } else {
+            "LOADER PCR 12 DIFFERS from the ramdisk the kernel received"
+        };
+        STATE.lock().loader_note = note;
         crate::tpm::create_ak()
     })();
     match r {
@@ -218,6 +231,7 @@ pub fn tpm_commit() {
                 crate::tpm::did_vid(),
                 attest::hex(&ak.x[..6])
             );
+            crate::println!("TPM: {}", STATE.lock().loader_note);
             let mut subj: heapless::String<48> = heapless::String::new();
             let _ = write!(subj, "ak:{}", attest::hex(&ak.x[..8]));
             audit::record(EventKind::TpmReady, &subj, crate::tpm::did_vid() as u64);
@@ -241,7 +255,7 @@ pub fn tpm_commit() {
 pub fn tpm_quote(nonce: &[u8; 32]) -> Option<alloc::vec::Vec<u8>> {
     let ak = STATE.lock().ak?;
     let r =
-        crate::tpm::pcr_read_0_to_10().and_then(|p| crate::tpm::quote(&ak, nonce).map(|q| (p, q)));
+        crate::tpm::pcr_read_quoted().and_then(|p| crate::tpm::quote(&ak, nonce).map(|q| (p, q)));
     let (pcrs, (attest_bytes, r, s)) = match r {
         Ok(v) => v,
         Err(e) => {
@@ -290,6 +304,9 @@ pub fn report(mut f: impl FnMut(&str)) {
         let _ = writeln!(s, "register {} {}", i, attest::hex(r));
     }
     let _ = writeln!(s, "tpm: {}", st.tpm_note);
+    if !st.loader_note.is_empty() {
+        let _ = writeln!(s, "loader: {}", st.loader_note);
+    }
     if let Some(ak) = &st.ak {
         let _ = writeln!(
             s,

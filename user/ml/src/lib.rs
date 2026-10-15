@@ -327,8 +327,26 @@ mod tests {
     /// the featurizer and integer inference, the expected outputs.
     #[test]
     fn demo_model_matches_python_reference() {
-        let model = include_bytes!("../../models/priority-demo.cdklm");
-        let vectors = include_str!("../../models/priority-demo.vectors");
+        let n = check_against_reference(
+            include_bytes!("../../models/priority-demo.cdklm"),
+            include_str!("../../models/priority-demo.vectors"),
+        );
+        assert!(n >= 10);
+    }
+
+    /// The fraud-triage demo model (`tools/train_fraud_demo_model.py`).
+    #[test]
+    fn fraud_demo_model_matches_python_reference() {
+        let n = check_against_reference(
+            include_bytes!("../../models/fraud-demo.cdklm"),
+            include_str!("../../models/fraud-demo.vectors"),
+        );
+        assert!(n >= 7);
+    }
+
+    /// Every vector line: identical integer logits and label. Returns the
+    /// number checked.
+    fn check_against_reference(model: &[u8], vectors: &str) -> usize {
         let m = Model::parse(model).unwrap();
         assert_eq!(m.feature_kind(), FeatureKind::HashedTrigrams);
         let mut checked = 0;
@@ -358,6 +376,6 @@ mod tests {
             );
             checked += 1;
         }
-        assert!(checked >= 10);
+        checked
     }
 }

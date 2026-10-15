@@ -121,6 +121,8 @@ pub fn verify_quote_signature(q: &tpm::Quote<'_>) -> bool {
 
 pub struct Attestor {
     expect: Option<[[u8; 32]; REGISTERS]>,
+    /// Expected PCRs 11-12 from the measuring loader (UEFI boots).
+    expect_loader: Option<[[u8; 32]; 2]>,
     tpm_file: Option<PathBuf>,
     enrolled: Option<Enrollment>,
     nonce: [u8; 32],
@@ -129,7 +131,11 @@ pub struct Attestor {
 }
 
 impl Attestor {
-    pub fn new(expect: Option<[[u8; 32]; REGISTERS]>, tpm_file: Option<&Path>) -> Self {
+    pub fn new(
+        expect: Option<[[u8; 32]; REGISTERS]>,
+        expect_loader: Option<[[u8; 32]; 2]>,
+        tpm_file: Option<&Path>,
+    ) -> Self {
         let enrolled = tpm_file
             .and_then(|p| std::fs::read_to_string(p).ok())
             .map(|t| {
@@ -140,6 +146,7 @@ impl Attestor {
             });
         Attestor {
             expect,
+            expect_loader,
             tpm_file: tpm_file.map(Path::to_path_buf),
             enrolled,
             nonce: [0; 32],
@@ -183,7 +190,7 @@ impl Attestor {
         })();
         match &result {
             Ok(q) => eprintln!(
-                "gateway: <- TPM quote: signature verified (attestation key {}…), PCRs 0-10 match the quoted digest",
+                "gateway: <- TPM quote: signature verified (attestation key {}…), PCRs 0-12 match the quoted digest",
                 attest::hex(&q.ak[..6])
             ),
             Err(e) => eprintln!("gateway: <- TPM quote REJECTED: {e}"),
@@ -265,6 +272,26 @@ impl Attestor {
                 return false;
             }
         }
+        if let Some(exp) = &self.expect_loader {
+            for (i, pcr) in tpm::LOADER_PCRS.iter().enumerate() {
+                let got = quote.pcrs[*pcr as usize];
+                if got == [0; 32] {
+                    eprintln!("gateway: PCR {pcr} is empty — CDK was not started by the measuring loader (BIOS boot?)");
+                    return false;
+                }
+                if got != exp[i] {
+                    eprintln!(
+                        "gateway: PCR {pcr} (measured by the loader before the kernel ran) differs from the build: {} (expected {})",
+                        attest::hex(&got[..8]),
+                        attest::hex(&exp[i][..8])
+                    );
+                    return false;
+                }
+            }
+            eprintln!(
+                "gateway: PCRs 11-12 (kernel and ramdisk, measured by the loader) MATCH the build"
+            );
+        }
         let mut firmware = [[0u8; 32]; 8];
         firmware.copy_from_slice(&quote.pcrs[..8]);
         let seen = Enrollment {
@@ -282,7 +309,11 @@ impl Attestor {
                 }
                 for i in 0..8 {
                     if e.firmware[i] != seen.firmware[i] {
-                        eprintln!("gateway: firmware PCR {i} differs from enrollment");
+                        eprintln!(
+                            "gateway: firmware PCR {i} differs from enrollment: {} (enrolled {})",
+                            attest::hex(&seen.firmware[i][..8]),
+                            attest::hex(&e.firmware[i][..8])
+                        );
                     }
                 }
                 false
@@ -375,7 +406,7 @@ mod tests {
     fn serves_only_matching_fresh_attestations() {
         let good = expected_registers(b"k", b"r", Verdict::Verified, &[1; 16]);
         let bad = expected_registers(b"k", b"r2", Verdict::Verified, &[1; 16]);
-        let mut a = Attestor::new(Some(good), None);
+        let mut a = Attestor::new(Some(good), None, None);
         a.request();
         assert!(!a.serving(), "nothing before the answer");
         a.on_message(&answer(&a, good));
@@ -387,7 +418,7 @@ mod tests {
         a.request();
         a.on_message(&old);
         assert_eq!(a.status, Status::Rejected, "replayed answer");
-        let mut b = Attestor::new(None, None);
+        let mut b = Attestor::new(None, None, None);
         b.request();
         assert!(b.serving());
         b.on_message(&old);
@@ -401,7 +432,7 @@ mod tests {
         let _ = std::fs::remove_file(&file);
 
         // First contact enrolls.
-        let mut a = Attestor::new(Some(regs), Some(&file));
+        let mut a = Attestor::new(Some(regs), None, Some(&file));
         a.request();
         a.on_quote(&quote(&a, 7, pcrs_for(&regs, 0x33)));
         a.on_message(&answer(&a, regs));
@@ -409,7 +440,7 @@ mod tests {
         assert!(file.exists());
 
         // Same machine, next boot: accepted.
-        let mut b = Attestor::new(Some(regs), Some(&file));
+        let mut b = Attestor::new(Some(regs), None, Some(&file));
         b.request();
         b.on_quote(&quote(&b, 7, pcrs_for(&regs, 0x33)));
         b.on_message(&answer(&b, regs));
@@ -429,7 +460,7 @@ mod tests {
 
         // A kernel reporting registers the TPM does not hold: rejected.
         let other = expected_registers(b"k", b"r2", Verdict::Verified, &[1; 16]);
-        let mut c = Attestor::new(None, Some(&file));
+        let mut c = Attestor::new(None, None, Some(&file));
         c.request();
         c.on_quote(&quote(&c, 7, pcrs_for(&other, 0x33)));
         c.on_message(&answer(&c, regs));
@@ -448,6 +479,41 @@ mod tests {
         c.on_quote(&q);
         c.on_message(&answer(&c, regs));
         assert!(!c.serving());
+        std::fs::remove_file(&file).unwrap();
+    }
+
+    #[test]
+    fn loader_pcrs_must_match_the_build() {
+        let regs = expected_registers(b"k", b"r", Verdict::Verified, &[1; 16]);
+        let loader = tpm::expected_loader_pcrs(b"kernel elf", b"r");
+        let file = std::env::temp_dir().join(format!("cdk-tpm-loader-{}", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let with_loader = |l: Option<[[u8; 32]; 2]>| {
+            let mut p = pcrs_for(&regs, 0x33);
+            if let Some(l) = l {
+                p[11] = l[0];
+                p[12] = l[1];
+            }
+            p
+        };
+        let mut a = Attestor::new(Some(regs), Some(loader), Some(&file));
+        a.request();
+        a.on_quote(&quote(&a, 7, with_loader(Some(loader))));
+        a.on_message(&answer(&a, regs));
+        assert!(a.serving(), "measured by the loader, matching the build");
+
+        // Another kernel file measured by the loader: refused.
+        let other = tpm::expected_loader_pcrs(b"other kernel", b"r");
+        a.request();
+        a.on_quote(&quote(&a, 7, with_loader(Some(other))));
+        a.on_message(&answer(&a, regs));
+        assert!(!a.serving());
+
+        // Not started by the measuring loader (BIOS boot): refused.
+        a.request();
+        a.on_quote(&quote(&a, 7, with_loader(None)));
+        a.on_message(&answer(&a, regs));
+        assert!(!a.serving());
         std::fs::remove_file(&file).unwrap();
     }
 }

@@ -344,8 +344,34 @@ pub fn decode(b: &[u8]) -> Option<Message<'_>> {
     }
 }
 
+/// Expected loader PCRs from an expected-measurements file: `loader 11
+/// <hex>` and `loader 12 <hex>` lines (written by `cdk-sign measure
+/// --loader`); `None` if the file has none (BIOS boots are not measured by
+/// a loader).
+pub fn parse_expected_loader(text: &str) -> Option<[[u8; 32]; 2]> {
+    let mut out = [None; 2];
+    for line in text
+        .lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim())
+        .filter(|l| !l.is_empty())
+    {
+        let mut w = line.split_whitespace();
+        if w.next() != Some("loader") {
+            continue;
+        }
+        let i = match w.next()? {
+            "11" => 0,
+            "12" => 1,
+            _ => return None,
+        };
+        out[i] = Some(unhex32(w.next()?)?);
+    }
+    Some([out[0]?, out[1]?])
+}
+
 /// Parse an expected-measurements file (written by `cdk-sign measure`):
-/// `register <n> <hex>` lines; `#` comments.
+/// `register <n> <hex>` lines (and `loader` lines, see
+/// [`parse_expected_loader`]); `#` comments.
 pub fn parse_expected(text: &str) -> Option<[[u8; 32]; REGISTERS]> {
     let mut out = [None; REGISTERS];
     for line in text
@@ -354,7 +380,11 @@ pub fn parse_expected(text: &str) -> Option<[[u8; 32]; REGISTERS]> {
         .filter(|l| !l.is_empty())
     {
         let mut w = line.split_whitespace();
-        let (Some("register"), Some(i), Some(h), None) = (w.next(), w.next(), w.next(), w.next())
+        let first = w.next();
+        if first == Some("loader") {
+            continue;
+        }
+        let (Some("register"), Some(i), Some(h), None) = (first, w.next(), w.next(), w.next())
         else {
             return None;
         };
@@ -524,5 +554,20 @@ mod tests {
             .collect::<String>();
         assert_eq!(parse_expected(&text), Some(r));
         assert_eq!(parse_expected("register 0 00\n"), None);
+        assert_eq!(parse_expected_loader(&text), None, "no loader lines");
+        let with_loader = alloc::format!(
+            "{text}loader 11 {}\nloader 12 {}\n",
+            hex(&[1; 32]),
+            hex(&[2; 32])
+        );
+        assert_eq!(
+            parse_expected(&with_loader),
+            Some(r),
+            "loader lines are ignored here"
+        );
+        assert_eq!(
+            parse_expected_loader(&with_loader),
+            Some([[1; 32], [2; 32]])
+        );
     }
 }

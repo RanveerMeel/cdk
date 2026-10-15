@@ -1,0 +1,6 @@
+# Reproducible builds (tools/release.sh): /Brepro makes LLD derive the PE
+# timestamp and debug GUID from content instead of the clock, and /DEBUG:NONE
+# drops the PDB, whose absolute paths would otherwise feed that hash and make
+# builds in different directories differ.
+[target.x86_64-unknown-uefi]
+rustflags = ["-C", "link-arg=/Brepro", "-C", "link-arg=/DEBUG:NONE"]

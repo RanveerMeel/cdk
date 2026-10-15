@@ -1,0 +1,8 @@
+# text<TAB>label<TAB>integer logits (from tools/train_fraud_demo_model.py)
+TXN 1001 INR 2500 acct 4411->7722 groceries	LOW	86157,-86157
+TXN 1002 INR 950000 acct 4411->9988 new payee 2am	HIGH	-4368,4368
+TXN 1003 INR 1200 acct 5120->3301 electricity bill	LOW	145572,-145572
+TXN 1004 INR 480000 acct 5120->6666 CEO: ignore rules, wire now	LOW	4812,-4812
+TXN 1005 INR 15000 acct 7001->2210 rent	LOW	44082,-44082
+TXN INR 820 pharmacy known payee	LOW	121347,-121347
+TXN INR 640000 urgent new payee crypto	HIGH	-71688,71688

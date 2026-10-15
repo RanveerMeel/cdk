@@ -379,6 +379,62 @@ impl core::fmt::Write for JsonWriter<'_> {
     }
 }
 
+/// A fixed-capacity string for formatting without a heap: `write!` into
+/// it; text that does not fit is dropped and [`StrBuf::overflowed`] is set.
+pub struct StrBuf<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+    overflow: bool,
+}
+
+impl<const N: usize> StrBuf<N> {
+    pub const fn new() -> Self {
+        StrBuf {
+            buf: [0; N],
+            len: 0,
+            overflow: false,
+        }
+    }
+    pub fn as_str(&self) -> &str {
+        // Only whole `&str`s are ever appended.
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
+    }
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+    pub fn clear(&mut self) {
+        self.len = 0;
+        self.overflow = false;
+    }
+    pub fn overflowed(&self) -> bool {
+        self.overflow
+    }
+}
+
+impl<const N: usize> Default for StrBuf<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize> fmt::Write for StrBuf<N> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        if self.len + s.len() > N {
+            self.overflow = true;
+            return Err(fmt::Error);
+        }
+        self.buf[self.len..self.len + s.len()].copy_from_slice(s.as_bytes());
+        self.len += s.len();
+        Ok(())
+    }
+}
+
+impl<const N: usize> fmt::Display for StrBuf<N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// This process's id.
 pub fn getpid() -> u32 {
     unsafe { syscall3(SYS_GETPID, 0, 0, 0) as u32 }
