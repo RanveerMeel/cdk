@@ -7,7 +7,8 @@
 # 2. Unpacks it into two different directories and builds each from scratch,
 #    offline (CARGO_NET_OFFLINE), with the same release key: kernel, agent
 #    programs, evaluation ramdisk (programs + default policy, signed manifest;
-#    no deployment keys), measuring UEFI loader, boot image, and the expected
+#    no deployment keys), measuring UEFI loader (pinned to that kernel's
+#    SHA-256; unsigned — deployments sign it for Secure Boot), boot image, and the expected
 #    boot measurements.
 # 3. Requires every artifact to be byte-identical between the two builds.
 # 4. Writes SHA256SUMS, signs it with the release key (cdk-sign sign-file:
@@ -53,7 +54,10 @@ build_tree() { # $1 = directory to unpack and build in
         HOST="$(rustc -vV | sed -n 's/^host: //p')"
         cargo build --release --locked --quiet --bin cdk
         tools/build_user_programs.sh "$tree/target/initrd.tar" > "$dir/ramdisk.log" 2>&1
-        (cd boot/uefi-loader && cargo build --release --locked --quiet --target x86_64-unknown-uefi \
+        # The release loader boots only the release kernel (Secure Boot
+        # deployments sign it with their own key: tools/secureboot.sh sign).
+        (cd boot/uefi-loader && CDK_KERNEL_SHA256="$(sha256sum < ../../target/x86_64-unknown-none/release/cdk | cut -d' ' -f1)" \
+            cargo build --release --locked --quiet --target x86_64-unknown-uefi \
             -Zbuild-std=core -Zbuild-std-features=compiler-builtins-mem)
         cargo run --quiet --locked --manifest-path tools/create_disk_image/Cargo.toml --release --target "$HOST" -- \
             target/x86_64-unknown-none/release/cdk target/boot.img target/initrd.tar \

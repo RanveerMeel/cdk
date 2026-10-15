@@ -50,7 +50,7 @@ the measurement chain and its limits are in §6), and denial of service by the h
 | Approval spool decision files | `gateway/src/spool.rs` | `spool_decision` |
 | TPM quotes at the gateway (`TPMS_ATTEST`, ECDSA signature, enrollment) | `link/src/tpm.rs`, `gateway/src/attestation.rs` | `boot_attest` (quote decode/re-encode, attest parsing); gateway tests: other TPM, changed firmware, kernel report ≠ TPM, missing or tampered quote; QEMU + swtpm: enroll, same machine, other TPM, no TPM; AK template cross-checked with tpm2-tools |
 | TPM endorsement: EK certificate (X.509/DER), EK chunks, credential challenge and proof | `gateway/src/ekcert.rs`, `gateway/src/credential.rs`, `link/src/tpm.rs`, `src/tpm.rs` (`nv_read`, `activate_credential`) | `ek_certificate` (DER parser, chain walk); `boot_attest` (EK chunk reassembly, challenge/proof re-encode); gateway tests on a real swtpm-issued EK certificate: chain to the root, missing intermediate, other vendor, intermediate alone, forged key; MakeCredential round trip bound to AK name and EK; attestor: EK ≠ certificate key, no EK, wrong proof, enrollment only after proof; QEMU + swtpm: certified TPM proven and enrolled, untrusted manufacturer and uncertified TPM refused |
-| Measuring UEFI loader (kernel and ramdisk files from the boot medium) | `boot/uefi-loader/src/main.rs` (`measure`) | QEMU + OVMF + swtpm: PCRs 11–12 match `cdk-sign measure --loader`; the kernel's PCR 12 cross-check; gateway test: other kernel, BIOS boot (empty PCRs) refused |
+| Measuring UEFI loader (kernel and ramdisk files from the boot medium) | `boot/uefi-loader/src/main.rs` (`measure`, `PINNED_KERNEL`) | QEMU + OVMF + swtpm: PCRs 11–12 match `cdk-sign measure --loader`; the kernel's PCR 12 cross-check; gateway test: other kernel, BIOS boot (empty PCRs) refused; Secure Boot (OVMF SMM): unsigned loader and loader signed by another key refused by the firmware, changed kernel refused by the loader before parsing |
 | Boot manifest, kernel ELF measurement, attestation messages, expected-measurements file | `link/src/attest.rs`, `src/boot.rs` | `boot_attest` (accepted manifest ⇒ canonical; attestations re-encode exactly); QEMU tests: weakened policy, smuggled operator key, manifest re-signed with another key all lock down; unverified kernel refused by the gateway |
 | Syscalls (every argument) | `src/syscall.rs`, `src/agent.rs`, `src/tools.rs`, `src/paging.rs` | `chaos` ring-3 program in QEMU: 20,000 syscalls with kernel, unmapped, read-only and boundary-straddling pointers, huge lengths, unknown numbers and handles |
 | MCP and model server responses | `gateway/src/mcp.rs`, `gateway/src/models.rs` | Gateway tests (status mapping, wrong-key redaction, redirects); not yet fuzzed |
@@ -103,8 +103,10 @@ host test suites also run under AddressSanitizer
 - Under UEFI the kernel and ramdisk are measured by CDK's loader, which
   the firmware measures; under BIOS the kernel only measures itself (the
   gateway refuses BIOS boots when it expects loader measurements). UEFI
-  Secure Boot is not enabled, so a changed loader is detected (PCR 4) but
-  not prevented.
+  Secure Boot is opt-in (`CDK_SECURE_BOOT=1`); without it a changed loader
+  is detected (PCR 4) but not prevented. Secure Boot signatures are RSA
+  (classical, a UEFI constraint); one key serves as PK, KEK and db in the
+  QEMU setup.
 - With `--tpm-ca`, the TPM must prove its attestation key is in a TPM
   certified by a trusted manufacturer CA (EK certificate chain +
   `MakeCredential`/`ActivateCredential`). Only ECC P-256 endorsement keys

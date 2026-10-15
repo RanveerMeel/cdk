@@ -10,7 +10,14 @@
 //! so the chain is firmware -> loader -> kernel, with no stage measuring
 //! itself. Without a TPM the files are not measured and boot continues;
 //! a verifier then sees zero PCRs 11-12 and refuses the machine.
-//! Marked changes: `measure()` and its two call sites.
+//!
+//! Secure Boot: when built with `CDK_KERNEL_SHA256=<hex>` (run_qemu.sh with
+//! CDK_SECURE_BOOT=1, tools/release.sh), the loader boots only the kernel
+//! file with that SHA-256 and refuses any other. Signed for UEFI Secure
+//! Boot (tools/secureboot.sh), it extends the firmware's signature check to
+//! the kernel; the kernel then checks the ramdisk against the release key.
+//!
+//! Marked changes: `measure()` and its two call sites, `PINNED_KERNEL`.
 
 #![no_std]
 #![no_main]
@@ -70,6 +77,14 @@ fn main() -> Status {
     let mut boot_mode = BootMode::Disk;
 
     let mut kernel = load_kernel(boot_mode);
+    if KERNEL_PINNED.load(core::sync::atomic::Ordering::Relaxed) == 2 {
+        // CDK: not the kernel this loader was built (and signed) for.
+        uefi::println!(
+            "CDK: kernel image does NOT match the SHA-256 this loader was built for - refusing to boot it"
+        );
+        boot::stall(core::time::Duration::from_secs(3));
+        return Status::SECURITY_VIOLATION;
+    }
     if kernel.is_none() {
         // Try TFTP boot
         boot_mode = BootMode::Tftp;
@@ -107,6 +122,11 @@ fn main() -> Status {
     match KERNEL_MEASURED.load(core::sync::atomic::Ordering::Relaxed) {
         1 => log::info!("CDK: kernel image measured into PCR {PCR_KERNEL}"),
         _ => log::warn!("CDK: kernel image NOT measured (no TPM?)"),
+    }
+    // CDK: refuse any kernel but the pinned one.
+    match KERNEL_PINNED.load(core::sync::atomic::Ordering::Relaxed) {
+        1 => log::info!("CDK: kernel image matches the pinned SHA-256"),
+        _ => log::info!("CDK: no kernel SHA-256 pinned (development loader)"),
     }
 
     if let Some(framebuffer) = framebuffer {
@@ -202,11 +222,38 @@ fn load_kernel(boot_mode: BootMode) -> Option<Kernel<'static>> {
     // The logger is not up yet; the outcome is logged once it is.
     let ok = measure(PCR_KERNEL, "CDK kernel image", kernel_slice);
     KERNEL_MEASURED.store(if ok { 1 } else { 2 }, core::sync::atomic::Ordering::Relaxed);
+    if let Some(pinned) = PINNED_KERNEL {
+        let matches = pinned_digest(pinned)
+            .is_some_and(|want| <sha2::Sha256 as sha2::Digest>::digest(&*kernel_slice)[..] == want);
+        KERNEL_PINNED.store(if matches { 1 } else { 2 }, core::sync::atomic::Ordering::Relaxed);
+        if !matches {
+            return None; // refused before the file is even parsed
+        }
+    }
     Some(Kernel::parse(kernel_slice))
 }
 
 /// CDK: 0 = not attempted, 1 = measured, 2 = not measured.
 static KERNEL_MEASURED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// CDK: the only kernel file this loader boots (SHA-256, hex), if pinned.
+const PINNED_KERNEL: Option<&str> = option_env!("CDK_KERNEL_SHA256");
+/// CDK: 0 = not pinned, 1 = matches, 2 = differs (boot refused).
+static KERNEL_PINNED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// CDK: parse the pinned digest; a malformed one matches nothing.
+fn pinned_digest(hex: &str) -> Option<[u8; 32]> {
+    let b = hex.trim().as_bytes();
+    if b.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, o) in out.iter_mut().enumerate() {
+        let d = |c: u8| (c as char).to_digit(16);
+        *o = (d(b[2 * i])? * 16 + d(b[2 * i + 1])?) as u8;
+    }
+    Some(out)
+}
 
 /// CDK: PCRs the loader extends (roadmap 4.2).
 const PCR_KERNEL: u32 = 11;
