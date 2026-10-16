@@ -48,3 +48,8 @@ version = "0.38.0"
 
 [dependencies.x86_64]
 version = "0.15.2"
+
+# CDK: SHA-256 of the kernel file, checked against the pinned digest.
+[dependencies.sha2]
+version = "0.10"
+default-features = false

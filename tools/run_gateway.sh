@@ -39,5 +39,13 @@ if [ "$EXPECT_FILE" != "none" ] && [ -f "$EXPECT_FILE" ]; then EXPECT=(--expect 
 # into target/tpm-enrollment. CDK_TPM=0: don't require one.
 if [ "${CDK_TPM:-1}" != "0" ] && command -v swtpm &> /dev/null; then
     EXPECT+=(--tpm "${CDK_TPM_ENROLLMENT:-$ROOT/target/tpm-enrollment}")
+    # Endorsement: the TPM must prove it was certified by its manufacturer
+    # (for the software TPM, the test CA of tools/tpm_manufacture.sh).
+    # CDK_TPM_CA=DIR names other manufacturer CAs; CDK_TPM_CA=none skips it.
+    TPM_CA="${CDK_TPM_CA:-}"
+    if [ -z "$TPM_CA" ] && [ -e "${CDK_TPM_DIR:-$ROOT/target/tpm}/.ek-certified" ]; then
+        TPM_CA="$ROOT/target/tpm-manufacturer/trust"
+    fi
+    if [ -n "$TPM_CA" ] && [ "$TPM_CA" != "none" ]; then EXPECT+=(--tpm-ca "$TPM_CA"); fi
 fi
 exec "$BIN" "${ID[@]}" "${MCP[@]}" "${MODELS[@]}" "${SPOOL[@]}" "${EXPECT[@]}" ${CDK_MCP_ALLOW:+--allow "$CDK_MCP_ALLOW"} "${1:-$ROOT/target/cdk-link.sock}"

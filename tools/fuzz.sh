@@ -11,7 +11,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
-TARGETS=(frame_decoder link_messages sealed_channel handshake hybrid_verify elf initrd policy spool_decision boot_attest)
+TARGETS=(frame_decoder link_messages sealed_channel handshake hybrid_verify elf initrd policy spool_decision boot_attest ek_certificate)
 python3 tools/gen_fuzz_seeds.py >/dev/null
 
 dirs() { # target -> corpus dirs (first one writable)

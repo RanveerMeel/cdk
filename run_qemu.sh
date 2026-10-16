@@ -69,12 +69,29 @@ BOOT_MODE="${CDK_BOOT:-}"
 if [[ -z "$BOOT_MODE" ]]; then
     if [[ -f "$OVMF_CODE" && -f "$OVMF_VARS" ]]; then BOOT_MODE=uefi; else BOOT_MODE=bios; fi
 fi
+# UEFI Secure Boot (CDK_SECURE_BOOT=1): the firmware runs only a loader signed
+# with CDK's Secure Boot key (tools/secureboot.sh), and that loader runs only
+# the kernel whose SHA-256 is built into it. Uses OVMF's SMM build (q35).
+SECURE_BOOT="${CDK_SECURE_BOOT:-0}"
+if [[ "$SECURE_BOOT" == "1" && "$BOOT_MODE" != "uefi" ]]; then
+    echo "Error: CDK_SECURE_BOOT=1 needs UEFI (OVMF)"
+    exit 1
+fi
 UEFI_LOADER=()
 if [[ "$BOOT_MODE" == "uefi" ]]; then
     echo "Building the measuring UEFI loader..."
-    (cd boot/uefi-loader && rustup run nightly cargo build --release --quiet --target x86_64-unknown-uefi \
+    PIN=()
+    if [[ "$SECURE_BOOT" == "1" ]]; then
+        PIN=(env CDK_KERNEL_SHA256="$(sha256sum "$KERNEL_ELF" | cut -d' ' -f1)")
+    fi
+    (cd boot/uefi-loader && "${PIN[@]}" rustup run nightly cargo build --release --quiet --target x86_64-unknown-uefi \
         -Zbuild-std=core -Zbuild-std-features=compiler-builtins-mem)
     UEFI_LOADER=("$CARGO_TARGET_DIR/x86_64-unknown-uefi/release/cdk-uefi-loader.efi")
+    if [[ "$SECURE_BOOT" == "1" ]]; then
+        tools/secureboot.sh init
+        tools/secureboot.sh sign "${UEFI_LOADER[0]}" "$PWD/target/cdk-uefi-loader.signed.efi"
+        UEFI_LOADER=("$PWD/target/cdk-uefi-loader.signed.efi")
+    fi
 fi
 rustup run nightly cargo run --manifest-path tools/create_disk_image/Cargo.toml --release --target "$HOST_TARGET" -- \
     "$KERNEL_ELF" "$DISK_IMG" "$RAMDISK" "${UEFI_LOADER[@]}"
@@ -113,11 +130,19 @@ LINK_ARGS=(-device virtio-serial-pci
     -device virtconsole,chardev=cdklink)
 
 # TPM 2.0 (roadmap 4.2): a software TPM (swtpm) when installed, with state in
-# target/tpm/ so the attestation key persists like a real chip's.
-# CDK_TPM=0 disables it.
+# target/tpm/ so the attestation key persists like a real chip's. A new one is
+# "manufactured" with EK certificates from a test CA (tools/tpm_manufacture.sh,
+# needs swtpm-tools and tpm2-tools) so the gateway can check it is genuine.
+# CDK_TPM_DIR overrides the state directory; CDK_TPM=0 disables the TPM.
 TPM_ARGS=()
 if [[ "${CDK_TPM:-1}" != "0" ]] && command -v swtpm &> /dev/null; then
-    TPM_DIR="$PWD/target/tpm"
+    TPM_DIR="${CDK_TPM_DIR:-$PWD/target/tpm}"
+    if [[ ! -e "$TPM_DIR/tpm2-00.permall" ]] && command -v swtpm_setup &> /dev/null \
+        && command -v tpm2_createek &> /dev/null; then
+        tools/tpm_manufacture.sh "$TPM_DIR" || echo "TPM: manufacturing failed; using an uncertified swtpm"
+    elif [[ ! -e "$TPM_DIR/.ek-certified" ]]; then
+        echo "TPM: this software TPM has no EK certificate (remove $TPM_DIR and the TPM enrollment files to manufacture a certified one)"
+    fi
     mkdir -p "$TPM_DIR"
     rm -f "$TPM_DIR/swtpm-sock"
     swtpm socket --tpm2 --tpmstate dir="$TPM_DIR" --ctrl type=unixio,path="$TPM_DIR/swtpm-sock" \
@@ -129,7 +154,14 @@ if [[ "${CDK_TPM:-1}" != "0" ]] && command -v swtpm &> /dev/null; then
 fi
 
 FIRMWARE_ARGS=()
-if [[ "$BOOT_MODE" == "uefi" ]]; then
+if [[ "$BOOT_MODE" == "uefi" && "$SECURE_BOOT" == "1" ]]; then
+    # Variables with CDK's key enrolled (PK, KEK, db), fresh each run.
+    tools/secureboot.sh vars "$PWD/target/ovmf-vars.fd" > /dev/null
+    FIRMWARE_ARGS=(-machine q35,smm=on -global driver=cfi.pflash01,property=secure,value=on
+        -drive "if=pflash,format=raw,unit=0,readonly=on,file=${CDK_OVMF_SECBOOT_CODE:-/usr/share/OVMF/OVMF_CODE_4M.secboot.fd}"
+        -drive "if=pflash,format=raw,unit=1,file=$PWD/target/ovmf-vars.fd")
+    echo "Boot: UEFI Secure Boot (OVMF, SMM) — signed loader, pinned kernel"
+elif [[ "$BOOT_MODE" == "uefi" ]]; then
     # A fresh copy of the variable store each run keeps firmware PCRs stable.
     cp "$OVMF_VARS" "$PWD/target/ovmf-vars.fd"
     FIRMWARE_ARGS=(-drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE"

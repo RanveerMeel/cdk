@@ -93,6 +93,10 @@ def boot():
     files = sorted([("hello", b"elf"), ("policy.rules", b"approval credential\n")])
     m = "CDK-BOOT-MANIFEST-v1\n" + "".join(f"{hashlib.sha256(d).hexdigest()} {n}\n" for n, d in files)
     write("boot_attest", "manifest", m.encode())
+    ek = ROOT / "gateway/tests/data/ek-p256.der"
+    if ek.exists():
+        write("ek_certificate", "ek-p256", ek.read_bytes())
+        write("ek_certificate", "ca-root", (ROOT / "gateway/tests/data/tpm-ca-root.pem").read_bytes())
     write("boot_attest", "expected", "".join(f"register {i} {'ab' * 32}\n" for i in range(3)).encode())
     k = ROOT / "target/x86_64-unknown-none/release/cdk"
     if k.exists() and k.stat().st_size < 4 << 20:

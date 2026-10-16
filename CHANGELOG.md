@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- TPM endorsement (roadmap 4.2): `cdk-gateway --tpm-ca DIR` requires the
+  TPM's endorsement-key certificate to chain to a manufacturer CA in DIR and
+  proves the attestation key is in that TPM (`TPM2_MakeCredential` /
+  `TPM2_ActivateCredential`) before serving or enrolling; enrollment is no
+  longer trust-on-first-use. `tools/tpm_manufacture.sh` gives swtpm EK
+  certificates from a test manufacturer CA; new fuzz target `ek_certificate`.
+- UEFI Secure Boot (roadmap 4.2, now complete): `CDK_SECURE_BOOT=1
+  ./run_qemu.sh` enrolls CDK's own key in OVMF (SMM build) and boots a
+  signed loader that runs only the kernel whose SHA-256 is built into it
+  (`tools/secureboot.sh`). Release loaders are pinned to the release kernel.
+- The UEFI loader changed, so PCR 4 changes: machines enrolled under UEFI
+  (`target/tpm-enrollment*`) must be re-enrolled once — delete the
+  enrollment file and the next attestation enrolls again.
+
 ## v0.1.0 — preview (2026-10)
 
 First public preview. See [docs/releases/v0.1.0.md](docs/releases/v0.1.0.md)

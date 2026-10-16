@@ -274,6 +274,50 @@ pub fn tpm_quote(nonce: &[u8; 32]) -> Option<alloc::vec::Vec<u8>> {
     })
 }
 
+/// The TPM's endorsement key and the messages carrying it with the
+/// manufacturer's EK certificate, for a gateway that asked for proof
+/// (`--tpm-ca`). The caller flushes the EK when the exchange is over.
+pub fn tpm_endorsement() -> Option<(crate::tpm::Ek, alloc::vec::Vec<alloc::vec::Vec<u8>>)> {
+    STATE.lock().ak?;
+    let cert = match crate::tpm::nv_read(
+        cdk_link::tpm::EK_CERT_NV_INDEX,
+        cdk_link::tpm::MAX_EK_BLOB - 64,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            crate::println!("TPM: no EK certificate in NV (index 0x01c0000a): {:x?}", e);
+            return None;
+        }
+    };
+    let ek = match crate::tpm::create_ek() {
+        Ok(ek) => ek,
+        Err(e) => {
+            crate::println!("TPM: endorsement key not created: {:x?}", e);
+            return None;
+        }
+    };
+    match cdk_link::tpm::encode_ek_chunks(&ek.x, &ek.y, &cert) {
+        Some(msgs) => Some((ek, msgs)),
+        None => {
+            let _ = crate::tpm::flush(ek.handle);
+            None
+        }
+    }
+}
+
+/// Answer the gateway's credential challenge with `TPM2_ActivateCredential`.
+pub fn tpm_activate(ek: &crate::tpm::Ek, challenge: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+    let ak = STATE.lock().ak?;
+    let (id_object, secret) = cdk_link::tpm::decode_challenge(challenge)?;
+    match crate::tpm::activate_credential(&ak, ek, id_object, secret) {
+        Ok(recovered) => cdk_link::tpm::encode_proof(&recovered),
+        Err(e) => {
+            crate::println!("TPM: credential activation failed: {:x?}", e);
+            None
+        }
+    }
+}
+
 /// The attestation answer to a gateway's `nonce`.
 pub fn attestation(nonce: &[u8; 32]) -> alloc::vec::Vec<u8> {
     let st = STATE.lock();

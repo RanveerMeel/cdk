@@ -13,6 +13,9 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 cdk = { path = ".." }
 cdk-link = { path = "../link" }
+# gateway/src/ekcert.rs (ek_certificate target)
+base64 = "0.22"
+ring = "0.17"
 
 # Not part of the parent's build.
 [workspace]
@@ -87,6 +90,13 @@ bench = false
 [[bin]]
 name = "boot_attest"
 path = "fuzz_targets/boot_attest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ek_certificate"
+path = "fuzz_targets/ek_certificate.rs"
 test = false
 doc = false
 bench = false
