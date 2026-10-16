@@ -171,13 +171,16 @@ fn answer_attestation(gateway: &[u8; 16], timeout_ms: u64) {
     };
     // Endorsement (gateway --tpm-ca): the EK and its certificate go first,
     // so the gateway can challenge the AK as soon as the quote arrives.
-    let endorsement = if flags & cdk_link::tpm::PROVE_ENDORSEMENT != 0 {
-        crate::boot::tpm_endorsement()
-            .filter(|(_, msgs)| msgs.iter().all(|m| send_data(m).is_ok()))
-            .map(|(ek, _)| ek)
-    } else {
-        None
-    };
+    let mut endorsement = None;
+    if flags & cdk_link::tpm::PROVE_ENDORSEMENT != 0 {
+        if let Some((ek, msgs)) = crate::boot::tpm_endorsement() {
+            if msgs.iter().all(|m| send_data(m).is_ok()) {
+                endorsement = Some(ek);
+            } else {
+                let _ = crate::tpm::flush(ek.handle); // never leak a TPM object slot
+            }
+        }
+    }
     let quoted = match crate::boot::tpm_quote(&nonce) {
         Some(q) => send_data(&q).is_ok(),
         None => false,

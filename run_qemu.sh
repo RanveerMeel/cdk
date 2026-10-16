@@ -77,6 +77,9 @@ if [[ "$SECURE_BOOT" == "1" && "$BOOT_MODE" != "uefi" ]]; then
     echo "Error: CDK_SECURE_BOOT=1 needs UEFI (OVMF)"
     exit 1
 fi
+if [[ "$SECURE_BOOT" == "1" && "${CDK_RELEASE_PUB:-}" == "/dev/null" ]]; then
+    echo "Warning: Secure Boot with an unverified kernel (CDK_RELEASE_PUB=/dev/null): the chain ends at the kernel; the ramdisk is not checked"
+fi
 UEFI_LOADER=()
 if [[ "$BOOT_MODE" == "uefi" ]]; then
     echo "Building the measuring UEFI loader..."

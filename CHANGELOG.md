@@ -12,6 +12,10 @@
   ./run_qemu.sh` enrolls CDK's own key in OVMF (SMM build) and boots a
   signed loader that runs only the kernel whose SHA-256 is built into it
   (`tools/secureboot.sh`). Release loaders are pinned to the release kernel.
+- Security review fixes (2026-10-16): one endorsement proof per challenge,
+  compared in constant time, and attestation decisions are final per
+  session; EK certificates must carry the TCG EK usage and not be CAs; the
+  TPM EK object is always flushed. See SECURITY-REVIEW.md §4.
 - The UEFI loader changed, so PCR 4 changes: machines enrolled under UEFI
   (`target/tpm-enrollment*`) must be re-enrolled once — delete the
   enrollment file and the next attestation enrolls again.
