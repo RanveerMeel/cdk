@@ -209,6 +209,8 @@ pub fn run_static(
             &mut frame_alloc.lock(),
             &mut page_table.lock(),
         );
+        // Every lock above is released at the end of that statement.
+        run_deferred();
     }
 }
 
@@ -3024,10 +3026,62 @@ fn cmd_handles(pid_str: &str) {
     }
 }
 
-fn run_process(pid: u32, kernel: &mut Kernel) {
-    match crate::agent::with_kernel(kernel, || crate::process::enter(pid)) {
-        Ok(status) => print_exit_status(pid, status),
-        Err(e) => crate::println!("elf-run failed: {:?}", e),
+/// A run requested by the current command, started once the console has
+/// released the kernel and its other locks (roadmap 2.7): agents' syscalls,
+/// on any CPU, lock the kernel themselves.
+static DEFERRED_RUN: Mutex<Option<crate::process::Select>> = Mutex::new(None);
+
+fn run_process(pid: u32, _kernel: &mut Kernel) {
+    *DEFERRED_RUN.lock() = Some(crate::process::Select::One(pid));
+}
+
+/// Start the run the last command asked for, if any (no locks held).
+fn run_deferred() {
+    let Some(which) = DEFERRED_RUN.lock().take() else {
+        return;
+    };
+    let started = uptime_ms();
+    match crate::process::run_scheduled(which) {
+        Ok(results) if results.is_empty() => crate::println!("run-all: no Ready processes"),
+        Ok(results) => {
+            for (pid, status) in results {
+                print_exit_status(pid, status);
+                if let Some(cpus) = crate::process::cpus_used(pid) {
+                    crate::println!("       pid={} ran on CPU(s) {}", pid, CpuList(cpus));
+                }
+            }
+            if matches!(which, crate::process::Select::AllReady) {
+                crate::println!(
+                    "run-all: about {} ms wall clock, agents on {} CPU(s)",
+                    uptime_ms().wrapping_sub(started),
+                    crate::process::agent_cpu_count()
+                );
+            }
+        }
+        Err(e) => crate::println!("run failed: {:?}", e),
+    }
+}
+
+fn uptime_ms() -> u64 {
+    #[cfg(target_os = "none")]
+    return crate::interrupts::uptime_ms();
+    #[cfg(not(target_os = "none"))]
+    0
+}
+
+/// Topology slots of a CPU bitmask, for printing.
+struct CpuList(u64);
+
+impl core::fmt::Display for CpuList {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut first = true;
+        for i in 0..64 {
+            if self.0 & (1 << i) != 0 {
+                write!(f, "{}{}", if first { "" } else { "," }, i)?;
+                first = false;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -3049,20 +3103,10 @@ fn print_exit_status(pid: u32, status: crate::process::ExitStatus) {
     }
 }
 
-/// Run every `Ready` process concurrently under the preemptive scheduler.
-fn cmd_run_all(kernel: &mut Kernel) {
-    let result = crate::agent::with_kernel(kernel, || {
-        crate::process::run_scheduled(crate::process::Select::AllReady)
-    });
-    match result {
-        Ok(results) if results.is_empty() => crate::println!("run-all: no Ready processes"),
-        Ok(results) => {
-            for (pid, status) in results {
-                print_exit_status(pid, status);
-            }
-        }
-        Err(e) => crate::println!("run-all failed: {:?}", e),
-    }
+/// Run every `Ready` process concurrently: on every agent CPU, each
+/// preemptively scheduled (roadmap 2.3, 2.7).
+fn cmd_run_all(_kernel: &mut Kernel) {
+    *DEFERRED_RUN.lock() = Some(crate::process::Select::AllReady);
 }
 
 fn cmd_budget(n: &str) {

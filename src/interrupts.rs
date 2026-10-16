@@ -65,6 +65,16 @@ pub fn ticks() -> u64 {
     TICKS.load(AtomicOrdering::Relaxed)
 }
 
+/// Local APIC timer interrupts on the bootstrap CPU (~20 Hz once
+/// calibrated; see [`crate::local_apic::TARGET_RUNTIME_TIMER_HZ`]).
+static BSP_LAPIC_TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// Approximate milliseconds since the bootstrap CPU's LAPIC timer started.
+pub fn uptime_ms() -> u64 {
+    BSP_LAPIC_TICKS.load(AtomicOrdering::Relaxed) * 1000
+        / crate::local_apic::TARGET_RUNTIME_TIMER_HZ as u64
+}
+
 // ---------------------------------------------------------------------------
 // Preemption hook
 // ---------------------------------------------------------------------------
@@ -469,6 +479,9 @@ extern "C" fn timer_dispatch(frame: &mut crate::process::TrapFrame, vector: u32)
         // runtime service to the currently interrupted CPU.
         let apic_id = current_local_apic_id();
         unsafe { local_apic_eoi() };
+        if crate::percpu::slot_for_apic(apic_id) == Some(0) {
+            BSP_LAPIC_TICKS.fetch_add(1, AtomicOrdering::Relaxed);
+        }
         call_local_apic_tick_hook(apic_id);
     }
     if frame.from_user() {

@@ -580,35 +580,14 @@ pub fn read_decision() -> bool {
 // Syscalls
 // ---------------------------------------------------------------------------
 
-/// Kernel state the syscalls act on, lent by the caller of [`with_kernel`].
-static KERNEL_CTX: core::sync::atomic::AtomicPtr<Kernel> =
-    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
-
-/// Run `f` (which enters ring 3) with `kernel` lent to the syscall layer.
-///
-/// The caller already holds exclusive access to `kernel` (e.g. the console,
-/// holding the kernel lock). A ring-3 program runs synchronously on the same
-/// CPU until it exits, so its syscalls are the only code that can touch
-/// `kernel` meanwhile. This must be revisited when user processes are
-/// scheduled preemptively (roadmap 2.3).
-pub fn with_kernel<R>(kernel: &mut Kernel, f: impl FnOnce() -> R) -> R {
-    use core::sync::atomic::Ordering;
-    KERNEL_CTX.store(kernel as *mut Kernel, Ordering::Release);
-    let r = f();
-    KERNEL_CTX.store(core::ptr::null_mut(), Ordering::Release);
-    r
+/// The kernel, locked for one operation (roadmap 2.7). Syscalls on any CPU
+/// take it briefly; the console releases it while agents run.
+pub fn kernel_ref() -> Option<spin::MutexGuard<'static, Kernel>> {
+    crate::kernel::lock_global()
 }
 
-/// The kernel lent by [`with_kernel`], for other syscall modules.
-pub fn kernel_ref() -> Option<&'static mut Kernel> {
-    kernel()
-}
-
-fn kernel() -> Option<&'static mut Kernel> {
-    let p = KERNEL_CTX.load(core::sync::atomic::Ordering::Acquire);
-    // SAFETY: see `with_kernel`; non-null only while the lender is blocked
-    // in ring-3 execution on this CPU.
-    unsafe { p.as_mut() }
+fn kernel() -> Option<spin::MutexGuard<'static, Kernel>> {
+    crate::kernel::lock_global()
 }
 
 /// Dispatch an agent syscall for the current process.
@@ -789,8 +768,10 @@ fn open_signed(req: &mut Pending) {
     let (quorum, ttl) = {
         let policy = crate::policy::policy();
         let kind: heapless::String<32> = kernel_ref()
-            .and_then(|k| k.for_each_object_find(req.object()))
-            .and_then(|o| heapless::String::try_from(o.kind.as_str()).ok())
+            .and_then(|k| {
+                k.for_each_object_find(req.object())
+                    .and_then(|o| heapless::String::try_from(o.kind.as_str()).ok())
+            })
             .unwrap_or_default();
         let labels = policy.labels_of(req.object(), &kind, crate::tools::pinned_flags(&kind));
         (policy.quorum_for(&labels), policy.approval_timeout_s)
@@ -851,7 +832,7 @@ fn prepare_send(
 
 /// Deliver the message through the kernel (re-verifies and permission-checks).
 fn perform_send(pid: u32, handle: u64, cap: &Capability, buf: &[u8]) -> Result<u64, u64> {
-    let kernel = kernel().ok_or(errno::EINVAL)?;
+    let mut kernel = kernel().ok_or(errno::EINVAL)?;
     let mut from: heapless::String<16> = heapless::String::new();
     let _ = core::fmt::write(&mut from, format_args!("pid-{}", pid));
     let payload = MessagePayload::Data(heapless::Vec::from_slice(buf).map_err(|_| errno::EINVAL)?);
@@ -866,8 +847,8 @@ fn sys_recv(pid: u32, handle: u64, ptr: u64, len: u64) -> Result<u64, u64> {
     let cap = with_table(pid, |t| t.get(handle).cloned())
         .map_err(handle_errno)?
         .map_err(handle_errno)?;
-    let kernel = kernel().ok_or(errno::EINVAL)?;
-    let msg = kernel
+    let msg = kernel()
+        .ok_or(errno::EINVAL)?
         .receive_message(&cap)
         .map_err(|e| map_kernel_error(pid, handle, "recv", e))?
         .ok_or(errno::EEMPTY)?;

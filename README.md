@@ -152,7 +152,7 @@ sudo apt install qemu-system-x86
 ./run_qemu.sh
 ```
 
-This builds the kernel, creates a disk image that boots under both BIOS and UEFI (UEFI via OVMF when it is installed; `CDK_BOOT=bios` forces BIOS), and launches QEMU with **2 vCPUs** (`-smp 2`) and the serial console connected to your terminal. Override with `CDK_QEMU_SMP=4 ./run_qemu.sh`. Type `help` at the `cdk>` prompt.
+This builds the kernel, creates a disk image that boots under both BIOS and UEFI (UEFI via OVMF when it is installed; `CDK_BOOT=bios` forces BIOS), and launches QEMU with **4 vCPUs** (`-smp 4`: the console's CPU supervises, the other three run agents in parallel) and the serial console connected to your terminal. Override with `CDK_QEMU_SMP=1 ./run_qemu.sh` to run everything on one CPU. Type `help` at the `cdk>` prompt.
 
 For a graphical QEMU window instead:
 
@@ -345,7 +345,8 @@ The full plan — phases, milestones, and editions — is in [ROADMAP.md](ROADMA
 - [x] Key hygiene: zeroized keys and seeds, scrubbed crypto stack, zero-on-free heap, RFC 8032 / IETF ML-DSA known-answer tests, verified-proof cache — roadmap milestone 1.4
 - [x] Rust user programs loaded from a boot ramdisk, with SHA-256 provenance in the audit log — roadmap milestone 2.1
 - [x] Per-agent capability handles: grant, list, derive (attenuate only), drop, send/recv — every use verified and audited — roadmap milestone 2.2
-- [x] Preemptive round-robin scheduling of agents on one CPU, with a CPU-budget watchdog — roadmap milestone 2.3
+- [x] Preemptive round-robin scheduling of agents, with a CPU-budget watchdog — roadmap milestone 2.3
+- [x] Agents on every CPU: per-CPU scheduling with work stealing, kernel locking for syscalls, the console's CPU supervising approvals and tool results — roadmap milestone 2.7
 - [x] Native integer-only inference for agents (`cdk-ml`, `CDKLM1` models) with a public demo classifier — roadmap milestone 2.4
 - [x] Human-approval gates: approval-constrained capabilities block the agent until a person approves the exact payload — roadmap milestone 2.5
 - [x] Host link: virtio-console transport, shared framing crate, and a host gateway — roadmap milestone 3.1

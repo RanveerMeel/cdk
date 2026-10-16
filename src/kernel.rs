@@ -78,6 +78,21 @@ pub struct BridgeTickResult {
     pub egress_errors: u64,
 }
 
+/// The kernel instance syscalls act on, installed once by `main` (roadmap
+/// 2.7). Agents on any CPU lock it for the duration of one operation; the
+/// console never holds it while agents run.
+static GLOBAL: spin::Once<&'static spin::Mutex<Kernel>> = spin::Once::new();
+
+/// Install the global kernel (once, at boot).
+pub fn install_global(kernel: &'static spin::Mutex<Kernel>) {
+    GLOBAL.call_once(|| kernel);
+}
+
+/// Lock the global kernel; `None` before [`install_global`].
+pub fn lock_global() -> Option<spin::MutexGuard<'static, Kernel>> {
+    GLOBAL.get().map(|k| k.lock())
+}
+
 pub struct Kernel {
     objects: FnvIndexMap<String<MAX_ID_LEN>, KernelObject, MAX_OBJECTS>,
     /// Fine-grained internal locks (ready queue + per-core running slots).

@@ -32,6 +32,43 @@ static mut AP_DOUBLE_FAULT_STACKS: [[u8; DOUBLE_FAULT_STACK_SIZE]; MAX_AP_TSS] =
 static mut AP_KERNEL_STACKS: [[u8; KERNEL_STACK_SIZE]; MAX_AP_TSS] =
     [[0u8; KERNEL_STACK_SIZE]; MAX_AP_TSS];
 
+/// Stack each AP runs its kernel code on (idle loop, agent scheduler). The
+/// startup trampoline's stack is one shared 2 KiB page, so an AP leaves it
+/// first thing ([`run_on_ap_stack`]) — before it signals ready and the next
+/// AP is started on the same trampoline (roadmap 2.7).
+pub const AP_MAIN_STACK_SIZE: usize = 64 * 1024;
+
+#[repr(C, align(16))]
+struct ApMainStack([u8; AP_MAIN_STACK_SIZE]);
+static mut AP_MAIN_STACKS: [ApMainStack; MAX_AP_TSS] =
+    [const { ApMainStack([0u8; AP_MAIN_STACK_SIZE]) }; MAX_AP_TSS];
+
+/// Switch this AP to its private main stack and call `f(apic_id, seq)`
+/// there. Falls back to calling `f` on the current stack if the AP has no
+/// slot.
+pub fn run_on_ap_stack(apic_id: u32, seq: u32, f: extern "C" fn(u32, u32) -> !) -> ! {
+    #[cfg(target_os = "none")]
+    if let Some(idx) = ap_tss_slot(apic_id) {
+        // SAFETY: each AP owns one slot of AP_MAIN_STACKS; nothing returns
+        // to the old stack.
+        let top = unsafe { (&raw const AP_MAIN_STACKS[idx]) as usize + AP_MAIN_STACK_SIZE };
+        unsafe {
+            core::arch::asm!(
+                "mov rsp, {top}",
+                "xor ebp, ebp",
+                "call {f}",
+                "ud2",
+                top = in(reg) top,
+                f = in(reg) f,
+                in("edi") apic_id,
+                in("esi") seq,
+                options(noreturn)
+            );
+        }
+    }
+    f(apic_id, seq)
+}
+
 static TSS: Once<TaskStateSegment> = Once::new();
 static GDT: Once<(GlobalDescriptorTable, Selectors)> = Once::new();
 

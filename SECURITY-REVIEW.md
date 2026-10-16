@@ -81,9 +81,12 @@ host test suites also run under AddressSanitizer
    `unsafe` block in `src/syscall.rs`, `src/process.rs`, `src/elf.rs`. These
    run only on bare metal, so the host fuzzers and sanitizers do not cover
    them; `chaos` exercises them in QEMU.
-2. **Kernel locking** while agents run: the console lends its kernel
-   reference to syscalls (`agent::with_kernel`); sound only because agents run
-   on one CPU (roadmap 2.7 replaces it).
+2. **Kernel locking with agents on every CPU** (roadmap 2.7): syscalls lock
+   the kernel per operation (`kernel::lock_global`), the per-CPU process
+   table (`src/process.rs`), AP stacks and bring-up (`gdt::run_on_ap_stack`),
+   and the per-CPU print lock. Tested with concurrent `chaos` runs in QEMU;
+   a review for lock ordering, interrupt masking and TLB handling across
+   CPUs is wanted.
 3. **Approval and policy flows** (`src/approvals.rs`, `src/policy.rs`,
    `src/tools.rs`): the statement binding, quorum counting, veto, timeouts,
    and the pinned gateway listing.

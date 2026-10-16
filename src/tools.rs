@@ -407,24 +407,27 @@ fn prepare(
     }
 
     let cap = crate::agent::handle_cap(pid, handle).map_err(|_| errno::EBADH)?;
-    let kernel = crate::agent::kernel_ref().ok_or(errno::EINVAL)?;
     if Kernel::verify_capability(&cap) != Ok(true) {
         return Err(errno::ESIG);
     }
-    let tool_name = kernel
-        .for_each_object_find(&cap.object_id)
-        .and_then(|o| {
-            wire_name(&o.kind).map(|n| {
-                let mut s: String<{ tool::MAX_NAME }> = String::new();
-                let _ = s.push_str(n);
-                s
+    // The kernel lock is held only for the object lookup.
+    let (tool_name, kind) = {
+        let kernel = crate::agent::kernel_ref().ok_or(errno::EINVAL)?;
+        let object = kernel.for_each_object_find(&cap.object_id);
+        let tool_name = object
+            .and_then(|o| {
+                wire_name(&o.kind).map(|n| {
+                    let mut s: String<{ tool::MAX_NAME }> = String::new();
+                    let _ = s.push_str(n);
+                    s
+                })
             })
-        })
-        .ok_or(errno::EINVAL)?;
-    let kind: String<32> = kernel
-        .for_each_object_find(&cap.object_id)
-        .and_then(|o| String::try_from(o.kind.as_str()).ok())
-        .unwrap_or_default();
+            .ok_or(errno::EINVAL)?;
+        let kind: String<32> = object
+            .and_then(|o| String::try_from(o.kind.as_str()).ok())
+            .unwrap_or_default();
+        (tool_name, kind)
+    };
     if !cap.has_permission(&Permission::Execute) {
         crate::agent::audit_denied(pid, handle, "tool");
         return Err(errno::EPERM);

@@ -174,6 +174,43 @@ macro_rules! println {
     };
 }
 
+/// Console output lock, re-entrant per CPU: a CPU that is already printing
+/// (and then faults, panics, or takes an interrupt that prints) goes ahead
+/// instead of deadlocking on itself.
+#[cfg(not(test))]
+struct PrintLock(bool);
+
+#[cfg(not(test))]
+static PRINT_OWNER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+#[cfg(not(test))]
+impl PrintLock {
+    fn acquire() -> Self {
+        use core::sync::atomic::Ordering;
+        // Initial APIC id from CPUID: valid from the first instruction on.
+        let me = (core::arch::x86_64::__cpuid(1).ebx >> 24) + 1;
+        if PRINT_OWNER.load(Ordering::Acquire) == me {
+            return PrintLock(false); // nested on this CPU
+        }
+        while PRINT_OWNER
+            .compare_exchange_weak(0, me, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        PrintLock(true)
+    }
+}
+
+#[cfg(not(test))]
+impl Drop for PrintLock {
+    fn drop(&mut self) {
+        if self.0 {
+            PRINT_OWNER.store(0, core::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     #[cfg(test)]
@@ -185,6 +222,9 @@ pub fn _print(args: fmt::Arguments) {
     #[cfg(not(test))]
     {
         use core::fmt::Write;
+        // One CPU prints at a time, so lines from agents on different CPUs
+        // do not interleave (roadmap 2.7).
+        let _line = PrintLock::acquire();
         // Always write to COM1 (serial) so output is visible even when
         // the framebuffer is not yet initialised.
         let mut serial = crate::serial::SerialPort;

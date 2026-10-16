@@ -21,6 +21,17 @@ pub const SYSCALL_ERR: u64 = u64::MAX;
 
 /// Install EFER.SCE + STAR/LSTAR/FMASK for 64-bit SYSCALL.
 pub fn init() {
+    init_cpu();
+    #[cfg(target_os = "none")]
+    crate::println!(
+        "Syscall: SCE enabled LSTAR={:#x}",
+        syscall_entry_shim as *const () as usize
+    );
+}
+
+/// Program this CPU's SYSCALL MSRs (they are per CPU: every AP that runs
+/// agents needs them, roadmap 2.7). All GDTs share one selector layout.
+pub fn init_cpu() {
     #[cfg(target_os = "none")]
     {
         let Some((kcode, ucode, _udata)) = crate::gdt::star_selectors() else {
@@ -38,10 +49,6 @@ pub fn init() {
         cpu::wrmsr(IA32_FMASK, 0x200 | 0x400);
         let efer = cpu::rdmsr(IA32_EFER) | EFER_SCE;
         cpu::wrmsr(IA32_EFER, efer);
-        crate::println!(
-            "Syscall: SCE enabled LSTAR={:#x}",
-            syscall_entry_shim as *const () as usize
-        );
     }
 }
 

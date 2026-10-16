@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Agents on every CPU (roadmap 2.7): every AP starts at boot on its own
+  stack and runs agents; per-CPU scheduling with work stealing; syscalls
+  lock the kernel themselves; `run-all` shows each agent's CPUs and the wall
+  clock. `run_qemu.sh` now starts 4 vCPUs (`CDK_QEMU_SMP`). The CPU count is
+  part of the measured firmware configuration, so re-enroll TPM machines.
 - TPM endorsement (roadmap 4.2): `cdk-gateway --tpm-ca DIR` requires the
   TPM's endorsement-key certificate to chain to a manufacturer CA in DIR and
   proves the attestation key is in that TPM (`TPM2_MakeCredential` /
