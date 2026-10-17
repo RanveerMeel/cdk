@@ -126,6 +126,7 @@ fn ap_trampoline_entry_stub(apic_id: u32, startup_seq: u32) {
         }
         cdk::interrupts::load_idt();
         cdk::syscall::init_cpu();
+        cdk::fpu::init_cpu(false);
     }
 
     // M1: signal online via atomics — never requires KERNEL.lock.
@@ -580,6 +581,22 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     cdk::percpu::init_topology(topology);
     cdk::percpu::load_gs_for_slot(0);
     cdk::syscall::init();
+    // Agents' FPU/SSE/AVX state (roadmap 2.6); the kernel itself never uses it.
+    cdk::fpu::init_cpu(true);
+    {
+        let (xsave, xcr0, bytes) = cdk::fpu::summary();
+        if cdk::fpu::enabled() {
+            cdk::println!(
+                "FPU: per-agent x87/SSE{} state via {} ({} bytes, XCR0={:#x})",
+                if xcr0 & 0b100 != 0 { "/AVX" } else { "" },
+                if xsave { "XSAVE" } else { "FXSAVE" },
+                bytes,
+                xcr0
+            );
+        } else {
+            cdk::println!("FPU: not available — agents must be soft-float");
+        }
+    }
 
     // M13: IOAPIC route ISA IRQs; mask 8259 when successful.
     {

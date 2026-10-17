@@ -14,9 +14,11 @@ STAGE="$ROOT/target/initrd"
 # run_qemu.sh exports CARGO_TARGET_DIR for the kernel, and inheriting it would
 # build the programs elsewhere and pack stale binaries from user/target.
 USER_TARGET="$ROOT/user/target"
-(cd "$ROOT/user" && CARGO_TARGET_DIR="$USER_TARGET" cargo build --release --bins --quiet)
+# The agents' target (user/x86_64-cdk-user.json) has no prebuilt `core`.
+(cd "$ROOT/user" && CARGO_TARGET_DIR="$USER_TARGET" cargo build --release --bins --quiet \
+    -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem)
 
-BIN_DIR="$USER_TARGET/x86_64-unknown-none/release"
+BIN_DIR="$USER_TARGET/x86_64-cdk-user/release"
 rm -rf "$STAGE"
 mkdir -p "$STAGE" "$(dirname "$OUT")"
 for src in "$ROOT"/user/src/bin/*.rs; do

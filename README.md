@@ -55,7 +55,7 @@ CDK is **open core**. This repository — the kernel, the capability model, the 
 
 **Private programs** — Proprietary agents or models never go into this repository. Build them elsewhere and pack them into a local image with `CDK_PRIVATE_PROGRAMS_DIR=/path/outside/repo ./run_qemu.sh`; the build refuses a directory inside the repo and name clashes with public programs.
 
-**Preemptive Agent Scheduling** — Agents that never yield still share the CPU: the timer entry stubs save every register, and after each 100 ms slice the kernel switches to the next runnable agent (round-robin). A per-agent CPU budget watchdog kills runaway agents (`proc-killed` in the audit log). Try `spawn spin`, `spawn spin`, `spawn hog`, `run-all`.
+**Preemptive Agent Scheduling** — Agents that never yield still share the CPU: the timer entry stubs save every register, and after each 100 ms slice the kernel switches to the next runnable agent (round-robin). A per-agent CPU budget watchdog kills runaway agents (`proc-killed` in the audit log). Try `spawn spin`, `spawn spin`, `spawn hog`, `run-all`. Agents run in parallel on every CPU (roadmap 2.7) and use hardware floating point and SSE/AVX with their own register state (roadmap 2.6); `spawn fpu` ×4 then `run-all` checks that no agent sees another's registers.
 
 **Tamper-Evident Audit Log** — Capability issuance, every capability check (accepted or rejected, with reason), and process spawn/start/exit/reap are appended to a SHA-256 hash chain bound to the kernel issuer. Every 64 records the issuer signs the chain head (Ed25519 + ML-DSA-65). Editing, deleting, reordering, or truncating records is detected, and rewriting the whole chain cannot reproduce the signed checkpoints. Console: `audit`, `audit-verify`, `audit-checkpoint`.
 
