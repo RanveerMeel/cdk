@@ -118,8 +118,9 @@ else
     DISPLAY_ARGS=(-display none)
 fi
 
-# -smp 2: exercise AP trampoline / LAPIC path (roadmap reset M1).
-SMP_ARGS=(-smp "${CDK_QEMU_SMP:-2}")
+# 4 CPUs: the console's CPU supervises, the three APs run agents in
+# parallel (roadmap 2.7). CDK_QEMU_SMP=1 runs everything on one CPU.
+SMP_ARGS=(-smp "${CDK_QEMU_SMP:-4}")
 
 # Virtio-gpu on the PCI bus (soft backend always works without it).
 GPU_ARGS=(-device virtio-gpu-pci)

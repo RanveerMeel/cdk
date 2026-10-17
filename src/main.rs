@@ -101,14 +101,18 @@ fn on_tlb_shootdown_ipi(apic_id: u32) {
 }
 
 fn ap_trampoline_entry_stub(apic_id: u32, startup_seq: u32) {
+    let mut private_tss = false;
     #[cfg(target_os = "none")]
     {
         match cdk::gdt::init_for_ap(apic_id) {
-            Ok(()) => cdk::println!(
-                "SMP: AP private TSS/IST ready (apic_id={}, slot={:?})",
-                apic_id,
-                cdk::gdt::ap_tss_slot(apic_id)
-            ),
+            Ok(()) => {
+                private_tss = true;
+                cdk::println!(
+                    "SMP: AP private TSS/IST ready (apic_id={}, slot={:?})",
+                    apic_id,
+                    cdk::gdt::ap_tss_slot(apic_id)
+                )
+            }
             Err(e) => {
                 cdk::println!(
                     "SMP: WARNING — AP TSS init failed ({:?}); falling back to shared GDT",
@@ -121,6 +125,7 @@ fn ap_trampoline_entry_stub(apic_id: u32, startup_seq: u32) {
             cdk::percpu::load_gs_for_slot(slot);
         }
         cdk::interrupts::load_idt();
+        cdk::syscall::init_cpu();
     }
 
     // M1: signal online via atomics — never requires KERNEL.lock.
@@ -169,11 +174,22 @@ fn ap_trampoline_entry_stub(apic_id: u32, startup_seq: u32) {
         );
     }
     register_ap_runtime_core(apic_id);
+    // Roadmap 2.7: with its own TSS (ring-3 trap stack), stack, IDT and
+    // SYSCALL MSRs, this AP runs agents.
+    if let (true, Some(slot)) = (private_tss, cdk::percpu::slot_for_apic(apic_id)) {
+        cdk::process::enable_agent_cpu(slot);
+        cdk::println!("SMP: AP runs agents (apic_id={}, cpu {})", apic_id, slot);
+    }
 }
 
 /// 64-bit C ABI entry reached from the AP long-mode trampoline stub.
 #[no_mangle]
 pub extern "C" fn ap_kernel_entry(apic_id: u32, startup_seq: u32) -> ! {
+    // Off the shared trampoline stack before anything else (roadmap 2.7).
+    cdk::gdt::run_on_ap_stack(apic_id, startup_seq, ap_main)
+}
+
+extern "C" fn ap_main(apic_id: u32, startup_seq: u32) -> ! {
     ap_trampoline_entry_stub(apic_id, startup_seq);
     ap_idle_loop(apic_id)
 }
@@ -184,6 +200,8 @@ fn ap_idle_loop(apic_id: u32) -> ! {
         // Drain work that the IPI handler may have skipped (kernel lock busy).
         on_reschedule_ipi(apic_id);
         on_tlb_shootdown_ipi(apic_id);
+        // Agents queued for (or stealable by) this CPU (roadmap 2.7).
+        cdk::process::run_on_this_cpu();
 
         cdk::multicore::idle_enter(apic_id);
         unsafe {
@@ -242,8 +260,82 @@ fn service_ap_runtime_cores(kernel: &mut Kernel, tick: u64) {
     }
 }
 
+/// Plan (under the Kernel lock), INIT/SIPI, and wait for one AP's ready
+/// mailbox. Returns whether it came online.
+fn start_ap(apic: u32) -> bool {
+    let plan = {
+        let mut kernel = KERNEL.lock();
+        cdk::println!("SMP: planning AP startup for apic_id={} ...", apic);
+        match kernel.plan_ap_startup(apic) {
+            Ok(plan) => {
+                cdk::println!(
+                    "SMP: trampoline installed @ {:#x} vector={:#x} seq={}",
+                    plan.trampoline_phys,
+                    plan.sipi_vector,
+                    plan.startup_seq
+                );
+                plan
+            }
+            Err(e) => {
+                cdk::println!("SMP: WARNING — AP plan failed: {:?}", e);
+                return false;
+            }
+        }
+    };
+    cdk::println!(
+        "SMP: issuing INIT/SIPI to apic_id={} vector={:#x} ...",
+        plan.apic_id,
+        plan.sipi_vector
+    );
+    let mut apic_ctl = cdk::local_apic::XApicController::new();
+    use cdk::local_apic::ApicIpiController;
+    if !apic_ctl.bringup_ap(plan.apic_id, plan.sipi_vector) {
+        cdk::println!("SMP: WARNING — INIT/SIPI bring-up returned false");
+        return false;
+    }
+    let mut status = 0u32;
+    for i in 0..200_000u32 {
+        status = cdk::multicore::MultiCoreManager::read_trampoline_status_global();
+        if cdk::percpu::ap_ready(plan.apic_id) {
+            break;
+        }
+        if i % 20_000 == 0 {
+            cdk::println!(
+                "SMP: waiting... tramp_status={} ready_mask={:#x}",
+                status,
+                cdk::percpu::ap_ready_mask()
+            );
+        }
+        cdk::local_apic::spin_delay(500);
+    }
+    let ready = cdk::percpu::ap_ready(plan.apic_id);
+    cdk::println!(
+        "SMP: trampoline status={} ap_ready={} ready_mask={:#x}",
+        status,
+        ready,
+        cdk::percpu::ap_ready_mask()
+    );
+    if ready {
+        let mut k = KERNEL.lock();
+        let seq = cdk::percpu::ap_ready_seq(plan.apic_id).unwrap_or(plan.startup_seq);
+        match k.ap_trampoline_entry_hook(plan.apic_id, seq) {
+            Ok(()) => {
+                k.activate_ap_local_timer(plan.apic_id);
+                cdk::println!(
+                    "SMP: Kernel synced AP online (apic_id={}, seq={})",
+                    plan.apic_id,
+                    seq
+                );
+            }
+            Err(e) => cdk::println!("SMP: WARNING — Kernel sync failed: {:?}", e),
+        }
+    }
+    ready
+}
+
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     cdk::serial::init();
+    cdk::kernel::install_global(&KERNEL);
 
     let phys_map_ready = match boot_info.physical_memory_offset.into_option() {
         Some(offset) => {
@@ -547,8 +639,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
 
-    // M1: plan under Kernel lock, then drop it before INIT/SIPI + wait.
-    let ap_plan = {
+    // M1: register under Kernel lock, then drop it before INIT/SIPI + wait.
+    {
         let mut kernel = KERNEL.lock();
         kernel.configure_ap_handoff(ap_entry, cr3);
         cdk::println!(
@@ -579,82 +671,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         });
         // M11: keep BSP on lapic-local after topology registration.
         kernel.set_runtime_drive_mode(0, RuntimeDriveMode::LocalApic);
+    } // KERNEL.lock dropped here — APs can try_lock / use the mailbox
 
-        cdk::percpu::first_application_apic().and_then(|apic| {
-            cdk::println!("SMP: planning AP startup for apic_id={} ...", apic);
-            match kernel.plan_ap_startup(apic) {
-                Ok(plan) => {
-                    cdk::println!(
-                        "SMP: trampoline installed @ {:#x} vector={:#x} seq={}",
-                        plan.trampoline_phys,
-                        plan.sipi_vector,
-                        plan.startup_seq
-                    );
-                    Some(plan)
-                }
-                Err(e) => {
-                    cdk::println!("SMP: WARNING — AP plan failed: {:?}", e);
-                    None
-                }
-            }
-        })
-    }; // KERNEL.lock dropped here — AP can try_lock / use mailbox
-
-    if let Some(plan) = ap_plan {
-        cdk::println!(
-            "SMP: issuing INIT/SIPI to apic_id={} vector={:#x} ...",
-            plan.apic_id,
-            plan.sipi_vector
-        );
-        let mut apic = cdk::local_apic::XApicController::new();
-        use cdk::local_apic::ApicIpiController;
-        if apic.bringup_ap(plan.apic_id, plan.sipi_vector) {
-            cdk::println!(
-                "SMP: INIT/SIPI issued for apic_id={} seq={} (waiting for AP ready mailbox)",
-                plan.apic_id,
-                plan.startup_seq
-            );
-            let mut status = 0u32;
-            for i in 0..200_000u32 {
-                status = cdk::multicore::MultiCoreManager::read_trampoline_status_global();
-                if cdk::percpu::ap_ready(plan.apic_id) {
-                    break;
-                }
-                if i % 20_000 == 0 {
-                    cdk::println!(
-                        "SMP: waiting... tramp_status={} ready_mask={:#x}",
-                        status,
-                        cdk::percpu::ap_ready_mask()
-                    );
-                }
-                cdk::local_apic::spin_delay(500);
-            }
-            let ready = cdk::percpu::ap_ready(plan.apic_id);
-            cdk::println!(
-                "SMP: trampoline status={} ap_ready={} ready_mask={:#x}",
-                status,
-                ready,
-                cdk::percpu::ap_ready_mask()
-            );
-            // Sync Kernel online state now that AP has posted the mailbox.
-            if ready {
-                let mut k = KERNEL.lock();
-                let seq = cdk::percpu::ap_ready_seq(plan.apic_id).unwrap_or(plan.startup_seq);
-                match k.ap_trampoline_entry_hook(plan.apic_id, seq) {
-                    Ok(()) => {
-                        k.activate_ap_local_timer(plan.apic_id);
-                        cdk::println!(
-                            "SMP: Kernel synced AP online (apic_id={}, seq={})",
-                            plan.apic_id,
-                            seq
-                        );
-                    }
-                    Err(e) => cdk::println!("SMP: WARNING — Kernel sync failed: {:?}", e),
-                }
-            }
-        } else {
-            cdk::println!("SMP: WARNING — INIT/SIPI bring-up returned false");
+    // Start every AP, one at a time: each leaves the shared trampoline (and
+    // its stack) before it signals ready, so the next can reuse it (2.7).
+    let mut aps = heapless::Vec::<u32, { cdk::percpu::MAX_CPUS }>::new();
+    cdk::percpu::for_each_cpu(|cpu| {
+        if cpu.enabled && !cpu.is_bsp {
+            let _ = aps.push(cpu.apic_id);
         }
+    });
+    for apic in aps {
+        start_ap(apic);
     }
 
     {
