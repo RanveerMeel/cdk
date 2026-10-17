@@ -6,8 +6,10 @@
 #
 # Roadmap 2.6: agents have their own FPU/SSE/AVX state, so they are built for
 # x86_64-cdk-user.json — the bare-metal target with hardware floating point
-# (SSE2 baseline; AVX via #[target_feature] and runtime detection) — and
-# `core`/`alloc` are built from source for it.
+# (SSE2 baseline; AVX via #[target_feature] and runtime detection). `core`
+# and `alloc` must be built from source for it: tools/build_user_programs.sh
+# passes -Zbuild-std. It is not set here, because this config also applies
+# to user/ml, whose host tests need the prebuilt `core` that `std` uses.
 [build]
 target = "x86_64-cdk-user.json"
 
@@ -15,6 +17,4 @@ target = "x86_64-cdk-user.json"
 rustflags = ["-C", "relocation-model=static", "-C", "code-model=large"]
 
 [unstable]
-build-std = ["core", "alloc", "compiler_builtins"]
-build-std-features = ["compiler-builtins-mem"]
 json-target-spec = true
