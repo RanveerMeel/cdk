@@ -12,6 +12,7 @@ pub mod console;
 pub mod context;
 pub mod cpu;
 pub mod elf;
+pub mod fpu;
 pub mod framebuffer;
 pub mod gpu;
 #[cfg(target_os = "none")]

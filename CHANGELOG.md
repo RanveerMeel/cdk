@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Per-agent FPU/SSE/AVX state (roadmap 2.6): agents use hardware floating
+  point and vector registers, saved and restored per agent with XSAVE;
+  user programs build for `user/x86_64-cdk-user.json` (`core` from source);
+  new `fpu` isolation agent; CI checks the kernel never uses those registers.
 - Agents on every CPU (roadmap 2.7): every AP starts at boot on its own
   stack and runs agents; per-CPU scheduling with work stealing; syscalls
   lock the kernel themselves; `run-all` shows each agent's CPUs and the wall

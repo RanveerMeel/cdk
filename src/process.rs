@@ -134,7 +134,8 @@ pub enum TickAction {
     /// Keep running the current process.
     Continue,
     /// The frame now holds another process; load this page-table root.
-    Switch { pml4_phys: u64 },
+    /// `from`/`to` are the table slots, for the FPU state switch (2.6).
+    Switch { pml4_phys: u64, from: usize, to: usize },
     /// The current process exceeded its budget and has been marked `Killed`.
     Kill { pid: u32, ticks: u64 },
 }
@@ -505,6 +506,8 @@ impl ProcessTable {
         frame.rflags |= 0x200;
         TickAction::Switch {
             pml4_phys: new.pml4_phys,
+            from: idx,
+            to: next,
         }
     }
 
@@ -682,6 +685,11 @@ fn register(
     };
     match inserted {
         Ok(proc) => {
+            // A clean FPU/vector state: nothing from a previous occupant of
+            // the slot reaches the new agent (roadmap 2.6).
+            if let Some(slot) = TABLE.lock().find(pid) {
+                crate::fpu::reset(slot);
+            }
             let _ = crate::agent::create_table(pid);
             audit::record_fmt(
                 EventKind::ProcessSpawned,
@@ -842,6 +850,12 @@ fn run_one(proc: Process) -> Result<(), ProcessError> {
             0,
         );
     }
+    // Its FPU/vector registers (roadmap 2.6); whoever ran here before left
+    // theirs in the registers, and they are overwritten now.
+    let slot = TABLE.lock().find(proc.pid);
+    if let Some(slot) = slot {
+        crate::fpu::restore(slot);
+    }
     // TABLE must not be held here: SYS_exit, faults, and the timer path
     // all take it while the process runs.
     if let Err(e) = crate::syscall::run_frame(&proc.frame, proc.pml4_phys) {
@@ -899,8 +913,12 @@ pub fn on_user_tick(frame: &mut TrapFrame) -> TickAction {
     let cpu = this_cpu();
     let action = t.tick(cpu, frame, slice_ticks(), budget_ticks());
     match action {
-        TickAction::Switch { pml4_phys } => {
+        TickAction::Switch { pml4_phys, from, to } => {
             drop(t);
+            // The registers still hold the outgoing agent's state: the
+            // kernel never touches them (roadmap 2.6).
+            crate::fpu::save(from);
+            crate::fpu::restore(to);
             load_page_tables(pml4_phys);
         }
         TickAction::Kill { pid, ticks } => {
@@ -924,7 +942,14 @@ fn load_page_tables(pml4_phys: u64) {
 
 /// Park the current process (called from the syscall path with its frame).
 pub fn block_current(frame: &TrapFrame) {
-    TABLE.lock().block_current(this_cpu(), frame);
+    let mut t = TABLE.lock();
+    let slot = t.current[this_cpu()].and_then(|pid| t.find(pid));
+    t.block_current(this_cpu(), frame);
+    drop(t);
+    // It may resume on another CPU: keep its FPU/vector registers (2.6).
+    if let Some(slot) = slot {
+        crate::fpu::save(slot);
+    }
 }
 
 /// Resume a `Blocked` process with `result` as its syscall return value.
@@ -1169,7 +1194,8 @@ mod tests {
         f.rax = 111; // process 1 made progress
         assert_eq!(
             t.tick(0, &mut f, 2, 100),
-            TickAction::Switch { pml4_phys: 0x200 }
+            TickAction::Switch { pml4_phys: 0x200, from: 0, to: 1 },
+            "FPU state moves from slot 0 to slot 1"
         );
         assert_eq!(t.current[0], Some(2));
         assert_eq!(f.rip, 0x2000, "frame now belongs to pid 2");
@@ -1181,16 +1207,10 @@ mod tests {
         assert_eq!(t.slots[0].switches, 1);
 
         t.tick(0, &mut f, 2, 100);
-        assert_eq!(
-            t.tick(0, &mut f, 2, 100),
-            TickAction::Switch { pml4_phys: 0x300 }
-        );
+        assert!(matches!(t.tick(0, &mut f, 2, 100), TickAction::Switch { pml4_phys: 0x300, .. }));
         t.tick(0, &mut f, 2, 100);
         // Wraps around to pid 1 with its saved registers.
-        assert_eq!(
-            t.tick(0, &mut f, 2, 100),
-            TickAction::Switch { pml4_phys: 0x100 }
-        );
+        assert!(matches!(t.tick(0, &mut f, 2, 100), TickAction::Switch { pml4_phys: 0x100, .. }));
         assert_eq!(f.rax, 111);
     }
 
@@ -1318,7 +1338,7 @@ mod tests {
         // CPU 1's slice ends: it switches to the third process (CPU 1's
         // queue), never to the one running on CPU 2.
         let mut f = frame(a.pid as u64);
-        assert_eq!(t.tick(1, &mut f, 1, 100), TickAction::Switch { pml4_phys: 0x300 });
+        assert!(matches!(t.tick(1, &mut f, 1, 100), TickAction::Switch { pml4_phys: 0x300, .. }));
         let now1 = t.current[1].unwrap();
         assert!(now1 != a.pid && now1 != b.pid);
         assert_eq!(t.current[2], Some(b.pid));

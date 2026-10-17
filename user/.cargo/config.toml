@@ -3,8 +3,18 @@
 # (ET_EXEC) so the kernel loader maps segments exactly where they were linked
 # and never has to apply relocations. The `large` code model is required
 # because the default `small` model assumes everything lives below 2 GiB.
+#
+# Roadmap 2.6: agents have their own FPU/SSE/AVX state, so they are built for
+# x86_64-cdk-user.json — the bare-metal target with hardware floating point
+# (SSE2 baseline; AVX via #[target_feature] and runtime detection) — and
+# `core`/`alloc` are built from source for it.
 [build]
-target = "x86_64-unknown-none"
+target = "x86_64-cdk-user.json"
 
-[target.x86_64-unknown-none]
+[target.x86_64-cdk-user]
 rustflags = ["-C", "relocation-model=static", "-C", "code-model=large"]
+
+[unstable]
+build-std = ["core", "alloc", "compiler_builtins"]
+build-std-features = ["compiler-builtins-mem"]
+json-target-spec = true

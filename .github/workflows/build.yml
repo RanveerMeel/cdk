@@ -36,6 +36,9 @@ jobs:
       - name: Build kernel (release)
         run: cargo build --release --bin cdk
 
+      - name: Kernel never uses FPU/vector registers (agents own them, roadmap 2.6)
+        run: tools/check_kernel_no_simd.sh
+
       - name: Check virtio-hw feature
         run: cargo check --features virtio-hw
 

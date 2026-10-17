@@ -16,7 +16,7 @@ STAGE="$ROOT/target/initrd"
 USER_TARGET="$ROOT/user/target"
 (cd "$ROOT/user" && CARGO_TARGET_DIR="$USER_TARGET" cargo build --release --bins --quiet)
 
-BIN_DIR="$USER_TARGET/x86_64-unknown-none/release"
+BIN_DIR="$USER_TARGET/x86_64-cdk-user/release"
 rm -rf "$STAGE"
 mkdir -p "$STAGE" "$(dirname "$OUT")"
 for src in "$ROOT"/user/src/bin/*.rs; do
