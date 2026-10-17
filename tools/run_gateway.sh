@@ -48,4 +48,15 @@ if [ "${CDK_TPM:-1}" != "0" ] && command -v swtpm &> /dev/null; then
     fi
     if [ -n "$TPM_CA" ] && [ "$TPM_CA" != "none" ]; then EXPECT+=(--tpm-ca "$TPM_CA"); fi
 fi
+# Distributed capabilities (roadmap 3.5): CDK_NODE=<name> makes this gateway
+# the registry authority for the CDK it serves — once the attestation is
+# accepted it certifies CDK as node <name> with the registry key
+# (CDK_REGISTRY_KEY, default target/registry.key: tools/sign.sh init --key
+# target/registry.key --pub-out target/registry.pub). Exports and imports go
+# through CDK_CAP_DIR (default target/caps/{outbox,inbox}); CDK_CERT_VALIDITY
+# sets the certificate lifetime in seconds (default 24 h).
+if [ -n "${CDK_NODE:-}" ]; then
+    EXPECT+=(--registry-key "${CDK_REGISTRY_KEY:-$ROOT/target/registry.key}" --node "$CDK_NODE" \
+        --cap-dir "${CDK_CAP_DIR:-$ROOT/target/caps}" ${CDK_CERT_VALIDITY:+--cert-validity "$CDK_CERT_VALIDITY"})
+fi
 exec "$BIN" "${ID[@]}" "${MCP[@]}" "${MODELS[@]}" "${SPOOL[@]}" "${EXPECT[@]}" ${CDK_MCP_ALLOW:+--allow "$CDK_MCP_ALLOW"} "${1:-$ROOT/target/cdk-link.sock}"

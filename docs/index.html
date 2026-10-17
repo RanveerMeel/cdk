@@ -278,6 +278,7 @@ audit: OK — 97 records (seq 0..96), 0 evicted, 1 checkpoint(s) valid</code></p
                 <li>Models on Linux GPUs, granted per model; API keys stay in the gateway, never in the agent</li>
                 <li>Policy change review: every grant shown as a reach diff, checked against invariant rules, approved before it applies</li>
                 <li>Signed operator approvals: post-quantum operator signatures, two-person (M-of-N) rules, vetoes, time-outs, every vote audit-logged</li>
+                <li>Distributed capabilities: nodes certified after attestation by a registry; capabilities delegated between nodes and checked against the receiving node's trust policy</li>
                 <li>Every parser of untrusted bytes fuzzed in CI, an in-kernel syscall fuzzer, and AddressSanitizer on host tests</li>
                 <li>Verified and measured boot: a release-signed ramdisk the kernel checks before trusting any key (lockdown on failure); a measured chain from firmware to loader to kernel in TPM PCRs, attested with TPM quotes from an enrolled machine whose TPM proves it is genuine (manufacturer certificate chain and credential activation); UEFI Secure Boot runs only a signed loader, which runs only the kernel it was built for</li>
               </ul>
@@ -285,7 +286,7 @@ audit: OK — 97 records (seq 0..96), 0 evicted, 1 checkpoint(s) valid</code></p
             <div>
               <h3 class="status-head next">Next on the roadmap</h3>
               <ul class="checklist todo">
-                <li>Distributed capabilities across CDK nodes</li>
+                <li>Distributed capabilities, stage 2: messages to peers' objects, revocation</li>
                 <li>Independent security review; ARM64 port</li>
               </ul>
             </div>

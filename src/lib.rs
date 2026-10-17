@@ -36,6 +36,7 @@ pub mod network;
 pub mod node;
 pub mod object;
 pub mod paging;
+pub mod peer;
 pub mod percpu;
 pub mod phys_mem;
 pub mod process;

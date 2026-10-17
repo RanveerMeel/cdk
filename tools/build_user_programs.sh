@@ -71,6 +71,15 @@ if [ -d "$OPERATORS_DIR" ]; then
     done
 fi
 
+# Distributed capabilities (roadmap 3.5): the registry key that certifies
+# CDK nodes (tools/sign.sh init --key target/registry.key --pub-out
+# target/registry.pub; the gateway signs with it). Public half only; none =
+# no peer trust. Override with CDK_REGISTRY_PUB.
+REGISTRY_PUB="${CDK_REGISTRY_PUB:-$ROOT/target/registry.pub}"
+if [ -f "$REGISTRY_PUB" ]; then
+    cp "$REGISTRY_PUB" "$STAGE/registry.pub"
+fi
+
 # Verified boot (roadmap 4.2): sign a manifest of every file above with the
 # release key (tools/sign.sh init). The kernel checks it before trusting any
 # pinned key or program; without a key the ramdisk is unsigned (development).

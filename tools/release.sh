@@ -49,7 +49,7 @@ build_tree() { # $1 = directory to unpack and build in
         cd "$tree"
         export CARGO_NET_OFFLINE=true CARGO_TARGET_DIR="$tree/target"
         export CDK_RELEASE_PUB="$PUB" CDK_RELEASE_KEY="$KEY"
-        export CDK_GATEWAY_PUB=/nonexistent CDK_OPERATORS_DIR=/nonexistent
+        export CDK_GATEWAY_PUB=/nonexistent CDK_OPERATORS_DIR=/nonexistent CDK_REGISTRY_PUB=/nonexistent
         unset CDK_POLICY_FILE CDK_PRIVATE_PROGRAMS_DIR
         HOST="$(rustc -vV | sed -n 's/^host: //p')"
         cargo build --release --locked --quiet --bin cdk

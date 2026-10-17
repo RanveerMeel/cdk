@@ -103,6 +103,16 @@ impl core::fmt::Debug for Identity {
     }
 }
 
+impl core::fmt::Debug for Signature {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "Signature(ed25519 {:02x}{:02x}…, ml-dsa-65)",
+            self.ed[0], self.ed[1]
+        )
+    }
+}
+
 impl Identity {
     pub fn from_bytes(b: &[u8]) -> Option<Self> {
         if b.len() != IDENTITY_LEN {

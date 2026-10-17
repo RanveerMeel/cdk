@@ -29,6 +29,12 @@
 //! | `separate <a> <b>` | one agent holds handles reaching both `<a>` and `<b>` |
 //! | `approval <l>` | a handle with an effect (`exec`, `send`, `write`, `delete`) on an `<l>` object lacks the approval constraint |
 //!
+//! **Peer trust** (roadmap 3.5): `trust <node> <object|*> <perms>` lets a
+//! certified peer node delegate capabilities on its object (by name) to
+//! agents here, up to `<perms>` (add `approval` to force the approval gate).
+//! Imported objects appear as `peer:<node>/<object>` and carry the automatic
+//! labels `peer` and `peer:<node>`, so the rules above apply to them too.
+//!
 //! A change that would violate a rule is refused outright (it cannot be
 //! approved). The boot policy is loaded from `policy.rules` in the ramdisk;
 //! if that file is malformed the kernel fails closed and refuses every
@@ -226,6 +232,30 @@ pub struct Policy {
     pub quorums: Vec<(Label, u8), 8>,
     /// Seconds an approval request waits before it is denied.
     pub approval_timeout_s: u16,
+    /// Peer trust (roadmap 3.5).
+    pub trusts: Vec<Trust, 16>,
+}
+
+/// `trust <node> <object|*> <perms>`: what a peer node may delegate here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Trust {
+    pub node: String<16>,
+    /// Object name on the peer, or `*`.
+    pub object: String<16>,
+    /// Permissions it may grant (and `approval` to force the gate).
+    pub mask: u64,
+}
+
+impl fmt::Display for Trust {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "trust {} {} {}",
+            self.node,
+            self.object,
+            crate::agent::permission_names(self.mask)
+        )
+    }
 }
 
 impl Default for Policy {
@@ -233,6 +263,9 @@ impl Default for Policy {
         Self::new()
     }
 }
+
+/// Object kinds of imported peer objects: `peer:<node>/<object>`.
+pub const PEER_PREFIX: &str = "peer:";
 
 /// Default approval time-out.
 pub const DEFAULT_APPROVAL_TIMEOUT_S: u16 = 300;
@@ -246,7 +279,17 @@ impl Policy {
             labels: Vec::new(),
             quorums: Vec::new(),
             approval_timeout_s: DEFAULT_APPROVAL_TIMEOUT_S,
+            trusts: Vec::new(),
         }
+    }
+
+    /// What `node` may delegate on its object `object`: the permission mask
+    /// (with [`APPROVAL`] if the import must be gated), or 0.
+    pub fn trusted(&self, node: &str, object: &str) -> u64 {
+        self.trusts
+            .iter()
+            .filter(|t| t.node == node && (t.object == object || t.object == "*"))
+            .fold(0, |m, t| m | t.mask)
     }
 
     /// Operators required for an action on an object with `labels` (at
@@ -294,6 +337,15 @@ impl Policy {
         }
         if flags & cdk_link::tool::FLAG_REMOTE != 0 {
             add("remote");
+        }
+        if let Some(rest) = kind.strip_prefix(PEER_PREFIX) {
+            add("peer");
+            if let Some(node) = rest.split('/').next() {
+                let mut l: String<24> = String::new();
+                if l.push_str("peer:").is_ok() && l.push_str(node).is_ok() {
+                    add(&l);
+                }
+            }
         }
         for (sel, l) in &self.labels {
             if sel == object || sel == kind {
@@ -391,6 +443,30 @@ impl Policy {
                     .ok()
                     .filter(|s| (10..=3600).contains(s))
                     .ok_or(e("approval-timeout must be 10..=3600 seconds"))?;
+            } else if let Some(rest) = line.strip_prefix("trust ") {
+                let mut w = rest.split_whitespace();
+                let (Some(node), Some(object), Some(perms), None) =
+                    (w.next(), w.next(), w.next(), w.next())
+                else {
+                    return Err(e("trust <node> <object|*> <perms>"));
+                };
+                if !cdk_link::peer::valid_node_name(node) {
+                    return Err(e("node names: a-z 0-9 - _ (at most 16)"));
+                }
+                if object != "*" && !cdk_link::peer::valid_object_name(object) {
+                    return Err(e("object names: letters, digits, - _ . (at most 10), or *"));
+                }
+                let mask = crate::agent::parse_permissions(perms)
+                    .ok_or(e("perms: read,write,exec,send,recv,delete,approval"))?
+                    .iter()
+                    .fold(0u64, |m, p| m | bit(p.clone()));
+                p.trusts
+                    .push(Trust {
+                        node: String::try_from(node).map_err(|_| e("node name"))?,
+                        object: String::try_from(object).map_err(|_| e("object name"))?,
+                        mask,
+                    })
+                    .map_err(|_| e("too many trust rules"))?;
             } else if let Some(rest) = line.strip_prefix("label ") {
                 let mut w = rest.split_whitespace();
                 let (Some(sel), Some(l), None) = (w.next(), w.next(), w.next()) else {
@@ -1049,5 +1125,40 @@ mod tests {
     fn digest_is_stable() {
         assert_eq!(digest("a"), digest("a"));
         assert_ne!(digest("a"), digest("b"));
+    }
+
+    /// Roadmap 3.5: what a peer node may delegate, and labels on proxies.
+    #[test]
+    fn peer_trust_and_labels() {
+        let p = Policy::parse(
+            "trust hq alerts send\ntrust hq * recv,approval\ntrust lab-2 ledger exec\nseparate customer-data peer\n",
+        )
+        .unwrap();
+        let send = bit(Permission::SendMessage);
+        let recv = bit(Permission::ReceiveMessage);
+        assert_eq!(p.trusted("hq", "alerts"), send | recv | APPROVAL);
+        assert_eq!(p.trusted("hq", "ledger"), recv | APPROVAL, "only the wildcard applies");
+        assert_eq!(p.trusted("branch", "alerts"), 0, "untrusted node");
+        assert_eq!(p.trusted("lab-2", "ledger"), bit(Permission::Execute));
+        let labels = p.labels_of("obj-4", "peer:hq/alerts", 0);
+        assert!(labels.iter().any(|l| l == "peer") && labels.iter().any(|l| l == "peer:hq"));
+        // Rules apply to proxies like any object.
+        let grants = [
+            Grant::new(1, "obj-4", "peer:hq/alerts", 0, send),
+            Grant::new(1, "obj-1", "txn", 0, recv),
+        ];
+        let mut q = p.clone();
+        q.add_label("obj-1", "customer-data").unwrap();
+        assert_eq!(q.violations(&grants).len(), 1);
+        // Malformed trust lines fail the parse (the kernel then fails closed).
+        for bad in [
+            "trust HQ alerts send",
+            "trust hq alerts",
+            "trust hq a/b send",
+            "trust hq alerts fly",
+            "trust a-very-long-node-name x send",
+        ] {
+            assert!(Policy::parse(bad).is_err(), "{bad}");
+        }
     }
 }

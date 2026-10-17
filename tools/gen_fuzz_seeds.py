@@ -51,6 +51,9 @@ def messages():
     for name, m in [("list-request", b"\x03"), ("list", lst), ("call", call), ("response", resp), ("chunk", chunk),
                     ("approval-request", req), ("resolved", bytes([0x22]) + struct.pack("<IB", 3, 1))]:
         write("link_messages", name, m)
+    # A real portable capability (roadmap 3.5), when a local export exists.
+    for pc in sorted((ROOT / "target/caps/outbox").glob("*.pcap"))[:1]:
+        write("link_messages", "portable-cap", pc.read_bytes())
     write("link_messages", "decision-parts", part(0, b"abcd") + b"\xff" + part(4, b"efgh"))
 
 

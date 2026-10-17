@@ -219,6 +219,11 @@ fn answer_attestation(gateway: &[u8; 16], timeout_ms: u64) {
             None => crate::println!("link: gateway sent no endorsement challenge"),
         }
     }
+    // Distributed capabilities (roadmap 3.5): a gateway holding the registry
+    // key certifies this boot's issuer once it has accepted the attestation.
+    if flags & cdk_link::peer::CERTIFY != 0 {
+        crate::peer::await_certificate(10_000);
+    }
 }
 
 /// Poll for sealed messages until `f` accepts one or `timeout_ms` passes.

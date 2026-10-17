@@ -127,6 +127,20 @@ pub enum EventKind {
     /// key. Subject `ak:<x prefix>` (or `tpm-failed`); `detail` = TPM
     /// vendor/device id.
     TpmReady = 30,
+    /// This node's issuer key was certified by the pinned registry (roadmap
+    /// 3.5). Subject `node:<name>`; `detail` = certificate serial.
+    NodeCertified = 31,
+    /// A capability was exported to another node. Subject
+    /// `<object>><node>:pid-<p>`; `detail` = permission mask.
+    CapExported = 32,
+    /// A peer node's capability was accepted. Subject `peer:<node>/<object>`;
+    /// `detail` = permission mask granted.
+    CapImported = 33,
+    /// A peer node's capability was refused. Subject `peer:<node>/<object>`
+    /// (or `peer`); `detail` = reason (1 no registry, 2 bad certificate or
+    /// signature, 3 not addressed to this node, 4 replayed, 5 not trusted by
+    /// policy, 6 malformed, 7 expired).
+    CapImportRejected = 34,
 }
 
 impl EventKind {
@@ -162,6 +176,10 @@ impl EventKind {
             EventKind::BootRejected => "boot-rejected",
             EventKind::Attested => "attested",
             EventKind::TpmReady => "tpm-ready",
+            EventKind::NodeCertified => "node-certified",
+            EventKind::CapExported => "cap-exported",
+            EventKind::CapImported => "cap-imported",
+            EventKind::CapImportRejected => "cap-import-rejected",
         }
     }
 }

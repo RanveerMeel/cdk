@@ -29,7 +29,8 @@
 //! ```text
 //! cdk-gateway --init [--identity FILE] [--pub-out FILE]   create identity, export public key
 //! cdk-gateway [--identity FILE] [--mcp NAME=COMMAND]... [--model SPEC]... [--allow t1,t2]
-//!             [--spool DIR] [--expect FILE] [--tpm FILE] [--tpm-ca DIR] [SOCKET]
+//!             [--spool DIR] [--expect FILE] [--tpm FILE] [--tpm-ca DIR]
+//!             [--registry-key FILE --node NAME [--cert-validity S]] [--cap-dir DIR] [SOCKET]
 //! ```
 //! The public key file (1984 bytes) is packed into CDK's ramdisk as
 //! `gateway.pub`; CDK refuses any other gateway.
@@ -50,6 +51,7 @@ mod credential;
 mod ekcert;
 mod mcp;
 mod models;
+mod registry;
 mod spool;
 
 fn send(stream: &mut UnixStream, k: u8, flags: u8, payload: &[u8]) -> std::io::Result<()> {
@@ -230,6 +232,79 @@ struct Args {
     expect: Option<PathBuf>,
     tpm: Option<PathBuf>,
     tpm_ca: Option<PathBuf>,
+    registry_key: Option<PathBuf>,
+    node: Option<String>,
+    cert_validity: Option<u64>,
+    cap_dir: PathBuf,
+}
+
+/// Once the attestation is accepted: the node certificate for the key CDK
+/// proved in this session's handshake, as blob chunks (roadmap 3.5).
+fn certify(
+    reg: &Option<registry::Registry>,
+    attestor: &attestation::Attestor,
+    client: &Option<cdk_link::secure::Identity>,
+    certified: &mut bool,
+) -> Vec<Vec<u8>> {
+    let (Some(reg), Some(client)) = (reg, client) else {
+        return Vec::new();
+    };
+    if *certified || attestor.status != attestation::Status::Trusted {
+        return Vec::new();
+    }
+    *certified = true;
+    let cert = reg.certify(client, attestor.attested_digest());
+    eprintln!(
+        "gateway: -> node certificate: '{}' = CDK issuer {}… (serial {:#x})",
+        cert.name,
+        hex(&client.id()[..8]),
+        cert.serial
+    );
+    cdk_link::peer::encode_blob(cdk_link::peer::kind::NODE_CERT, &cert.encode()).unwrap_or_default()
+}
+
+/// Capability exports and imports: the gateway carries them between its
+/// outbox/inbox and CDK, which verifies everything (roadmap 3.5).
+fn handle_peer(
+    msg: &[u8],
+    serving: bool,
+    caps: &registry::CapDir,
+    blobs: &mut cdk_link::peer::BlobAssembler,
+) -> Vec<Vec<u8>> {
+    use cdk_link::peer;
+    if !serving {
+        eprintln!("gateway: capability transfer refused — CDK not attested");
+        return vec![peer::encode_status(
+            false,
+            "the gateway refuses: CDK not attested",
+        )];
+    }
+    match msg.first() {
+        Some(&peer::BLOB) => match blobs.push(msg) {
+            Ok(Some((peer::kind::EXPORT, data))) => match caps.write_export(&data) {
+                Ok(path) => vec![peer::encode_status(
+                    true,
+                    &format!("written to {}", path.display()),
+                )],
+                Err(e) => vec![peer::encode_status(false, &e)],
+            },
+            Ok(_) => Vec::new(),
+            Err(e) => vec![peer::encode_status(false, e)],
+        },
+        Some(&peer::IMPORT_REQUEST) => {
+            let Some(name) = peer::decode_import_request(msg) else {
+                return vec![peer::encode_status(false, "bad import request")];
+            };
+            match caps.read_import(name) {
+                Ok(data) => {
+                    eprintln!("gateway: -> capability {name}.pcap from the inbox to CDK");
+                    peer::encode_blob(peer::kind::IMPORT, &data).unwrap_or_default()
+                }
+                Err(e) => vec![peer::encode_status(false, &e)],
+            }
+        }
+        _ => Vec::new(),
+    }
 }
 
 fn args() -> Args {
@@ -244,6 +319,10 @@ fn args() -> Args {
         expect: None,
         tpm: None,
         tpm_ca: None,
+        registry_key: None,
+        node: None,
+        cert_validity: None,
+        cap_dir: PathBuf::from("target/caps"),
         allow: None,
     };
     let mut it = std::env::args().skip(1);
@@ -264,6 +343,19 @@ fn args() -> Args {
             "--expect" => a.expect = Some(it.next().expect("--expect FILE").into()),
             "--tpm" => a.tpm = Some(it.next().expect("--tpm ENROLLMENT-FILE").into()),
             "--tpm-ca" => a.tpm_ca = Some(it.next().expect("--tpm-ca DIR").into()),
+            "--registry-key" => {
+                a.registry_key = Some(it.next().expect("--registry-key FILE").into())
+            }
+            "--node" => a.node = Some(it.next().expect("--node NAME")),
+            "--cert-validity" => {
+                a.cert_validity = Some(
+                    it.next()
+                        .and_then(|s| s.parse().ok())
+                        .filter(|s| (60..=30 * 86400).contains(s))
+                        .expect("--cert-validity SECONDS (60..=2592000)"),
+                )
+            }
+            "--cap-dir" => a.cap_dir = it.next().expect("--cap-dir DIR").into(),
             "--allow" => {
                 let list = it.next().expect("--allow tool1,tool2");
                 a.allow = Some(list.split(',').map(str::to_string).collect());
@@ -394,6 +486,35 @@ fn main() -> std::io::Result<()> {
         store
     });
     let mut attestor = attestation::Attestor::new(expect, expect_loader, a.tpm.as_deref(), trust);
+    // Distributed capabilities (roadmap 3.5): certify the attested CDK.
+    let node_registry = a.registry_key.as_deref().map(|path| {
+        let node = a.node.as_deref().unwrap_or_else(|| {
+            eprintln!("gateway: --registry-key needs --node NAME");
+            std::process::exit(2)
+        });
+        if a.expect.is_none() && a.tpm.is_none() && a.tpm_ca.is_none() {
+            eprintln!("gateway: refusing to certify an unattested node: --registry-key needs --expect, --tpm or --tpm-ca");
+            std::process::exit(2)
+        }
+        let mut reg = registry::Registry::load(path, node).unwrap_or_else(|e| {
+            eprintln!("gateway: --registry-key: {e}");
+            std::process::exit(2)
+        });
+        if let Some(v) = a.cert_validity {
+            reg.validity_s = v;
+        }
+        eprintln!(
+            "gateway: registry {}… will certify this CDK as node '{}' after its attestation is accepted",
+            hex(&reg.public().id()[..8]),
+            reg.node
+        );
+        reg
+    });
+    attestor.certify = node_registry.is_some();
+    let caps = registry::CapDir(a.cap_dir.clone());
+    let mut blobs = cdk_link::peer::BlobAssembler::default();
+    let mut peer_identity: Option<cdk_link::secure::Identity> = None;
+    let mut certified = false;
     eprintln!("gateway: approval spool {}", spool.dir().display());
     // Wake up regularly to forward operators' decisions.
     stream.set_read_timeout(Some(Duration::from_millis(250)))?;
@@ -470,6 +591,8 @@ fn main() -> std::io::Result<()> {
                                             "gateway: SECURE session with CDK issuer {} (X25519+ML-KEM-768, ChaCha20-Poly1305)",
                                             hex(&client.id())
                                         );
+                                        peer_identity = Some(client.clone());
+                                        certified = false;
                                         session = Some(s);
                                         // Ask CDK to attest its measured boot.
                                         if let Some(s) = session.as_mut() {
@@ -537,9 +660,38 @@ fn main() -> std::io::Result<()> {
                             }
                             Ok(m) if m > 0 && cdk_link::tpm::is_endorsement(&plain[..m]) => {
                                 attestor.on_endorsement(&plain[..m]);
+                                for msg in certify(
+                                    &node_registry,
+                                    &attestor,
+                                    &peer_identity,
+                                    &mut certified,
+                                ) {
+                                    let mut out = [0u8; cdk_link::MAX_PAYLOAD];
+                                    let len = s.seal(&msg, &mut out).expect("chunk fits");
+                                    send(&mut stream, kind::SEALED, 0, &out[..len])?;
+                                }
                             }
                             Ok(m) if m > 0 && cdk_link::attest::is_attest(&plain[..m]) => {
                                 attestor.on_message(&plain[..m]);
+                                for msg in certify(
+                                    &node_registry,
+                                    &attestor,
+                                    &peer_identity,
+                                    &mut certified,
+                                ) {
+                                    let mut out = [0u8; cdk_link::MAX_PAYLOAD];
+                                    let len = s.seal(&msg, &mut out).expect("chunk fits");
+                                    send(&mut stream, kind::SEALED, 0, &out[..len])?;
+                                }
+                            }
+                            Ok(m) if m > 0 && cdk_link::peer::is_peer(&plain[..m]) => {
+                                for msg in
+                                    handle_peer(&plain[..m], attestor.serving(), &caps, &mut blobs)
+                                {
+                                    let mut out = [0u8; cdk_link::MAX_PAYLOAD];
+                                    let len = s.seal(&msg, &mut out).expect("message fits");
+                                    send(&mut stream, kind::SEALED, 0, &out[..len])?;
+                                }
                             }
                             Ok(m) if m > 0 && cdk_link::approval::is_approval(&plain[..m]) => {
                                 if attestor.serving() {

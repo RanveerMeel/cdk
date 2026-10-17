@@ -1,11 +1,32 @@
-//! Tool, model and approval messages inside the sealed channel. Anything
+//! Tool, model, approval and peer (roadmap 3.5) messages inside the sealed
+//! channel, and portable capabilities / node certificates from a peer. Anything
 //! that decodes must re-encode to the same bytes (no two encodings of one
 //! message), and reassembly must never produce more than it was given.
 #![no_main]
-use cdk_link::{approval, tool};
+use cdk_link::{approval, peer, tool};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
+    // Peer capabilities come from an untrusted courier: decoding is strict
+    // (canonical), and verification never panics.
+    if let Some(c) = peer::NodeCert::decode(data) {
+        assert_eq!(c.encode(), data);
+    }
+    if let Some(p) = peer::PortableCap::decode(data) {
+        assert_eq!(p.encode(), data);
+        let registry = p.cert.issuer.clone();
+        let _ = p.verify(&registry, "fuzz", 0);
+    }
+    let mut blobs = peer::BlobAssembler::default();
+    for part in data.split(|&b| b == 0xfe) {
+        if let Ok(Some((_, out))) = blobs.push(part) {
+            assert!(out.len() <= peer::MAX_BLOB);
+        }
+    }
+    if let Some(name) = peer::decode_import_request(data) {
+        assert!(peer::valid_file_name(name));
+    }
+    let _ = peer::decode_status(data);
     match tool::decode(data) {
         Ok(tool::Message::ListRequest) => assert_eq!(tool::encode_list_request(), data),
         Ok(tool::Message::ListResponse(entries)) => {
