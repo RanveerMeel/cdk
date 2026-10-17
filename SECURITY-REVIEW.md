@@ -69,6 +69,7 @@ host test suites also run under AddressSanitizer
 | `link_messages` fuzzer (seconds) | `tool::decode` accepted call arguments and response bodies longer than `MAX_BODY`, which the encoder can never produce. Bounded by the frame size, so not exploitable, but a parser/encoder mismatch. | Fixed; regression test and `fuzz/regressions/link_messages/` |
 | Diff security review (2026-10-14; verified boot, gateway attestation with `--expect`, ELF `validate()`, tool decoder bounds — the 4.3 and 4.2 changes) | No medium, high or critical findings. Gaps it noted were already documented: TPM-less measurements, `--expect` being optional, a software-only root at the time (since then the TPM root and the measuring loader address the last). Not the independent review below; the TPM-root and fraud-demo changes were not in its scope. | — |
 | `boot_attest` fuzzer (4.2, under a minute) | The manifest checker accepted non-canonical spellings (uppercase hex, CRLF). Not exploitable — the release signature covers the exact bytes — but one set of files should have exactly one valid manifest. | Fixed: canonical form required; regression test and replayed input |
+| Diff security review (2026-10-16; TPM endorsement and UEFI Secure Boot — `gateway/src/ekcert.rs`, `credential.rs`, `attestation.rs`, `link/src/tpm.rs`, the kernel's TPM commands, the loader's kernel pin, the TPM and Secure Boot scripts) | **Medium:** within one session the gateway accepted any number of endorsement proofs and compared the secret with `==`, so a rejected session could later become trusted (and the secret could in principle be guessed byte by byte from timing). **Medium:** the EK certificate's purpose was not enforced — a CA certificate, or a non-EK certificate from a trusted vendor CA, naming a key whose private half lives outside a TPM, would have been accepted as an EK certificate. **Low:** a failed send leaked the TPM transient EK object (later `CreatePrimary` could fail). **Low:** Secure Boot with an unverified development kernel ended the chain at the kernel without saying so. **Info:** the loader still reads the unsigned `boot.json` (display and logging settings only; the kernel's own boot config is in the pinned kernel). | Fixed: one proof per challenge, constant-time comparison, and every attestation decision is final for its session (a second attestation, quote or EK is ignored); EK certificates must carry the TCG EK usage (2.23.133.8.1) and not be CAs; the EK is flushed on every path; `run_qemu.sh` warns. Regression tests with certificates that chain correctly but are not EK certificates; the tests fail with the old code. `boot.json`: documented |
 | The nine 4.3 fuzz targets, 10 minutes each after the fixes (about 296 million executions: `spool_decision` 139 M, `initrd` 82 M, `policy` 36 M, `link_messages` 21 M, `frame_decoder` 7.9 M, `sealed_channel` 6.4 M, `elf` 1.9 M, `hybrid_verify` 1.5 M, `handshake` 0.7 M) | No crashes, sanitizer reports, or property violations | — |
 | `chaos` in QEMU (20,000 syscalls; with h0 granted and two messages queued) | Every hostile call rejected: bad buffers `-3`, escalating derives `-2`, unknown handles and syscalls `-1`, empty queue `-5`; valid calls succeeded; read-only canary intact; the kernel kept running programs; 940 audit records with 8 signed checkpoints verified | — |
 | AddressSanitizer: kernel host tests (279), link (21 + 3 RFC), gateway (8) | No reports | — |
@@ -107,12 +108,16 @@ host test suites also run under AddressSanitizer
   is detected (PCR 4) but not prevented. Secure Boot signatures are RSA
   (classical, a UEFI constraint); one key serves as PK, KEK and db in the
   QEMU setup.
+- Under Secure Boot the loader still reads `boot.json` from the boot
+  partition unsigned; it sets display and logging options only (the
+  kernel's boot configuration is compiled into the pinned kernel).
 - With `--tpm-ca`, the TPM must prove its attestation key is in a TPM
   certified by a trusted manufacturer CA (EK certificate chain +
   `MakeCredential`/`ActivateCredential`). Only ECC P-256 endorsement keys
   (template L-2, certificate at NV `0x01c0000a`) are supported, as provisioned
   on discrete TPMs; firmware TPMs (Intel PTT, AMD fTPM) whose EK certificate
   is fetched from the vendor online, and RSA-only EKs, are not yet. EK
-  certificate dates and revocation are not checked, and the EK template is
+  certificate dates and revocation are not checked (the certificate must carry
+  the TCG EK usage and not be a CA), and the EK template is
   assumed standard (no NV template override). Without `--tpm-ca`, TPM
   enrollment is trust-on-first-use.

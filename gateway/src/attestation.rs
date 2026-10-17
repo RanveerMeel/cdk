@@ -128,6 +128,11 @@ pub fn verify_quote_signature(q: &tpm::Quote<'_>) -> bool {
     vk.verify(q.attest, &sig).is_ok()
 }
 
+/// Constant-time equality of two byte strings of public length.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 pub struct Attestor {
     expect: Option<[[u8; 32]; REGISTERS]>,
     /// Expected PCRs 11-12 from the measuring loader (UEFI boots).
@@ -226,6 +231,10 @@ impl Attestor {
         }
         match msg.first() {
             Some(&tpm::EK_CHUNK) => {
+                if self.ek.is_some() {
+                    eprintln!("gateway: endorsement key already received; chunk ignored");
+                    return;
+                }
                 if let Err(e) = self.ek_chunks.push(msg) {
                     self.ek = Some(Err(e.to_string()));
                     return;
@@ -240,8 +249,14 @@ impl Attestor {
                 }
             }
             Some(&tpm::PROOF) => {
+                if self.ek_proven.is_some() {
+                    // One answer per challenge: a second one cannot overturn
+                    // the first (no guessing the secret over retries).
+                    eprintln!("gateway: second endorsement proof ignored");
+                    return;
+                }
                 let r = match (tpm::decode_proof(msg), &self.credential) {
-                    (Some(got), Some(want)) if got == want => Ok(()),
+                    (Some(got), Some(want)) if ct_eq(got, want) => Ok(()),
                     (Some(_), Some(_)) => {
                         Err("the TPM did not recover the challenge secret".to_string())
                     }
@@ -270,16 +285,17 @@ impl Attestor {
         if cert.key != PublicKey::P256(point) {
             return Err("the EK certificate does not certify the TPM's endorsement key".into());
         }
+        // Only an EK certificate vouches for a TPM-resident decryption key:
+        // a CA's or another kind of certificate from the same vendor CA
+        // could name a key whose private half exists outside any TPM.
+        if cert.is_ca || !cert.ek_usage {
+            return Err("not an EK certificate (needs the TCG EK extended key usage 2.23.133.8.1, and must not be a CA)".into());
+        }
         let path = trust.verify(&cert)?;
         eprintln!(
-            "gateway: <- endorsement key {}… certified: {}{}",
+            "gateway: <- endorsement key {}… certified: {}",
             attest::hex(&blob.x[..6]),
-            path.join(" <- "),
-            if cert.ek_usage {
-                ""
-            } else {
-                " (no TCG EK key usage)"
-            }
+            path.join(" <- ")
         );
         Ok((blob.x, blob.y))
     }
@@ -287,6 +303,10 @@ impl Attestor {
     /// A TPM quote (CDK sends it just before its attestation). With
     /// `--tpm-ca`, returns the credential challenge to send CDK.
     pub fn on_quote(&mut self, msg: &[u8]) -> Option<Vec<u8>> {
+        if self.quote.is_some() {
+            eprintln!("gateway: second TPM quote in this session ignored");
+            return None;
+        }
         let result = (|| {
             let q = tpm::decode_quote(msg).ok_or("malformed TPM quote")?;
             if q.nonce != self.nonce {
@@ -347,6 +367,10 @@ impl Attestor {
     }
 
     pub fn on_message(&mut self, msg: &[u8]) {
+        if self.attest_ok.is_some() || self.status != Status::Pending {
+            eprintln!("gateway: second attestation in this session ignored");
+            return;
+        }
         let Some(Message::Attestation(a)) = attest::decode(msg) else {
             eprintln!("gateway: malformed attestation ignored");
             return;
@@ -391,6 +415,9 @@ impl Attestor {
     /// Decide once the attestation (and, with `--tpm-ca`, the endorsement
     /// proof) are in.
     fn finish(&mut self) {
+        if self.status != Status::Pending {
+            return; // decided: only a new request (new session) starts over
+        }
         let Some(mut ok) = self.attest_ok else {
             return;
         };
@@ -805,5 +832,72 @@ mod tests {
         a.on_endorsement(&tpm::encode_proof(&secret).unwrap());
         assert!(a.serving() && file.exists());
         std::fs::remove_file(&file).unwrap();
+    }
+
+    /// Security review 2026-10-16: one proof per challenge, and a decided
+    /// session stays decided.
+    #[test]
+    fn a_rejected_session_cannot_be_overturned() {
+        let regs = expected_registers(b"k", b"r", Verdict::Verified, &[1; 16]);
+        let cert: &[u8] = include_bytes!("../tests/data/ek-p256.der");
+        let (x, y) = ek_point();
+        let mut a = Attestor::new(Some(regs), None, None, Some(trust()));
+        a.request();
+        for m in tpm::encode_ek_chunks(&x, &y, cert).unwrap() {
+            a.on_endorsement(&m);
+        }
+        a.on_quote(&quote(&a, 7, pcrs_for(&regs, 0x33)));
+        a.on_message(&answer(&a, regs));
+        let secret = a.credential.unwrap();
+        a.on_endorsement(&tpm::encode_proof(&[0; 32]).unwrap());
+        assert_eq!(a.status, Status::Rejected);
+        // The right answer afterwards: still rejected (no retries).
+        a.on_endorsement(&tpm::encode_proof(&secret).unwrap());
+        assert_eq!(a.status, Status::Rejected);
+        // Nor does a second attestation, quote or EK change anything.
+        a.on_message(&answer(&a, regs));
+        assert!(a.on_quote(&quote(&a, 7, pcrs_for(&regs, 0x33))).is_none());
+        assert_eq!(a.status, Status::Rejected);
+
+        // Without --tpm-ca: a rejected attestation stays rejected too.
+        let other = expected_registers(b"k", b"r2", Verdict::Verified, &[1; 16]);
+        let mut b = Attestor::new(Some(regs), None, None, None);
+        b.request();
+        b.on_message(&answer(&b, other));
+        b.on_message(&answer(&b, regs));
+        assert!(!b.serving());
+    }
+
+    /// Security review 2026-10-16: only an EK certificate vouches for an
+    /// endorsement key, even from a trusted manufacturer CA.
+    #[test]
+    fn only_ek_certificates_are_accepted() {
+        let regs = expected_registers(b"k", b"r", Verdict::Verified, &[1; 16]);
+        let (x, y) = ek_point();
+        for (what, cert) in [
+            (
+                "no TCG EK usage",
+                &include_bytes!("../tests/data/ek-p256-no-eku.der")[..],
+            ),
+            (
+                "a CA certificate",
+                &include_bytes!("../tests/data/ek-p256-as-ca.der")[..],
+            ),
+        ] {
+            let c = Certificate::parse(cert).unwrap();
+            assert!(
+                trust().verify(&c).is_ok(),
+                "{what}: chains to the trusted root"
+            );
+            let mut a = Attestor::new(Some(regs), None, None, Some(trust()));
+            a.request();
+            for m in tpm::encode_ek_chunks(&x, &y, cert).unwrap() {
+                a.on_endorsement(&m);
+            }
+            assert!(matches!(a.ek, Some(Err(_))), "{what}: refused");
+            assert!(a.on_quote(&quote(&a, 7, pcrs_for(&regs, 0x33))).is_none());
+            a.on_message(&answer(&a, regs));
+            assert_eq!(a.status, Status::Rejected, "{what}");
+        }
     }
 }
