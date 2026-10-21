@@ -173,6 +173,7 @@ pub struct Accepted {
     serial: u64,
 }
 
+/// Audit a refused import (`cap-import-rejected` with `reason`) and return the message for the console.
 fn refused(subject: &str, reason: u64, msg: &'static str) -> &'static str {
     audit::record_fmt(EventKind::CapImportRejected, format_args!("{}", subject), reason);
     msg

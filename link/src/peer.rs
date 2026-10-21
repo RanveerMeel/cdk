@@ -98,6 +98,7 @@ pub fn valid_object_name(s: &str) -> bool {
 struct Reader<'a>(&'a [u8]);
 
 impl<'a> Reader<'a> {
+    /// The next `n` bytes, or `None` if fewer remain.
     fn take(&mut self, n: usize) -> Option<&'a [u8]> {
         if self.0.len() < n {
             return None;
@@ -106,15 +107,19 @@ impl<'a> Reader<'a> {
         self.0 = b;
         Some(a)
     }
+    /// One byte.
     fn u8(&mut self) -> Option<u8> {
         Some(self.take(1)?[0])
     }
+    /// A little-endian `u16`.
     fn u16(&mut self) -> Option<u16> {
         Some(u16::from_le_bytes(self.take(2)?.try_into().ok()?))
     }
+    /// A little-endian `u64`.
     fn u64(&mut self) -> Option<u64> {
         Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
     }
+    /// A length-prefixed UTF-8 name that `valid` accepts.
     fn name(&mut self, valid: fn(&str) -> bool) -> Option<String> {
         let n = self.u8()? as usize;
         let s = core::str::from_utf8(self.take(n)?).ok()?;
@@ -139,6 +144,7 @@ pub struct NodeCert {
 }
 
 impl NodeCert {
+    /// The fields the registry signs, in order (`CDK-NODE-CERT-v1` ...).
     fn signed_part(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(CERT_MAGIC.len() + 1 + self.name.len() + IDENTITY_LEN + 56);
         v.extend_from_slice(CERT_MAGIC);
@@ -159,6 +165,7 @@ impl NodeCert {
         Sha256::digest(self.signed_part()).into()
     }
 
+    /// The certificate's wire form: the signed part, then the signature.
     pub fn encode(&self) -> Vec<u8> {
         let mut v = self.signed_part();
         let mut sig = alloc::vec![0u8; SIG_LEN];
@@ -216,6 +223,7 @@ pub struct PortableCap {
 }
 
 impl PortableCap {
+    /// The fields the issuing node signs, in order, including the encoded certificate.
     fn signed_part(&self, cert: &[u8]) -> Vec<u8> {
         let mut v = Vec::with_capacity(PCAP_MAGIC.len() + 2 + cert.len() + 48);
         v.extend_from_slice(PCAP_MAGIC);
@@ -236,6 +244,7 @@ impl PortableCap {
         Sha256::digest(self.signed_part(&self.cert.encode())).into()
     }
 
+    /// The portable capability's wire form: the signed part, then the signature.
     pub fn encode(&self) -> Vec<u8> {
         let mut v = self.signed_part(&self.cert.encode());
         let mut sig = alloc::vec![0u8; SIG_LEN];
@@ -244,6 +253,7 @@ impl PortableCap {
         v
     }
 
+    /// Strict decoding (canonical: exactly one encoding per capability).
     pub fn decode(b: &[u8]) -> Option<PortableCap> {
         if b.len() > MAX_BLOB {
             return None;
@@ -372,12 +382,14 @@ impl BlobAssembler {
     }
 }
 
+/// `ImportReq` for the inbox file `name`.
 pub fn encode_import_request(name: &str) -> Vec<u8> {
     let mut m = alloc::vec![IMPORT_REQUEST, name.len() as u8];
     m.extend_from_slice(name.as_bytes());
     m
 }
 
+/// The file name of an `ImportReq`, if well formed.
 pub fn decode_import_request(b: &[u8]) -> Option<&str> {
     let r = b.strip_prefix(&[IMPORT_REQUEST])?;
     let (&n, rest) = r.split_first()?;
@@ -394,12 +406,14 @@ pub fn valid_file_name(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
 }
 
+/// `PeerStatus`: success or failure, with a short note (at most 200 bytes).
 pub fn encode_status(ok: bool, text: &str) -> Vec<u8> {
     let mut m = alloc::vec![PEER_STATUS, ok as u8];
     m.extend_from_slice(&text.as_bytes()[..text.len().min(200)]);
     m
 }
 
+/// `(ok, note)` of a `PeerStatus`.
 pub fn decode_status(b: &[u8]) -> Option<(bool, &str)> {
     let r = b.strip_prefix(&[PEER_STATUS])?;
     let (&ok, text) = r.split_first()?;
@@ -416,6 +430,7 @@ mod tests {
     use super::*;
     use crate::secure::hybrid::Keypair;
 
+    /// A node certificate for `node`'s key, signed by `registry`.
     fn cert(registry: &Keypair, node: &Keypair, name: &str) -> NodeCert {
         let mut c = NodeCert {
             name: name.into(),
@@ -430,6 +445,7 @@ mod tests {
         c
     }
 
+    /// A portable capability on `object` for `audience`, signed by `node`.
     fn pcap(node: &Keypair, cert: NodeCert, object: &str, audience: &str) -> PortableCap {
         let mut p = PortableCap {
             cert,
@@ -444,6 +460,7 @@ mod tests {
         p
     }
 
+    /// Certificates and portable capabilities round-trip, verify, and refuse every tampering, wrong audience and expiry.
     #[test]
     fn certificates_and_portable_capabilities() {
         let registry = Keypair::from_seeds(&[1; 32], &[2; 32]);
@@ -506,6 +523,7 @@ mod tests {
         assert!(PortableCap::decode(&longer).is_none());
     }
 
+    /// Name rules, blob reassembly (in order, bounded) and the small message codecs.
     #[test]
     fn names_and_blobs() {
         assert!(valid_node_name("hq-1") && !valid_node_name("HQ") && !valid_node_name(""));

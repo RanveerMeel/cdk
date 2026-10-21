@@ -247,6 +247,7 @@ pub struct Trust {
 }
 
 impl fmt::Display for Trust {
+    /// The rule as it is written in a policy file.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,

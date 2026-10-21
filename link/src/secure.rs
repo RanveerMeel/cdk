@@ -104,6 +104,7 @@ impl core::fmt::Debug for Identity {
 }
 
 impl core::fmt::Debug for Signature {
+    /// Shows only a prefix of the Ed25519 half: signatures are long and not secret, but logs need not carry them.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
             f,

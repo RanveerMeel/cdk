@@ -23,6 +23,7 @@ use rand_core::{OsRng, RngCore};
 /// Default certificate lifetime: 24 hours.
 pub const DEFAULT_VALIDITY_S: u64 = 24 * 3600;
 
+/// The gateway's clock in Unix seconds (0 if the clock is before 1970).
 pub fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -70,6 +71,7 @@ impl Registry {
         })
     }
 
+    /// The registry's public key, which nodes pin as `registry.pub`.
     pub fn public(&self) -> &Identity {
         self.key.public()
     }
@@ -144,12 +146,14 @@ impl CapDir {
 mod tests {
     use super::*;
 
+    /// Whether a fresh certificate expires one default lifetime from now.
     fn cert_expires_in_a_day(reg: &Registry) -> bool {
         let node = hybrid::Keypair::from_seeds(&[3; 32], &[4; 32]);
         let c = reg.certify(node.public(), [0; 32]);
         c.not_after.abs_diff(now() + DEFAULT_VALIDITY_S) < 5
     }
 
+    /// Certificates name the session's key; exports round-trip through the outbox and inbox; bad file names are refused.
     #[test]
     fn certifies_the_session_key_and_carries_exports() {
         let dir = std::env::temp_dir().join(format!("cdk-registry-{}", std::process::id()));

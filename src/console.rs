@@ -1566,6 +1566,7 @@ fn cmd_policy(sub: &str, a: &str, rest: &str, kernel: &mut Kernel) {
     }
 }
 
+/// `peer`: the pinned registry, this node's certificate, and the policy's trust rules (roadmap 3.5).
 fn cmd_peer() {
     match crate::peer::registry() {
         Some(r) => {
@@ -1593,6 +1594,7 @@ fn cmd_peer() {
     }
 }
 
+/// `cap-export <pid> <h> <node> <file> [perms]`: delegate an agent's handle to a peer node through the gateway's outbox.
 fn cmd_cap_export(pid: &str, handle: &str, rest: &str, kernel: &Kernel) {
     let mut w = rest.split_whitespace();
     let (Some(pid), Some(h), Some(node), Some(file)) = (
@@ -1638,6 +1640,7 @@ fn cmd_cap_export(pid: &str, handle: &str, rest: &str, kernel: &Kernel) {
     }
 }
 
+/// `cap-import <file> <pid>`: fetch a peer's capability from the gateway's inbox, verify it, and grant `pid` a handle on the proxy through policy review.
 fn cmd_cap_import(file: &str, pid: &str, kernel: &mut Kernel, mem_graph: &mut MemoryGraph) {
     let Some(pid) = parse_u32(pid.trim()) else {
         crate::println!("Usage: cap-import <file> <pid>");
