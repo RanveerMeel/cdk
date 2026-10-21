@@ -1,14 +1,17 @@
 //! Registry authority for distributed capabilities (roadmap 3.5).
 //!
-//! With `--registry-key FILE --node NAME`, the gateway certifies the CDK it
-//! serves: once that CDK's attestation is accepted, it signs a
-//! [`NodeCert`] binding NAME to the issuer key CDK used in this session's
-//! handshake, and sends it to CDK. Certifying needs attestation
+//! With `--registry-key FILE --registry-auth FILE`, the gateway certifies
+//! the CDK it serves: once that CDK's attestation is accepted, it signs a
+//! [`NodeCert`] binding its node name to the issuer key CDK used in this
+//! session's handshake, and sends it to CDK. Certifying needs attestation
 //! (`--expect`, `--tpm` or `--tpm-ca`), so only a measured, verified boot
-//! gets a name. The registry key is a hybrid key made with `cdk-sign init
-//! --key FILE --pub-out FILE`; its public half goes into every node's
-//! ramdisk as `registry.pub`. In production the registry is a separate
-//! service holding its key in an HSM; here each gateway may hold it.
+//! gets a name.
+//!
+//! The gateway holds only its own certifying key and a [`NodeAuthority`]
+//! for **one node name**, signed by the registry root (`cdk-sign
+//! node-authority NAME --root ROOT-KEY`). The root key (`cdk-sign init`)
+//! stays offline; its public half is every node's `registry.pub`. A
+//! compromised gateway can therefore certify only its own node.
 //!
 //! The gateway also carries portable capabilities and peer messages
 //! between nodes: CDK's exports go to `--cap-dir DIR/outbox/<file>.pcap`,
@@ -37,48 +40,72 @@ pub fn now() -> u64 {
 
 pub struct Registry {
     key: hybrid::Keypair,
+    authority: peer::NodeAuthority,
     pub node: String,
-    /// Certificate lifetime in seconds.
+    /// Certificate lifetime in seconds (capped by the authority's).
     pub validity_s: u64,
 }
 
+/// Load a 64-byte hybrid seed file (0600).
+pub fn load_key(path: &Path) -> Result<hybrid::Keypair, String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if meta.mode() & 0o077 != 0 {
+        return Err(format!(
+            "{} must not be readable by group or others (chmod 600)",
+            path.display()
+        ));
+    }
+    let seeds = zeroize::Zeroizing::new(std::fs::read(path).map_err(|e| e.to_string())?);
+    if seeds.len() != 64 {
+        return Err(format!("{} is not a 64-byte hybrid key", path.display()));
+    }
+    let (mut ed, mut ml) = ([0u8; 32], [0u8; 32]);
+    ed.copy_from_slice(&seeds[..32]);
+    ml.copy_from_slice(&seeds[32..]);
+    let key = hybrid::Keypair::from_seeds(&ed, &ml);
+    zeroize::Zeroize::zeroize(&mut ed);
+    zeroize::Zeroize::zeroize(&mut ml);
+    Ok(key)
+}
+
 impl Registry {
-    /// Load the 64-byte hybrid seed file made by `cdk-sign init`.
-    pub fn load(path: &Path, node: &str) -> Result<Registry, String> {
-        use std::os::unix::fs::MetadataExt;
-        if !peer::valid_node_name(node) {
-            return Err("--node: a-z 0-9 - _ (at most 16)".into());
+    /// Load this gateway's certifying key and its node authority; `node`,
+    /// if given, must be the authority's name.
+    pub fn load(key: &Path, authority: &Path, node: Option<&str>) -> Result<Registry, String> {
+        let key = load_key(key)?;
+        let auth = std::fs::read(authority).map_err(|e| format!("{}: {e}", authority.display()))?;
+        let authority = peer::NodeAuthority::decode(&auth).ok_or_else(|| {
+            format!(
+                "{} is not a node authority (cdk-sign node-authority)",
+                authority.display()
+            )
+        })?;
+        if &authority.key != key.public() {
+            return Err("the node authority is for another key than --registry-key".into());
         }
-        let meta = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        if meta.mode() & 0o077 != 0 {
-            return Err(format!(
-                "{} must not be readable by group or others (chmod 600)",
-                path.display()
-            ));
+        if let Some(n) = node {
+            if n != authority.node {
+                return Err(format!(
+                    "--node {n}, but the authority is for node '{}'",
+                    authority.node
+                ));
+            }
         }
-        let seeds = zeroize::Zeroizing::new(std::fs::read(path).map_err(|e| e.to_string())?);
-        if seeds.len() != 64 {
-            return Err(format!(
-                "{} is not a 64-byte hybrid key (cdk-sign init)",
-                path.display()
-            ));
+        if authority.not_after <= now() {
+            return Err("the node authority has expired".into());
         }
-        let (mut ed, mut ml) = ([0u8; 32], [0u8; 32]);
-        ed.copy_from_slice(&seeds[..32]);
-        ml.copy_from_slice(&seeds[32..]);
-        let key = hybrid::Keypair::from_seeds(&ed, &ml);
-        zeroize::Zeroize::zeroize(&mut ed);
-        zeroize::Zeroize::zeroize(&mut ml);
         Ok(Registry {
+            node: authority.node.clone(),
             key,
-            node: node.to_string(),
+            authority,
             validity_s: DEFAULT_VALIDITY_S,
         })
     }
 
-    /// The registry's public key, which nodes pin as `registry.pub`.
-    pub fn public(&self) -> &Identity {
-        self.key.public()
+    /// The id of the registry root this gateway's authority chains to.
+    pub fn root_id(&self) -> [u8; 16] {
+        self.authority.root
     }
 
     /// Certify `issuer` (the key CDK proved in this session's handshake)
@@ -87,10 +114,11 @@ impl Registry {
         let mut cert = NodeCert {
             name: self.node.clone(),
             issuer: issuer.clone(),
-            registry: self.key.public().id(),
+            registry: self.authority.root,
             serial: OsRng.next_u64(),
             attested,
-            not_after: now() + self.validity_s,
+            not_after: (now() + self.validity_s).min(self.authority.not_after),
+            authority: self.authority.clone(),
             signature: Signature::from_slice(&[0; SIG_LEN]).expect("length"),
         };
         cert.signature = self.key.sign_with(&cert.digest(), peer::NODE_CONTEXT);
@@ -233,6 +261,32 @@ impl CapDir {
 mod tests {
     use super::*;
 
+    /// Write `bytes` to `path` as an owner-only file.
+    fn write_private(path: &Path, bytes: &[u8]) {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
+    }
+
+    /// A registry for `node` whose gateway key is authorized by `root`.
+    fn registry(root: &hybrid::Keypair, node: &str, seed: u8) -> Registry {
+        let key = hybrid::Keypair::from_seeds(&[seed; 32], &[seed + 1; 32]);
+        let authority = peer::NodeAuthority::issue(root, node, key.public().clone(), now() + 3600);
+        Registry {
+            node: node.into(),
+            key,
+            authority,
+            validity_s: DEFAULT_VALIDITY_S,
+        }
+    }
+
     /// Whether a fresh certificate expires one default lifetime from now.
     fn cert_expires_in_a_day(reg: &Registry) -> bool {
         let node = hybrid::Keypair::from_seeds(&[3; 32], &[4; 32]);
@@ -246,24 +300,29 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cdk-registry-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let keyf = dir.join("registry.key");
-        {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&keyf)
-                .unwrap()
-                .write_all(&[7u8; 64])
-                .unwrap();
-        }
-        assert!(Registry::load(&keyf, "Bad Name").is_err());
-        let reg = Registry::load(&keyf, "hq").unwrap();
+        let root = hybrid::Keypair::from_seeds(&[9; 32], &[9; 32]);
+        let keyf = dir.join("node-hq.key");
+        let authf = dir.join("node-hq.auth");
+        write_private(&keyf, &[7u8; 64]);
+        let gw = load_key(&keyf).unwrap();
+        let auth = peer::NodeAuthority::issue(&root, "hq", gw.public().clone(), now() + 7 * 86400);
+        std::fs::write(&authf, auth.encode()).unwrap();
+        assert!(Registry::load(&keyf, &authf, Some("branch")).is_err());
+        let reg = Registry::load(&keyf, &authf, None).unwrap();
+        assert_eq!(reg.node, "hq");
+        assert_eq!(reg.root_id(), root.public().id());
+        // An authority for another key is refused.
+        let other = dir.join("other.auth");
+        let wrong = hybrid::Keypair::from_seeds(&[8; 32], &[8; 32]);
+        std::fs::write(
+            &other,
+            peer::NodeAuthority::issue(&root, "hq", wrong.public().clone(), now() + 3600).encode(),
+        )
+        .unwrap();
+        assert!(Registry::load(&keyf, &other, Some("hq")).is_err());
         let node = hybrid::Keypair::from_seeds(&[1; 32], &[2; 32]);
         let cert = reg.certify(node.public(), [5; 32]);
-        assert!(cert.verify(reg.public()));
+        assert!(cert.verify(root.public()));
         assert_eq!(&cert.issuer, node.public());
 
         // A portable capability signed by that node goes through the
@@ -291,10 +350,15 @@ mod tests {
         assert_eq!(
             PortableCap::decode(&back[8..])
                 .unwrap()
-                .verify(reg.public(), "branch", at),
+                .verify(root.public(), "branch", at),
             Ok(())
         );
         assert!(cert_expires_in_a_day(&reg));
+        // Certificates never outlive the authority that signed them.
+        let short = registry(&root, "hq", 30);
+        let c = short.certify(node.public(), [0; 32]);
+        assert_eq!(c.not_after, short.authority.not_after);
+        assert!(c.verify(root.public()));
         assert!(caps.read_import("../registry").is_err());
         let mut bad = payload.clone();
         bad[1] = b'/';
@@ -309,21 +373,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cdk-capdir-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let caps = CapDir(dir.clone());
-        let reg = hybrid::Keypair::from_seeds(&[1; 32], &[2; 32]);
+        let root = hybrid::Keypair::from_seeds(&[1; 32], &[2; 32]);
         let hq = hybrid::Keypair::from_seeds(&[3; 32], &[4; 32]);
         let branch = hybrid::Keypair::from_seeds(&[5; 32], &[6; 32]);
         let cert = |k: &hybrid::Keypair, name: &str| {
-            let mut c = NodeCert {
-                name: name.into(),
-                issuer: k.public().clone(),
-                registry: reg.public().id(),
-                serial: 1,
-                attested: [0; 32],
-                not_after: now() + 60,
-                signature: Signature::from_slice(&[0; SIG_LEN]).unwrap(),
-            };
-            c.signature = reg.sign_with(&c.digest(), peer::NODE_CONTEXT);
-            c
+            registry(&root, name, 20).certify(k.public(), [0; 32])
         };
         let mut grant = PortableCap {
             cert: cert(&hq, "hq"),
@@ -358,7 +412,7 @@ mod tests {
         assert_eq!(&next[1..1 + n], name.as_bytes());
         let at = u64::from_le_bytes(next[1 + n..9 + n].try_into().unwrap());
         let back = peer::PeerMessage::decode(&next[9 + n..]).unwrap();
-        assert_eq!(back.verify(reg.public(), "hq", at), Ok(()));
+        assert_eq!(back.verify(root.public(), "hq", at), Ok(()));
         caps.file_inbound(&name, true).unwrap();
         assert!(caps.next_inbound().is_none(), "filed under done/");
         assert!(dir.join(format!("inbox/done/{name}.pmsg")).exists());

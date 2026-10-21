@@ -6,9 +6,10 @@
 //! * After the gateway accepts this node's attestation it sends a
 //!   [`NodeCert`] for this boot's issuer key ([`on_node_cert`]); it must name
 //!   *our* key and verify against the pinned registry.
-//! * `cap-export` ([`export`]) turns an agent's handle into a
-//!   [`PortableCap`] for one named peer node, signed by our issuer; the
-//!   gateway writes it to its outbox.
+//! * `cap-export` ([`prepare_export`], reviewed like a grant, then
+//!   [`sign_export`]) turns an agent's handle into a [`PortableCap`] for one
+//!   named peer node, signed by our issuer; the gateway writes it to its
+//!   outbox.
 //! * `cap-import` ([`check_import`]) verifies a peer's portable capability
 //!   and the policy's `trust` rules; the console then grants the agent a
 //!   handle on the local proxy object `peer:<node>/<object>` through the
@@ -120,11 +121,12 @@ pub fn on_node_cert(bytes: &[u8]) -> Result<alloc::string::String, &'static str>
     Ok(name)
 }
 
-/// Delegate `pid`'s handle `handle` to node `audience`, with `perms` (a
-/// subset of the handle's; `None` = all of them). `object_name` maps the
-/// handle's object id to its name; the caller holds the kernel (the console
-/// does, so this must not lock it).
-pub fn export(
+/// Prepare (validate, not yet sign) the delegation of `pid`'s handle
+/// `handle` to node `audience`, with `perms` (a subset of the handle's;
+/// `None` = all of them). `object_name` maps the handle's object id to its
+/// name; the caller holds the kernel (the console does, so this must not
+/// lock it). The caller reviews it, then calls [`sign_export`].
+pub fn prepare_export(
     pid: u32,
     handle: u64,
     audience: &str,
@@ -134,7 +136,7 @@ pub fn export(
     let cert = MY_CERT
         .lock()
         .clone()
-        .ok_or("this node has no certificate (gateway with --registry-key, then link-secure)")?;
+        .ok_or("this node has no certificate (gateway with --registry-key and --registry-auth, then link-secure)")?;
     if !peer::valid_node_name(audience) {
         return Err("node names: a-z 0-9 - _ (at most 16)");
     }
@@ -162,15 +164,20 @@ pub fn export(
         use rand_core::RngCore;
         (crate::rng::KernelRng.next_u64() & !0xFFFF) | (EXPORTS.fetch_add(1, Ordering::Relaxed) & 0xFFFF)
     };
-    let mut pcap = PortableCap {
+    Ok(PortableCap {
         cert: cert.clone(),
-        object: object.clone(),
+        object,
         perms: mask,
         audience: audience.into(),
         serial,
         not_after: cert.not_after,
         signature: Signature::from_slice(&[0; cdk_link::secure::SIG_LEN]).expect("length"),
-    };
+    })
+}
+
+/// Sign a reviewed delegation with this boot's issuer (audit
+/// `cap-exported`).
+pub fn sign_export(mut pcap: PortableCap, pid: u32) -> PortableCap {
     let digest = pcap.digest();
     let sig = issuer::kernel().sign(SigDomain::PortableCap, &digest);
     pcap.signature = Signature {
@@ -179,10 +186,10 @@ pub fn export(
     };
     audit::record_fmt(
         EventKind::CapExported,
-        format_args!("{}>{}:pid-{}", object, audience, pid),
-        mask,
+        format_args!("{}>{}:pid-{}", pcap.object, pcap.audience, pid),
+        pcap.perms,
     );
-    Ok(pcap)
+    pcap
 }
 
 /// A verified import, before the grant.
@@ -481,7 +488,7 @@ pub fn sync(kernel: &mut crate::kernel::Kernel) -> Result<SyncReport, alloc::str
     let me = MY_CERT
         .lock()
         .clone()
-        .ok_or("this node has no certificate (gateway with --registry-key, then link-secure)")?;
+        .ok_or("this node has no certificate (gateway with --registry-key and --registry-auth, then link-secure)")?;
     let mut report = SyncReport::default();
 
     // Outbound: each proxy's queue, under the delegation behind it.
@@ -490,7 +497,7 @@ pub fn sync(kernel: &mut crate::kernel::Kernel) -> Result<SyncReport, alloc::str
         let Some(grant) = PortableCap::decode(grant) else {
             continue;
         };
-        let Ok(id) = kernel.resolve_object_ref(proxy) else {
+        let Ok(id) = kernel.find_by_name(proxy) else {
             continue;
         };
         while let Ok(Some(msg)) = kernel.receive_message_direct(&id) {
@@ -607,9 +614,10 @@ fn deliver(
             return Err(refused_msg(&subject, reject::REPLAYED, "replay list full: no more messages this boot"));
         }
     }
-    let id = kernel
-        .resolve_object_ref(&m.grant.object)
-        .map_err(|_| refused_msg(&subject, reject::NO_OBJECT, "no object of that name on this node"))?;
+    // By exact name only: ids change every boot, intents are free text.
+    let id = kernel.find_by_name(&m.grant.object).map_err(|_| {
+        refused_msg(&subject, reject::NO_OBJECT, "no single object of that name on this node")
+    })?;
     let msg = crate::message::Message::new(
         &label,
         &id,
@@ -737,6 +745,7 @@ mod tests {
             serial: 1,
             attested: [0; 32],
             not_after: 10,
+            authority: cdk_link::peer::NodeAuthority::issue(&k, "hq", k.public().clone(), 10),
             signature: zero.clone(),
         };
         let send = 1u64 << crate::capability::Permission::SendMessage.tag();

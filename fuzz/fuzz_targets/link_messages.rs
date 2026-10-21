@@ -1,5 +1,5 @@
 //! Tool, model, approval and peer (roadmap 3.5) messages inside the sealed
-//! channel, and portable capabilities / node certificates from a peer. Anything
+//! channel, and portable capabilities / node certificates and authorities from a peer. Anything
 //! that decodes must re-encode to the same bytes (no two encodings of one
 //! message), and reassembly must never produce more than it was given.
 #![no_main]
@@ -9,8 +9,13 @@ use libfuzzer_sys::fuzz_target;
 fuzz_target!(|data: &[u8]| {
     // Peer capabilities come from an untrusted courier: decoding is strict
     // (canonical), and verification never panics.
+    if let Some(a) = peer::NodeAuthority::decode(data) {
+        assert_eq!(a.encode(), data);
+        let _ = a.verify(&a.key);
+    }
     if let Some(c) = peer::NodeCert::decode(data) {
         assert_eq!(c.encode(), data);
+        let _ = c.verify(&c.authority.key);
     }
     if let Some(p) = peer::PortableCap::decode(data) {
         assert_eq!(p.encode(), data);

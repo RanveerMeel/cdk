@@ -75,6 +75,7 @@ host test suites also run under AddressSanitizer
 | Diff security review (2026-10-16; TPM endorsement and UEFI Secure Boot — `gateway/src/ekcert.rs`, `credential.rs`, `attestation.rs`, `link/src/tpm.rs`, the kernel's TPM commands, the loader's kernel pin, the TPM and Secure Boot scripts) | **Medium:** within one session the gateway accepted any number of endorsement proofs and compared the secret with `==`, so a rejected session could later become trusted (and the secret could in principle be guessed byte by byte from timing). **Medium:** the EK certificate's purpose was not enforced — a CA certificate, or a non-EK certificate from a trusted vendor CA, naming a key whose private half lives outside a TPM, would have been accepted as an EK certificate. **Low:** a failed send leaked the TPM transient EK object (later `CreatePrimary` could fail). **Low:** Secure Boot with an unverified development kernel ended the chain at the kernel without saying so. **Info:** the loader still reads the unsigned `boot.json` (display and logging settings only; the kernel's own boot config is in the pinned kernel). | Fixed: one proof per challenge, constant-time comparison, and every attestation decision is final for its session (a second attestation, quote or EK is ignored); EK certificates must carry the TCG EK usage (2.23.133.8.1) and not be CAs; the EK is flushed on every path; `run_qemu.sh` warns. Regression tests with certificates that chain correctly but are not EK certificates; the tests fail with the old code. `boot.json`: documented |
 | The nine 4.3 fuzz targets, 10 minutes each after the fixes (about 296 million executions: `spool_decision` 139 M, `initrd` 82 M, `policy` 36 M, `link_messages` 21 M, `frame_decoder` 7.9 M, `sealed_channel` 6.4 M, `elf` 1.9 M, `hybrid_verify` 1.5 M, `handshake` 0.7 M) | No crashes, sanitizer reports, or property violations | — |
 | `chaos` in QEMU (20,000 syscalls; with h0 granted and two messages queued) | Every hostile call rejected: bad buffers `-3`, escalating derives `-2`, unknown handles and syscalls `-1`, empty queue `-5`; valid calls succeeded; read-only canary intact; the kernel kept running programs; 940 audit records with 8 signed checkpoints verified | — |
+| Diff security review (2026-10-21; distributed capabilities stages 1–2 — `link/src/peer.rs`, `src/peer.rs`, the `cap-*`/`peer-sync` console commands, `gateway/src/registry.rs`) | **High:** every certifying gateway held the registry root key, so one compromised gateway could certify itself as *any* node name and receive or send under other nodes' delegations. **Medium:** inbound delivery resolved the delegation's object name by id, then kind, then intent, so a sender could aim a message at a different object whose id or intent matched the name. **Medium:** `cap-export` signed a delegation without the policy review or the operator approval (two-person control in signed mode) that local grants get. **Low:** the docs said a courier "can only add revocations", but across reboots the kernel relies on the gateway's file. **Info:** per-boot replay protection and the gateway as time source (already documented). | Fixed: the root signs a per-gateway `NodeAuthority` scoped to one node name (`cdk-sign node-authority`), carried and checked in every certificate, which cannot outlive it; delivery matches object names only, and only when exactly one object has that name; `cap-export` shows a delegation review and requires confirmation or a signed approval before signing. Regression tests: a certificate for another node from a valid authority, a certificate outliving its authority, a foreign root, name/id/intent confusion. Revocation persistence: documented as a limitation |
 | AddressSanitizer: kernel host tests (279), link (21 + 3 RFC), gateway (8) | No reports | — |
 
 ## 5. Areas that most need an expert
@@ -114,11 +115,14 @@ host test suites also run under AddressSanitizer
   is detected (PCR 4) but not prevented. Secure Boot signatures are RSA
   (classical, a UEFI constraint); one key serves as PK, KEK and db in the
   QEMU setup.
-- Distributed capabilities (3.5): each certifying gateway holds the
-  registry key; time comes from the gateway's clock; replay protection for
-  peer messages is per boot of the receiving node (a courier could
-  re-deliver an old message after it reboots, until expiry); revocation
-  is enforced by the issuing node for messages, not by importers.
+- Distributed capabilities (3.5): each certifying gateway holds a key the
+  registry root authorized for one node name (no authority revocation list
+  yet; authorities expire); time comes from the gateway's clock; replay
+  protection for peer messages is per boot of the receiving node (a courier
+  could re-deliver an old message after it reboots, until expiry);
+  revocation is enforced by the issuing node for messages, not by
+  importers, and survives the issuing node's reboots only through its
+  gateway's `revoked` file (no persistent sealed storage in the kernel yet).
 - Under Secure Boot the loader still reads `boot.json` from the boot
   partition unsigned; it sets display and logging options only (the
   kernel's boot configuration is compiled into the pinned kernel).

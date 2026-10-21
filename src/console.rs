@@ -1655,7 +1655,7 @@ fn cmd_cap_export(pid: &str, handle: &str, rest: &str, kernel: &Kernel) {
             }
         },
     };
-    let pcap = match crate::peer::export(pid, h, node, perms, |id| {
+    let draft = match crate::peer::prepare_export(pid, h, node, perms, |id| {
         kernel
             .for_each_object_find(id)
             .map(|o| alloc::string::String::from(o.kind.as_str()))
@@ -1666,6 +1666,34 @@ fn cmd_cap_export(pid: &str, handle: &str, rest: &str, kernel: &Kernel) {
             return;
         }
     };
+    // Delegating to another node widens reach like a grant does: it is
+    // reviewed the same way, with operator signatures in signed mode.
+    let labels = {
+        let policy = crate::policy::policy();
+        let id = kernel.find_by_name(&draft.object).unwrap_or_default();
+        policy.labels_of(&id, &draft.object, 0)
+    };
+    let mut text = alloc::string::String::new();
+    let _ = core::fmt::write(
+        &mut text,
+        format_args!(
+            "+ node '{}' gains {} on '{}' (pid {} h{}){}{}, until its certificate expires\n",
+            draft.audience,
+            crate::agent::permission_names(draft.perms),
+            draft.object,
+            pid,
+            h,
+            if labels.is_empty() { "" } else { " labels " },
+            labels.iter().map(|l| l.as_str()).collect::<alloc::vec::Vec<_>>().join(",")
+        ),
+    );
+    crate::println!("=== DELEGATION REVIEW ===");
+    crate::print!("  {}", text);
+    if !crate::policy::confirm("Delegate to that node?", &text) {
+        crate::println!("cap-export: not approved — nothing exported");
+        return;
+    }
+    let pcap = crate::peer::sign_export(draft, pid);
     crate::println!(
         "cap-export: '{}' [{}] for node '{}', signed by this node ('{}'), serial {:016x}",
         pcap.object,
@@ -1708,7 +1736,7 @@ fn cmd_cap_import(file: &str, pid: &str, kernel: &mut Kernel, mem_graph: &mut Me
         a.valid_s
     );
     // The local proxy for the peer's object.
-    if kernel.resolve_object_ref(&a.proxy).is_err() {
+    if kernel.find_by_name(&a.proxy).is_err() {
         let obj = KernelObject::new_compute(&a.proxy, "peer");
         let cap = kernel.register_object(obj);
         mem_graph.register_object(cap.object_id.as_str(), 0);

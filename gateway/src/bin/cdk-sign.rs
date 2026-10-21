@@ -11,6 +11,8 @@
 //! cdk-sign verify <ramdisk-stage-dir> [--pub FILE] check a staged ramdisk
 //! cdk-sign sign-file <file> [--key FILE]           write <file>.sig (release files)
 //! cdk-sign verify-file <file> [--pub FILE]         check <file> against <file>.sig
+//! cdk-sign node-authority <node> --root FILE [--key-out FILE] [--out FILE] [--days N]
+//!                                                  let one gateway certify node <node>
 //! ```
 //!
 //! Defaults: `target/release-signing.key`, `target/release.pub` (compiled
@@ -32,7 +34,7 @@ fn die(msg: &str) -> ! {
 }
 
 fn usage() -> ! {
-    die("usage: cdk-sign init | manifest <stage-dir> | measure <kernel-elf> <ramdisk.tar> | verify <stage-dir>")
+    die("usage: cdk-sign init | manifest <stage-dir> | measure <kernel-elf> <ramdisk.tar> | verify <stage-dir> | node-authority <node> --root FILE")
 }
 
 fn load_key(path: &Path) -> hybrid::Keypair {
@@ -71,19 +73,7 @@ fn init(key: &Path, pub_out: &Path) {
         );
         return;
     }
-    if let Some(dir) = key.parent() {
-        std::fs::create_dir_all(dir).unwrap_or_else(|e| die(&e.to_string()));
-    }
-    let mut seeds = [0u8; 64];
-    OsRng.fill_bytes(&mut seeds);
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(key)
-        .and_then(|mut f| f.write_all(&seeds))
-        .unwrap_or_else(|e| die(&format!("{}: {e}", key.display())));
-    seeds.fill(0);
+    create_key(key);
     let kp = load_key(key);
     write_pub(&kp, pub_out);
     println!(
@@ -94,6 +84,56 @@ fn init(key: &Path, pub_out: &Path) {
     println!(
         "public key {} (compiled into the kernel; rebuild it)",
         pub_out.display()
+    );
+}
+
+/// Create `path` (0600) holding a fresh 64-byte hybrid key.
+fn create_key(path: &Path) {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).unwrap_or_else(|e| die(&e.to_string()));
+    }
+    let mut seeds = [0u8; 64];
+    OsRng.fill_bytes(&mut seeds);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .and_then(|mut f| f.write_all(&seeds))
+        .unwrap_or_else(|e| die(&format!("{}: {e}", path.display())));
+    seeds.fill(0);
+}
+
+/// Sign, with the registry `root` key, an authority for the gateway key
+/// in `key_out` (created if missing) to certify node `node` only.
+fn node_authority(node: &str, root: &Path, key_out: &Path, out: &Path, days: u64) {
+    if !cdk_link::peer::valid_node_name(node) {
+        die(&format!(
+            "'{node}' is not a node name (a-z, 0-9, '-', up to 16)"
+        ));
+    }
+    let root = load_key(root);
+    let created = !key_out.exists();
+    if created {
+        create_key(key_out);
+    }
+    let gateway = load_key(key_out);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let auth = cdk_link::peer::NodeAuthority::issue(
+        &root,
+        node,
+        gateway.public().clone(),
+        now + days.saturating_mul(86400),
+    );
+    std::fs::write(out, auth.encode()).unwrap_or_else(|e| die(&e.to_string()));
+    println!(
+        "authority {} for node '{node}': gateway key {} ({}), root {}, {days} days",
+        out.display(),
+        key_out.display(),
+        if created { "created" } else { "existing" },
+        attest::hex(&root.public().id()),
     );
 }
 
@@ -293,6 +333,21 @@ fn main() {
             &opt("--out", "target/boot.measurements"),
             args.iter().any(|a| a == "--loader"),
         ),
+        Some("node-authority") => {
+            let node = args.get(1).unwrap_or_else(|| usage());
+            let days = args
+                .iter()
+                .position(|a| a == "--days")
+                .and_then(|i| args.get(i + 1))
+                .map_or(365, |d| d.parse().unwrap_or_else(|_| usage()));
+            node_authority(
+                node,
+                &opt("--root", "target/registry.key"),
+                &opt("--key-out", &format!("target/node-{node}.key")),
+                &opt("--out", &format!("target/node-{node}.auth")),
+                days,
+            )
+        }
         _ => usage(),
     }
 }
