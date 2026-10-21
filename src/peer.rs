@@ -32,8 +32,11 @@ use crate::issuer::{self, SigDomain};
 pub const REGISTRY_FILE: &str = "registry.pub";
 
 static MY_CERT: Mutex<Option<NodeCert>> = Mutex::new(None);
+/// Imports one boot can record; more are refused (see [`replay_check`]).
+const REPLAY_CAPACITY: usize = 64;
 /// `(issuer id, serial)` of every portable capability imported this boot.
-static IMPORTED: Mutex<heapless::Vec<([u8; 16], u64), 64>> = Mutex::new(heapless::Vec::new());
+static IMPORTED: Mutex<heapless::Vec<([u8; 16], u64), REPLAY_CAPACITY>> =
+    Mutex::new(heapless::Vec::new());
 static EXPORTS: AtomicU64 = AtomicU64::new(0);
 
 /// Why an import was refused (audit `cap-import-rejected` detail).
@@ -194,42 +197,26 @@ pub fn check_import(delivered: &[u8]) -> Result<Accepted, &'static str> {
         .ok_or_else(|| refused(&subject, reject::NO_REGISTRY, "no registry key pinned in the ramdisk"))?;
     let me = node_name()
         .ok_or_else(|| refused(&subject, reject::NOT_FOR_US, "this node has no certificate yet"))?;
-    issuer::crypto_stack::run(|| pcap.verify(&registry, &me, now)).map_err(|e| {
-        let reason = if e.contains("addressed") || e.contains("this node") {
-            reject::NOT_FOR_US
-        } else if e.contains("expired") || e.contains("outlives") {
-            reject::EXPIRED
-        } else {
-            reject::BAD_SIGNATURE
-        };
-        refused(&subject, reason, e)
-    })?;
+    issuer::crypto_stack::run(|| pcap.verify(&registry, &me, now))
+        .map_err(|e| refused(&subject, verify_reason(e), e))?;
     let issuer_id = pcap.cert.issuer.id();
-    if IMPORTED
-        .lock()
-        .iter()
-        .any(|(i, s)| *i == issuer_id && *s == pcap.serial)
-    {
-        return Err(refused(&subject, reject::REPLAYED, "already imported"));
-    }
+    replay_check(&IMPORTED.lock(), issuer_id, pcap.serial)
+        .map_err(|e| refused(&subject, reject::REPLAYED, e))?;
     let trusted = crate::policy::policy().trusted(&pcap.cert.name, &pcap.object);
-    let effect = pcap.perms & trusted & !crate::policy::APPROVAL;
-    if effect == 0 {
-        return Err(refused(
+    let mask = grant_mask(pcap.perms, trusted).ok_or_else(|| {
+        refused(
             &subject,
             reject::NOT_TRUSTED,
             "policy does not trust that node for that object (trust <node> <object> <perms>)",
-        ));
-    }
-    // The gate applies if the peer's handle had it or our policy asks.
-    let gate = (pcap.perms | trusted) & crate::policy::APPROVAL;
-    let mut proxy: heapless::String<32> = heapless::String::new();
-    let _ = core::fmt::write(&mut proxy, format_args!("{}{}/{}", crate::policy::PEER_PREFIX, pcap.cert.name, pcap.object));
+        )
+    })?;
+    let proxy = proxy_name(&pcap.cert.name, &pcap.object)
+        .ok_or_else(|| refused(&subject, reject::MALFORMED, "proxy name too long"))?;
     Ok(Accepted {
         node: pcap.cert.name.clone(),
         object: pcap.object.clone(),
         proxy,
-        mask: effect | gate,
+        mask,
         valid_s: pcap.not_after.saturating_sub(now),
         issuer: issuer_id,
         serial: pcap.serial,
@@ -237,13 +224,52 @@ pub fn check_import(delivered: &[u8]) -> Result<Accepted, &'static str> {
 }
 
 /// Record a granted import so the same token cannot be used again.
+/// `check_import` refuses imports once the list is full, so the push
+/// cannot fail; nothing is ever evicted (that would reopen replay).
 pub fn mark_imported(a: &Accepted) {
-    let mut seen = IMPORTED.lock();
-    if seen.is_full() {
-        seen.remove(0);
+    if IMPORTED.lock().push((a.issuer, a.serial)).is_err() {
+        crate::println!("peer: replay list full; import not recorded");
     }
-    let _ = seen.push((a.issuer, a.serial));
     audit::record_fmt(EventKind::CapImported, format_args!("{}", a.proxy), a.mask);
+}
+
+/// The reject code for an error from [`PortableCap::verify`].
+fn verify_reason(e: &str) -> u64 {
+    if e.contains("addressed") || e.contains("this node") {
+        reject::NOT_FOR_US
+    } else if e.contains("expired") || e.contains("outlives") {
+        reject::EXPIRED
+    } else {
+        reject::BAD_SIGNATURE
+    }
+}
+
+/// Refuse a capability imported before this boot, and fail closed once the
+/// replay list is full (at most its capacity of imports per boot).
+fn replay_check(seen: &[([u8; 16], u64)], issuer: [u8; 16], serial: u64) -> Result<(), &'static str> {
+    if seen.iter().any(|(i, s)| *i == issuer && *s == serial) {
+        return Err("already imported");
+    }
+    if seen.len() >= REPLAY_CAPACITY {
+        return Err("replay list full: no more imports this boot");
+    }
+    Ok(())
+}
+
+/// What to grant for a peer's `offered` permissions and the policy's
+/// `trusted` ones: their intersection, gated if either side asks for
+/// approval; `None` if nothing effective remains.
+fn grant_mask(offered: u64, trusted: u64) -> Option<u64> {
+    let effect = offered & trusted & !crate::policy::APPROVAL;
+    let gate = (offered | trusted) & crate::policy::APPROVAL;
+    (effect != 0).then_some(effect | gate)
+}
+
+/// `peer:<node>/<object>`, or `None` if it does not fit an object kind.
+fn proxy_name(node: &str, object: &str) -> Option<heapless::String<32>> {
+    let mut proxy = heapless::String::new();
+    core::fmt::write(&mut proxy, format_args!("{}{}/{}", crate::policy::PEER_PREFIX, node, object)).ok()?;
+    Some(proxy)
 }
 
 // ---------------------------------------------------------------------------
@@ -331,5 +357,75 @@ pub fn await_certificate(ms: u64) {
             Err(e) => crate::println!("link: node certificate REJECTED: {}", e),
         },
         Err(e) => crate::println!("link: no node certificate ({})", e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capability::Permission;
+
+    fn bit(p: Permission) -> u64 {
+        1 << p.tag()
+    }
+
+    /// The grant is the intersection, gated if either side asks.
+    #[test]
+    fn grant_is_the_intersection_and_keeps_the_gate() {
+        let (send, recv, exec) = (
+            bit(Permission::SendMessage),
+            bit(Permission::ReceiveMessage),
+            bit(Permission::Execute),
+        );
+        let gate = crate::policy::APPROVAL;
+        assert_eq!(grant_mask(send | recv, send), Some(send), "only what both allow");
+        assert_eq!(grant_mask(send, send | gate), Some(send | gate), "policy forces approval");
+        assert_eq!(grant_mask(send | gate, send), Some(send | gate), "the peer's gate is kept");
+        assert_eq!(grant_mask(exec, send), None, "nothing in common");
+        assert_eq!(grant_mask(send, 0), None, "untrusted node or object");
+        assert_eq!(grant_mask(gate, gate | send), None, "a gate alone grants nothing");
+    }
+
+    /// Every error from `PortableCap::verify` maps to its audit reason.
+    #[test]
+    fn verify_errors_map_to_reasons() {
+        for (e, want) in [
+            ("the node certificate is not signed by the pinned registry", reject::BAD_SIGNATURE),
+            ("outlives its node certificate", reject::EXPIRED),
+            ("expired", reject::EXPIRED),
+            ("issued by this node", reject::NOT_FOR_US),
+            ("addressed to another node", reject::NOT_FOR_US),
+            ("grants no permission", reject::BAD_SIGNATURE),
+            ("the issuing node's signature does not verify", reject::BAD_SIGNATURE),
+        ] {
+            assert_eq!(verify_reason(e), want, "{e}");
+        }
+    }
+
+    /// Replays are refused, and a full list refuses rather than forgets.
+    #[test]
+    fn replay_list_fails_closed() {
+        let mut seen: heapless::Vec<([u8; 16], u64), REPLAY_CAPACITY> = heapless::Vec::new();
+        assert_eq!(replay_check(&seen, [1; 16], 7), Ok(()));
+        seen.push(([1; 16], 7)).unwrap();
+        assert_eq!(replay_check(&seen, [1; 16], 7), Err("already imported"));
+        assert_eq!(replay_check(&seen, [2; 16], 7), Ok(()), "another issuer");
+        while !seen.is_full() {
+            let n = seen.len() as u64;
+            seen.push(([3; 16], n)).unwrap();
+        }
+        assert!(replay_check(&seen, [9; 16], 1).is_err(), "full: refused");
+        assert_eq!(replay_check(&seen, [1; 16], 7), Err("already imported"), "never forgotten");
+    }
+
+    /// The longest node and object names still fit an object kind.
+    #[test]
+    fn proxy_names_fit() {
+        let node = "n".repeat(cdk_link::peer::MAX_NODE_NAME);
+        let object = "o".repeat(cdk_link::peer::MAX_OBJECT_NAME);
+        let p = proxy_name(&node, &object).unwrap();
+        assert_eq!(p.len(), 32);
+        assert!(proxy_name(&node, "toolongobject").is_none());
+        assert_eq!(proxy_name("hq", "alerts").unwrap().as_str(), "peer:hq/alerts");
     }
 }

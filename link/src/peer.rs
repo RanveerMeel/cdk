@@ -409,7 +409,12 @@ pub fn valid_file_name(s: &str) -> bool {
 /// `PeerStatus`: success or failure, with a short note (at most 200 bytes).
 pub fn encode_status(ok: bool, text: &str) -> Vec<u8> {
     let mut m = alloc::vec![PEER_STATUS, ok as u8];
-    m.extend_from_slice(&text.as_bytes()[..text.len().min(200)]);
+    // Cut at a character boundary, or the receiver's UTF-8 check fails.
+    let mut end = text.len().min(200);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    m.extend_from_slice(&text.as_bytes()[..end]);
     m
 }
 
@@ -550,5 +555,10 @@ mod tests {
             decode_status(&encode_status(true, "ok")),
             Some((true, "ok"))
         );
+        // A long non-ASCII note is cut at a character boundary and decodes.
+        let long = "€".repeat(100); // 300 bytes; byte 200 is inside a '€'
+        let status = encode_status(false, &long);
+        let (ok, note) = decode_status(&status).unwrap();
+        assert!(!ok && note.len() == 198 && note.chars().all(|c| c == '€'));
     }
 }
