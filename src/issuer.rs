@@ -58,6 +58,8 @@ pub enum SigDomain {
     AuditCheckpoint,
     /// Host-link handshake transcripts (`cdk-link` secure channel).
     Link,
+    /// Portable capabilities delegated to other nodes (roadmap 3.5).
+    PortableCap,
 }
 
 impl SigDomain {
@@ -67,6 +69,7 @@ impl SigDomain {
             SigDomain::Capability => b"CDK-CAP-v1",
             SigDomain::AuditCheckpoint => b"CDK-AUDIT-v1",
             SigDomain::Link => b"CDK-LINK-v1",
+            SigDomain::PortableCap => cdk_link::peer::PORTABLE_CONTEXT,
         }
     }
 }

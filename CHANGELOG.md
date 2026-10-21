@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Distributed capabilities, stage 1 (roadmap 3.5): the gateway certifies an
+  attested node's per-boot issuer key with a registry key (`--registry-key`,
+  `--node`; `CDK_NODE` in `run_gateway.sh`); nodes pin `registry.pub`;
+  `cap-export` / `cap-import` delegate capabilities between nodes, checked
+  against certificate, signature, audience, expiry, replay and the new
+  `trust <node> <object> <perms>` policy rule; `peer` console command.
 - Per-agent FPU/SSE/AVX state (roadmap 2.6): agents use hardware floating
   point and vector registers, saved and restored per agent with XSAVE;
   user programs build for `user/x86_64-cdk-user.json` (`core` from source);

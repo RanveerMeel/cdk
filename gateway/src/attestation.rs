@@ -153,6 +153,10 @@ pub struct Attestor {
     attest_ok: Option<bool>,
     /// A first enrollment waiting for the endorsement proof.
     pending_enrollment: Option<Enrollment>,
+    /// Ask CDK to wait for a node certificate (roadmap 3.5).
+    pub certify: bool,
+    /// The registers of this session's attestation.
+    registers: Option<[[u8; 32]; REGISTERS]>,
     pub status: Status,
 }
 
@@ -185,8 +189,27 @@ impl Attestor {
             ek_proven: None,
             attest_ok: None,
             pending_enrollment: None,
+            certify: false,
+            registers: None,
             status: Status::Pending,
         }
+    }
+
+    /// What this session attested — SHA-256 over the measurement registers
+    /// and, with a TPM, the quoted PCRs — for a node certificate.
+    pub fn attested_digest(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"CDK-ATTESTED-v1");
+        for r in self.registers.iter().flatten() {
+            h.update(r);
+        }
+        if let Some(Ok(q)) = &self.quote {
+            for p in &q.pcrs {
+                h.update(p);
+            }
+        }
+        h.finalize().into()
     }
 
     /// Start attesting a new session; returns the request to send.
@@ -200,11 +223,15 @@ impl Attestor {
         self.ek_proven = None;
         self.attest_ok = None;
         self.pending_enrollment = None;
-        let flags = if self.trust.is_some() {
+        self.registers = None;
+        let mut flags = if self.trust.is_some() {
             tpm::PROVE_ENDORSEMENT
         } else {
             0
         };
+        if self.certify {
+            flags |= cdk_link::peer::CERTIFY;
+        }
         attest::encode_request(&self.nonce, flags)
     }
 
@@ -408,6 +435,7 @@ impl Attestor {
             }
         }
         ok &= self.check_tpm(&a.registers);
+        self.registers = Some(a.registers);
         self.attest_ok = Some(ok);
         self.finish();
     }

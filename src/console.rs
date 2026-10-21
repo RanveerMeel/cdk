@@ -160,6 +160,9 @@ const COMMANDS: &[&str] = &[
     "tools-sync",
     "policy",
     "operators",
+    "peer",
+    "cap-export",
+    "cap-import",
     "boot",
     "capbench",
     "audit",
@@ -653,6 +656,9 @@ fn dispatch(
         "tools-sync" => cmd_tools_sync(kernel),
         "policy" => cmd_policy(arg1, arg2, arg3, kernel),
         "operators" => cmd_operators(),
+        "peer" => cmd_peer(),
+        "cap-export" => cmd_cap_export(arg1, arg2, arg3, kernel),
+        "cap-import" => cmd_cap_import(arg1, arg2, kernel, mem_graph),
         "boot" => crate::boot::report(|s| crate::print!("{}", s)),
         "capbench" => cmd_capbench(arg1, arg2, kernel),
         "audit" => cmd_audit(arg1),
@@ -770,6 +776,9 @@ fn cmd_help() {
     crate::println!("  tools             List registered tool objects (grant with: grant <pid> tool:<name> exec)");
     crate::println!("  policy            Show rules, labels, review mode, and the pinned gateway listing");
     crate::println!("  operators         Pinned operator keys and open signed-approval requests");
+    crate::println!("  peer              This node's certificate, the pinned registry, peer trust (roadmap 3.5)");
+    crate::println!("  cap-export <pid> <h> <node> <file> [perms]  Delegate a handle to a peer node (gateway outbox)");
+    crate::println!("  cap-import <file> <pid>  Verify a peer's capability (gateway inbox) and grant pid a handle");
     crate::println!("  boot              Verified-boot verdict, release key, measured registers and log");
     crate::println!("  policy check      Check every agent's handles against the rules");
     crate::println!("  policy reach      Show what each agent can reach, with labels");
@@ -1557,6 +1566,130 @@ fn cmd_policy(sub: &str, a: &str, rest: &str, kernel: &mut Kernel) {
     }
 }
 
+/// `peer`: the pinned registry, this node's certificate, and the policy's trust rules (roadmap 3.5).
+fn cmd_peer() {
+    match crate::peer::registry() {
+        Some(r) => {
+            let id = r.id();
+            crate::print!("peer: registry ");
+            print_hex(&id[..8]);
+            crate::println!(" pinned (registry.pub in the ramdisk)");
+        }
+        None => crate::println!("peer: no registry key pinned — distributed capabilities disabled"),
+    }
+    match crate::peer::certificate() {
+        Some((name, serial, _)) => crate::println!(
+            "peer: this node is '{}' (certificate serial {:#x}, this boot's issuer)",
+            name,
+            serial
+        ),
+        None => crate::println!("peer: not certified (a gateway with --registry-key certifies after attestation)"),
+    }
+    let p = crate::policy::policy();
+    if p.trusts.is_empty() {
+        crate::println!("peer: no trust rules — every import is refused");
+    }
+    for t in &p.trusts {
+        crate::println!("  {}", t);
+    }
+}
+
+/// `cap-export <pid> <h> <node> <file> [perms]`: delegate an agent's handle to a peer node through the gateway's outbox.
+fn cmd_cap_export(pid: &str, handle: &str, rest: &str, kernel: &Kernel) {
+    let mut w = rest.split_whitespace();
+    let (Some(pid), Some(h), Some(node), Some(file)) = (
+        parse_u32(pid),
+        handle.trim_start_matches('h').parse::<u64>().ok(),
+        w.next(),
+        w.next(),
+    ) else {
+        crate::println!("Usage: cap-export <pid> <handle> <node> <file> [perms]");
+        return;
+    };
+    let perms = match w.next() {
+        None => None,
+        Some(spec) => match crate::agent::parse_permissions(spec) {
+            Some(ps) => Some(ps.iter().fold(0u64, |m, p| m | (1u64 << p.tag()))),
+            None => {
+                crate::println!("cap-export: perms are read,write,exec,send,recv,delete");
+                return;
+            }
+        },
+    };
+    let pcap = match crate::peer::export(pid, h, node, perms, |id| {
+        kernel
+            .for_each_object_find(id)
+            .map(|o| alloc::string::String::from(o.kind.as_str()))
+    }) {
+        Ok(p) => p,
+        Err(e) => {
+            crate::println!("cap-export: {}", e);
+            return;
+        }
+    };
+    crate::println!(
+        "cap-export: '{}' [{}] for node '{}', signed by this node ('{}')",
+        pcap.object,
+        crate::agent::permission_names(pcap.perms),
+        pcap.audience,
+        pcap.cert.name
+    );
+    match crate::peer::send_export(file, &pcap) {
+        Ok(note) => crate::println!("cap-export: {}", note),
+        Err(e) => crate::println!("cap-export: not delivered: {}", e),
+    }
+}
+
+/// `cap-import <file> <pid>`: fetch a peer's capability from the gateway's inbox, verify it, and grant `pid` a handle on the proxy through policy review.
+fn cmd_cap_import(file: &str, pid: &str, kernel: &mut Kernel, mem_graph: &mut MemoryGraph) {
+    let Some(pid) = parse_u32(pid.trim()) else {
+        crate::println!("Usage: cap-import <file> <pid>");
+        return;
+    };
+    let bytes = match crate::peer::fetch_import(file) {
+        Ok(b) => b,
+        Err(e) => {
+            crate::println!("cap-import: {}", e);
+            return;
+        }
+    };
+    let a = match crate::peer::check_import(&bytes) {
+        Ok(a) => a,
+        Err(e) => {
+            crate::println!("cap-import: REFUSED — {}", e);
+            return;
+        }
+    };
+    crate::println!(
+        "cap-import: verified — node '{}' (certified by the registry) delegates '{}' [{}], valid {} more s",
+        a.node,
+        a.object,
+        crate::agent::permission_names(a.mask),
+        a.valid_s
+    );
+    // The local proxy for the peer's object.
+    if kernel.resolve_object_ref(&a.proxy).is_err() {
+        let obj = KernelObject::new_compute(&a.proxy, "peer");
+        let cap = kernel.register_object(obj);
+        mem_graph.register_object(cap.object_id.as_str(), 0);
+        crate::println!("cap-import: created proxy object {} ({})", cap.object_id.as_str(), a.proxy);
+    }
+    let perms = crate::agent::permission_names(a.mask);
+    let (g, ps) = match proposed_grant(pid, &a.proxy, &perms, kernel) {
+        Ok(x) => x,
+        Err(e) => {
+            crate::println!("cap-import: {}", e);
+            return;
+        }
+    };
+    if crate::policy::review_grants(kernel, &[g.clone()]) {
+        apply_grant(&g, &ps, kernel);
+        crate::peer::mark_imported(&a);
+    } else {
+        crate::println!("cap-import: not granted (policy review); the capability can be imported again");
+    }
+}
+
 fn cmd_operators() {
     if !crate::approvals::signed_mode() {
         crate::println!("approvals: console mode — no operator keys pinned (lab use; a typed y approves)");
@@ -1603,7 +1736,13 @@ fn policy_show() {
     for (i, r) in p.rules.iter().enumerate() {
         crate::println!("  {}. {}", i + 1, r);
     }
-    crate::println!("labels (besides automatic tool, model, credential, remote):");
+    if !p.trusts.is_empty() {
+        crate::println!("peer trust (roadmap 3.5):");
+        for t in &p.trusts {
+            crate::println!("  {}", t);
+        }
+    }
+    crate::println!("labels (besides automatic tool, model, credential, remote, peer):");
     if p.labels.is_empty() {
         crate::println!("  (none)");
     }

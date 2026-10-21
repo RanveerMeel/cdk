@@ -22,6 +22,7 @@ extern crate alloc;
 
 pub mod approval;
 pub mod attest;
+pub mod peer;
 pub mod secure;
 pub mod tool;
 pub mod tpm;
