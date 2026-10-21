@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Distributed capabilities, stage 2 (roadmap 3.5): `peer-sync` carries
+  agents' messages on proxy objects to the owning node, which verifies the
+  sender, its own delegation, signatures, permission, replay and
+  revocation before delivering; `cap-revoke <serial>` withdraws a
+  delegation (kept by the gateway across reboots); new `notify` agent.
+- Console `recv` accepts an object name, like `send`.
 - Distributed capabilities, stage 1 (roadmap 3.5): the gateway certifies an
   attested node's per-boot issuer key with a registry key (`--registry-key`,
   `--node`; `CDK_NODE` in `run_gateway.sh`); nodes pin `registry.pub`;

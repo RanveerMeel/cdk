@@ -10,9 +10,14 @@
 //! ramdisk as `registry.pub`. In production the registry is a separate
 //! service holding its key in an HSM; here each gateway may hold it.
 //!
-//! The gateway also carries portable capabilities between nodes: CDK's
-//! exports go to `--cap-dir DIR/outbox/<file>.pcap`, imports are read from
-//! `DIR/inbox/<file>.pcap`. It is only a courier — CDK verifies everything.
+//! The gateway also carries portable capabilities and peer messages
+//! between nodes: CDK's exports go to `--cap-dir DIR/outbox/<file>.pcap`,
+//! imports are read from `DIR/inbox/<file>.pcap`; outbound messages go to
+//! `DIR/outbox/msg-*.pmsg`, inbound ones are read from `DIR/inbox/*.pmsg`
+//! and filed under `inbox/done/` or `inbox/rejected/` once CDK has decided.
+//! It is only a courier — CDK verifies everything. It also keeps this
+//! node's revocations (`DIR/revoked`) and hands them to CDK with each
+//! certificate; a courier can only add revocations, never remove CDK's.
 
 use std::path::{Path, PathBuf};
 
@@ -97,6 +102,88 @@ impl Registry {
 pub struct CapDir(pub PathBuf);
 
 impl CapDir {
+    /// Queue an outbound peer message as `outbox/msg-<time>-<random>.pmsg`.
+    pub fn write_outbound(&self, pmsg: &[u8]) -> Result<String, String> {
+        let m = peer::PeerMessage::decode(pmsg).ok_or("not a peer message")?;
+        let dir = self.0.join("outbox");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let name = format!("msg-{}-{:08x}", now(), OsRng.next_u32());
+        let tmp = dir.join(format!("{name}.tmp"));
+        std::fs::write(&tmp, pmsg).map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, dir.join(format!("{name}.pmsg"))).map_err(|e| e.to_string())?;
+        eprintln!(
+            "gateway: peer message from '{}' ({}) to '{}' on '{}' -> outbox/{name}.pmsg",
+            m.sender.name, m.from, m.grant.cert.name, m.grant.object
+        );
+        Ok(name)
+    }
+
+    /// The oldest inbound peer message as `name_len | name | now | message`.
+    pub fn next_inbound(&self) -> Option<Vec<u8>> {
+        let dir = self.0.join("inbox");
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .ok()?
+            .flatten()
+            .filter_map(|e| {
+                let n = e.file_name().into_string().ok()?;
+                let stem = n.strip_suffix(".pmsg")?;
+                peer::valid_file_name(stem).then(|| stem.to_string())
+            })
+            .collect();
+        names.sort();
+        for name in names {
+            let Ok(data) = std::fs::read(dir.join(format!("{name}.pmsg"))) else {
+                continue;
+            };
+            if data.len() + 64 > peer::MAX_BLOB {
+                let _ = self.file_inbound(&name, false);
+                continue;
+            }
+            let mut out = vec![name.len() as u8];
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(&now().to_le_bytes());
+            out.extend_from_slice(&data);
+            return Some(out);
+        }
+        None
+    }
+
+    /// File an inbound message under `inbox/done/` or `inbox/rejected/`.
+    pub fn file_inbound(&self, name: &str, accepted: bool) -> Result<(), String> {
+        if !peer::valid_file_name(name) {
+            return Err("bad file name".into());
+        }
+        let inbox = self.0.join("inbox");
+        let to = inbox.join(if accepted { "done" } else { "rejected" });
+        std::fs::create_dir_all(&to).map_err(|e| e.to_string())?;
+        let file = format!("{name}.pmsg");
+        std::fs::rename(inbox.join(&file), to.join(&file)).map_err(|e| e.to_string())
+    }
+
+    /// This node's revocations, recorded by `cap-revoke`.
+    pub fn revocations(&self) -> Vec<u64> {
+        std::fs::read_to_string(self.0.join("revoked"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| u64::from_str_radix(l.trim(), 16).ok())
+            .collect()
+    }
+
+    /// Record a revocation (idempotent).
+    pub fn add_revocation(&self, serial: u64) -> Result<(), String> {
+        if self.revocations().contains(&serial) {
+            return Ok(());
+        }
+        std::fs::create_dir_all(&self.0).map_err(|e| e.to_string())?;
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.0.join("revoked"))
+            .and_then(|mut f| writeln!(f, "{serial:016x}"))
+            .map_err(|e| e.to_string())
+    }
+
     /// Write an export (`name_len | name | portable capability`) to the
     /// outbox; returns the path.
     pub fn write_export(&self, payload: &[u8]) -> Result<PathBuf, String> {
@@ -212,6 +299,76 @@ mod tests {
         let mut bad = payload.clone();
         bad[1] = b'/';
         assert!(caps.write_export(&bad).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Outbound messages are queued, inbound ones served oldest first and
+    /// filed; revocations persist and are idempotent.
+    #[test]
+    fn peer_messages_and_revocations_on_disk() {
+        let dir = std::env::temp_dir().join(format!("cdk-capdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let caps = CapDir(dir.clone());
+        let reg = hybrid::Keypair::from_seeds(&[1; 32], &[2; 32]);
+        let hq = hybrid::Keypair::from_seeds(&[3; 32], &[4; 32]);
+        let branch = hybrid::Keypair::from_seeds(&[5; 32], &[6; 32]);
+        let cert = |k: &hybrid::Keypair, name: &str| {
+            let mut c = NodeCert {
+                name: name.into(),
+                issuer: k.public().clone(),
+                registry: reg.public().id(),
+                serial: 1,
+                attested: [0; 32],
+                not_after: now() + 60,
+                signature: Signature::from_slice(&[0; SIG_LEN]).unwrap(),
+            };
+            c.signature = reg.sign_with(&c.digest(), peer::NODE_CONTEXT);
+            c
+        };
+        let mut grant = PortableCap {
+            cert: cert(&hq, "hq"),
+            object: "alerts".into(),
+            perms: 1 << 4,
+            audience: "branch".into(),
+            serial: 9,
+            not_after: now() + 60,
+            signature: Signature::from_slice(&[0; SIG_LEN]).unwrap(),
+        };
+        grant.signature = hq.sign_with(&grant.digest(), peer::PORTABLE_CONTEXT);
+        let mut m = peer::PeerMessage {
+            sender: cert(&branch, "branch"),
+            grant,
+            seq: 1,
+            from: "pid-1".into(),
+            payload: b"ALERT".to_vec(),
+            signature: Signature::from_slice(&[0; SIG_LEN]).unwrap(),
+        };
+        m.signature = branch.sign_with(&m.digest(), peer::MESSAGE_CONTEXT);
+
+        assert!(caps.write_outbound(b"junk").is_err());
+        let name = caps.write_outbound(&m.encode()).unwrap();
+        std::fs::create_dir_all(dir.join("inbox")).unwrap();
+        std::fs::copy(
+            dir.join(format!("outbox/{name}.pmsg")),
+            dir.join(format!("inbox/{name}.pmsg")),
+        )
+        .unwrap();
+        let next = caps.next_inbound().unwrap();
+        let n = next[0] as usize;
+        assert_eq!(&next[1..1 + n], name.as_bytes());
+        let at = u64::from_le_bytes(next[1 + n..9 + n].try_into().unwrap());
+        let back = peer::PeerMessage::decode(&next[9 + n..]).unwrap();
+        assert_eq!(back.verify(reg.public(), "hq", at), Ok(()));
+        caps.file_inbound(&name, true).unwrap();
+        assert!(caps.next_inbound().is_none(), "filed under done/");
+        assert!(dir.join(format!("inbox/done/{name}.pmsg")).exists());
+        assert!(caps.file_inbound("../x", false).is_err());
+
+        assert!(caps.revocations().is_empty());
+        caps.add_revocation(9).unwrap();
+        caps.add_revocation(9).unwrap();
+        caps.add_revocation(u64::MAX).unwrap();
+        assert_eq!(caps.revocations(), vec![9, u64::MAX]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

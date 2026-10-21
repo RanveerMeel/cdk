@@ -60,6 +60,8 @@ pub enum SigDomain {
     Link,
     /// Portable capabilities delegated to other nodes (roadmap 3.5).
     PortableCap,
+    /// Messages to a peer node's object (roadmap 3.5 stage 2).
+    PeerMessage,
 }
 
 impl SigDomain {
@@ -70,6 +72,7 @@ impl SigDomain {
             SigDomain::AuditCheckpoint => b"CDK-AUDIT-v1",
             SigDomain::Link => b"CDK-LINK-v1",
             SigDomain::PortableCap => cdk_link::peer::PORTABLE_CONTEXT,
+            SigDomain::PeerMessage => cdk_link::peer::MESSAGE_CONTEXT,
         }
     }
 }

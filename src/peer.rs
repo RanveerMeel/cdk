@@ -15,14 +15,19 @@
 //!   normal policy review, and only then marks the import used
 //!   ([`mark_imported`]).
 //!
-//! Stage 1 establishes trust and delegation; forwarding an agent's messages
-//! on a proxy object to the peer node is stage 2.
+//! Stage 2 ([`sync`], console `peer-sync`): an agent's messages on a proxy
+//! object travel to the owning node as signed [`PeerMessage`]s through the
+//! gateways' outbox/inbox, and incoming ones are verified *at the owning
+//! node* — the sender's certificate, this node's own delegation to it (by
+//! name, so it outlives this node's reboots until it expires), both
+//! signatures, `send` permission, replay, and revocation ([`revoke`],
+//! console `cap-revoke`) — before they are delivered to the named object.
 
 extern crate alloc;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use cdk_link::peer::{self, NodeCert, PortableCap};
+use cdk_link::peer::{self, NodeCert, PeerMessage, PortableCap};
 use cdk_link::secure::{Identity, Signature};
 use spin::Mutex;
 
@@ -38,6 +43,18 @@ const REPLAY_CAPACITY: usize = 64;
 static IMPORTED: Mutex<heapless::Vec<([u8; 16], u64), REPLAY_CAPACITY>> =
     Mutex::new(heapless::Vec::new());
 static EXPORTS: AtomicU64 = AtomicU64::new(0);
+/// The delegation behind each proxy object: `(proxy kind, PortableCap)`.
+static GRANTS: Mutex<heapless::Vec<(heapless::String<32>, alloc::vec::Vec<u8>), 16>> =
+    Mutex::new(heapless::Vec::new());
+/// Serials of delegations this node revoked (from the gateway at
+/// certification, plus `cap-revoke`).
+static REVOKED: Mutex<heapless::Vec<u64, 128>> = Mutex::new(heapless::Vec::new());
+/// Inbound messages one boot can record; more are refused.
+const SEEN_CAPACITY: usize = 256;
+/// `(sender issuer id, seq)` of every peer message delivered this boot.
+static SEEN: Mutex<heapless::Vec<([u8; 16], u64), SEEN_CAPACITY>> = Mutex::new(heapless::Vec::new());
+/// Sequence numbers of this boot's outbound peer messages.
+static OUT_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// Why an import was refused (audit `cap-import-rejected` detail).
 pub mod reject {
@@ -48,6 +65,12 @@ pub mod reject {
     pub const NOT_TRUSTED: u64 = 5;
     pub const MALFORMED: u64 = 6;
     pub const EXPIRED: u64 = 7;
+    /// Peer messages: the delegation does not allow `send`.
+    pub const NO_SEND: u64 = 8;
+    /// Peer messages: the delegation was revoked.
+    pub const REVOKED: u64 = 9;
+    /// Peer messages: no object of that name on this node.
+    pub const NO_OBJECT: u64 = 10;
 }
 
 /// The pinned registry key, if the ramdisk carries one.
@@ -174,6 +197,8 @@ pub struct Accepted {
     pub valid_s: u64,
     issuer: [u8; 16],
     serial: u64,
+    /// The portable capability, kept as the proxy's delegation.
+    grant: alloc::vec::Vec<u8>,
 }
 
 /// Audit a refused import (`cap-import-rejected` with `reason`) and return the message for the console.
@@ -220,6 +245,7 @@ pub fn check_import(delivered: &[u8]) -> Result<Accepted, &'static str> {
         valid_s: pcap.not_after.saturating_sub(now),
         issuer: issuer_id,
         serial: pcap.serial,
+        grant: bytes.to_vec(),
     })
 }
 
@@ -230,6 +256,13 @@ pub fn mark_imported(a: &Accepted) {
     if IMPORTED.lock().push((a.issuer, a.serial)).is_err() {
         crate::println!("peer: replay list full; import not recorded");
     }
+    // The newest delegation backs the proxy's outbound messages.
+    let mut grants = GRANTS.lock();
+    grants.retain(|(p, _)| p != &a.proxy);
+    if grants.push((a.proxy.clone(), a.grant.clone())).is_err() {
+        crate::println!("peer: too many proxies; messages on {} cannot be forwarded", a.proxy);
+    }
+    drop(grants);
     audit::record_fmt(EventKind::CapImported, format_args!("{}", a.proxy), a.mask);
 }
 
@@ -276,11 +309,20 @@ fn proxy_name(node: &str, object: &str) -> Option<heapless::String<32>> {
 // Transfers through the gateway (its capability outbox/inbox)
 // ---------------------------------------------------------------------------
 
-/// Wait up to `ms` for the gateway's answer: a status, or a blob of `kind`.
-fn wait_answer(ms: u64, kind: u8) -> Result<alloc::vec::Vec<u8>, alloc::string::String> {
+/// The gateway's answer to a request.
+enum Answer {
+    /// A successful status, with its note.
+    Done(alloc::string::String),
+    /// A blob of the requested kind.
+    Blob(alloc::vec::Vec<u8>),
+}
+
+/// Wait up to `ms` for the gateway's answer: a status (a failed one is
+/// `Err`), or a blob of `kind`. Revocation lists are applied as they come.
+fn wait_answer(ms: u64, kind: u8) -> Result<Answer, alloc::string::String> {
     let start = crate::cpu::rdtsc();
     let mut asm = peer::BlobAssembler::default();
-    let mut out: Option<Result<alloc::vec::Vec<u8>, alloc::string::String>> = None;
+    let mut out: Option<Result<Answer, alloc::string::String>> = None;
     while out.is_none() && crate::cpu::rdtsc().wrapping_sub(start) < ms * 2_000_000 {
         crate::link::recv(|m| {
             let crate::link::Incoming::Sealed(p) = m else {
@@ -291,11 +333,13 @@ fn wait_answer(ms: u64, kind: u8) -> Result<alloc::vec::Vec<u8>, alloc::string::
                 return;
             }
             if let Some((ok, text)) = peer::decode_status(p) {
-                out = Some(if ok { Ok(text.as_bytes().to_vec()) } else { Err(text.into()) });
+                out = Some(if ok { Ok(Answer::Done(text.into())) } else { Err(text.into()) });
             } else if p.first() == Some(&peer::BLOB) {
                 if let Ok(Some((k, data))) = asm.push(p) {
-                    if k == kind {
-                        out = Some(Ok(data));
+                    if k == peer::kind::REVOCATIONS {
+                        on_revocations(&data);
+                    } else if k == kind {
+                        out = Some(Ok(Answer::Blob(data)));
                     }
                 }
             }
@@ -322,7 +366,10 @@ pub fn send_export(file: &str, pcap: &PortableCap) -> Result<alloc::string::Stri
             return Err("send failed".into());
         }
     }
-    wait_answer(5_000, 0).map(|t| alloc::string::String::from_utf8_lossy(&t).into_owned())
+    match wait_answer(5_000, 0)? {
+        Answer::Done(note) => Ok(note),
+        Answer::Blob(_) => Err("unexpected answer".into()),
+    }
 }
 
 /// Ask the gateway for `<file>.pcap` from its inbox.
@@ -336,13 +383,17 @@ pub fn fetch_import(file: &str) -> Result<alloc::vec::Vec<u8>, alloc::string::St
     if !matches!(crate::link::send_data(&peer::encode_import_request(file)), Ok(true)) {
         return Err("send failed".into());
     }
-    wait_answer(5_000, peer::kind::IMPORT)
+    match wait_answer(5_000, peer::kind::IMPORT)? {
+        Answer::Blob(b) => Ok(b),
+        Answer::Done(_) => Err("unexpected answer".into()),
+    }
 }
 
 /// Wait (during attestation) for the gateway's certificate for this boot.
 pub fn await_certificate(ms: u64) {
     match wait_answer(ms, peer::kind::NODE_CERT) {
-        Ok(bytes) => match on_node_cert(&bytes) {
+        Ok(Answer::Done(_)) => crate::println!("link: no node certificate (unexpected answer)"),
+        Ok(Answer::Blob(bytes)) => match on_node_cert(&bytes) {
             Ok(name) => {
                 let id = issuer::kernel().id();
                 crate::println!(
@@ -358,6 +409,248 @@ pub fn await_certificate(ms: u64) {
         },
         Err(e) => crate::println!("link: no node certificate ({})", e),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2: messages to peers' objects, and revocation
+// ---------------------------------------------------------------------------
+
+/// Apply a revocation list from the gateway (union with ours).
+fn on_revocations(bytes: &[u8]) {
+    let Some(serials) = peer::decode_revocations(bytes) else {
+        crate::println!("peer: malformed revocation list ignored");
+        return;
+    };
+    let mut r = REVOKED.lock();
+    for s in serials {
+        if !r.contains(&s) && r.push(s).is_err() {
+            crate::println!("peer: revocation list full");
+            break;
+        }
+    }
+}
+
+/// Serials this node has revoked.
+pub fn revoked() -> heapless::Vec<u64, 128> {
+    REVOKED.lock().clone()
+}
+
+/// Proxies with a delegation behind them.
+pub fn proxies() -> heapless::Vec<heapless::String<32>, 16> {
+    GRANTS.lock().iter().map(|(p, _)| p.clone()).collect()
+}
+
+/// Revoke this node's delegation `serial`: messages under it are refused
+/// from now on; the gateway records it so later boots refuse them too.
+pub fn revoke(serial: u64) -> Result<alloc::string::String, alloc::string::String> {
+    {
+        let mut r = REVOKED.lock();
+        if !r.contains(&serial) {
+            r.push(serial).map_err(|_| "revocation list full")?;
+        }
+    }
+    audit::record_fmt(EventKind::CapRevoked, format_args!("serial"), serial);
+    if !crate::link::is_secure() {
+        return Ok("revoked for this boot only (no secure link to record it)".into());
+    }
+    if !matches!(crate::link::send_data(&peer::encode_revoke(serial)), Ok(true)) {
+        return Ok("revoked for this boot only (send failed)".into());
+    }
+    match wait_answer(5_000, 0) {
+        Ok(Answer::Done(note)) => Ok(note),
+        Ok(Answer::Blob(_)) => Ok("revoked (unexpected answer)".into()),
+        Err(e) => Ok(alloc::format!("revoked for this boot only ({e})")),
+    }
+}
+
+/// What `peer-sync` did.
+#[derive(Default)]
+pub struct SyncReport {
+    pub sent: usize,
+    pub delivered: usize,
+    pub rejected: usize,
+}
+
+/// Send the agents' messages on proxy objects to their owning nodes, then
+/// deliver the messages waiting in the gateway's inbox. The caller holds
+/// the kernel (the console), so it is passed in.
+pub fn sync(kernel: &mut crate::kernel::Kernel) -> Result<SyncReport, alloc::string::String> {
+    if !crate::link::is_secure() {
+        return Err("no secure link (run link-secure)".into());
+    }
+    let me = MY_CERT
+        .lock()
+        .clone()
+        .ok_or("this node has no certificate (gateway with --registry-key, then link-secure)")?;
+    let mut report = SyncReport::default();
+
+    // Outbound: each proxy's queue, under the delegation behind it.
+    let grants = GRANTS.lock().clone();
+    for (proxy, grant) in grants.iter() {
+        let Some(grant) = PortableCap::decode(grant) else {
+            continue;
+        };
+        let Ok(id) = kernel.resolve_object_ref(proxy) else {
+            continue;
+        };
+        while let Ok(Some(msg)) = kernel.receive_message_direct(&id) {
+            let payload: alloc::vec::Vec<u8> = match &msg.payload {
+                crate::message::MessagePayload::Data(d) => d.to_vec(),
+                crate::message::MessagePayload::Text(t)
+                | crate::message::MessagePayload::Command(t) => t.as_bytes().to_vec(),
+                _ => continue,
+            };
+            if payload.is_empty() || payload.len() > peer::MAX_MESSAGE {
+                continue;
+            }
+            let from = if peer::valid_sender(&msg.from) { msg.from.as_str() } else { "agent" };
+            let mut m = PeerMessage {
+                sender: me.clone(),
+                grant: grant.clone(),
+                seq: OUT_SEQ.fetch_add(1, Ordering::Relaxed),
+                from: from.into(),
+                payload,
+                signature: Signature::from_slice(&[0; cdk_link::secure::SIG_LEN]).expect("length"),
+            };
+            let sig = issuer::kernel().sign(SigDomain::PeerMessage, &m.digest());
+            m.signature = Signature {
+                ed: sig.ed25519,
+                ml: sig.mldsa65,
+            };
+            for chunk in peer::encode_blob(peer::kind::OUTBOUND, &m.encode()).ok_or("message too large")? {
+                if !matches!(crate::link::send_data(&chunk), Ok(true)) {
+                    return Err("send failed (a drained message was lost)".into());
+                }
+            }
+            match wait_answer(5_000, 0) {
+                Ok(_) => {
+                    report.sent += 1;
+                    audit::record_fmt(
+                        EventKind::PeerMessageSent,
+                        format_args!("{}>{}", m.from, proxy),
+                        m.seq,
+                    );
+                }
+                Err(e) => return Err(alloc::format!("the gateway did not take a message: {e}")),
+            }
+        }
+    }
+
+    // Inbound: one at a time, each filed by the gateway as done or rejected.
+    for _ in 0..64 {
+        if !matches!(crate::link::send_data(&peer::encode_next_inbound()), Ok(true)) {
+            return Err("send failed".into());
+        }
+        let data = match wait_answer(5_000, peer::kind::INBOUND)? {
+            Answer::Done(_) => break, // inbox empty
+            Answer::Blob(b) => b,
+        };
+        let Some((&n, rest)) = data.split_first() else {
+            break;
+        };
+        let n = n as usize;
+        let Some(name) = rest.get(..n).and_then(|b| core::str::from_utf8(b).ok()) else {
+            break;
+        };
+        let name: heapless::String<32> = heapless::String::try_from(name).unwrap_or_default();
+        let ok = match deliver(kernel, &rest[n..]) {
+            Ok((from, object)) => {
+                crate::println!("peer-sync: delivered a message from {} to {}", from, object);
+                report.delivered += 1;
+                true
+            }
+            Err(e) => {
+                crate::println!("peer-sync: REFUSED {}: {}", name, e);
+                report.rejected += 1;
+                false
+            }
+        };
+        let _ = crate::link::send_data(&peer::encode_inbound_done(&name, ok));
+    }
+    Ok(report)
+}
+
+/// Audit a refused inbound message and return the message.
+fn refused_msg(subject: &str, reason: u64, msg: &'static str) -> &'static str {
+    audit::record_fmt(EventKind::PeerMessageRejected, format_args!("{}", subject), reason);
+    msg
+}
+
+/// Verify an inbound `now u64 | PeerMessage` and deliver it to the named
+/// object. Returns `(sender label, object)`.
+fn deliver(
+    kernel: &mut crate::kernel::Kernel,
+    delivered: &[u8],
+) -> Result<(alloc::string::String, alloc::string::String), &'static str> {
+    let (now, bytes) = match delivered.split_at_checked(8) {
+        Some((t, rest)) => (u64::from_le_bytes(t.try_into().unwrap_or([0; 8])), rest),
+        None => return Err(refused_msg("peer", reject::MALFORMED, "not a peer message")),
+    };
+    let m = PeerMessage::decode(bytes)
+        .ok_or_else(|| refused_msg("peer", reject::MALFORMED, "not a peer message"))?;
+    let label = alloc::format!("peer:{}/{}", m.sender.name, m.from);
+    let subject = alloc::format!("{}>{}", label, m.grant.object);
+    let registry = registry()
+        .ok_or_else(|| refused_msg(&subject, reject::NO_REGISTRY, "no registry key pinned in the ramdisk"))?;
+    let me = node_name()
+        .ok_or_else(|| refused_msg(&subject, reject::NOT_FOR_US, "this node has no certificate yet"))?;
+    issuer::crypto_stack::run(|| m.verify(&registry, &me, now))
+        .map_err(|e| refused_msg(&subject, message_reason(e), e))?;
+    message_policy(&m, &REVOKED.lock()).map_err(|(r, e)| refused_msg(&subject, r, e))?;
+    let sender = m.sender.issuer.id();
+    {
+        let mut seen = SEEN.lock();
+        if seen.iter().any(|(i, s)| *i == sender && *s == m.seq) {
+            return Err(refused_msg(&subject, reject::REPLAYED, "already delivered"));
+        }
+        if seen.push((sender, m.seq)).is_err() {
+            return Err(refused_msg(&subject, reject::REPLAYED, "replay list full: no more messages this boot"));
+        }
+    }
+    let id = kernel
+        .resolve_object_ref(&m.grant.object)
+        .map_err(|_| refused_msg(&subject, reject::NO_OBJECT, "no object of that name on this node"))?;
+    let msg = crate::message::Message::new(
+        &label,
+        &id,
+        crate::message::MessagePayload::Data(
+            heapless::Vec::from_slice(&m.payload).map_err(|_| "payload too large")?,
+        ),
+    )
+    .map_err(|_| refused_msg(&subject, reject::MALFORMED, "message fields too long"))?;
+    kernel
+        .send_message_direct(&id, msg)
+        .map_err(|_| refused_msg(&subject, reject::NO_OBJECT, "the object's queue is full"))?;
+    audit::record_fmt(
+        EventKind::PeerMessageDelivered,
+        format_args!("{}", subject),
+        m.payload.len() as u64,
+    );
+    Ok((label, m.grant.object.clone()))
+}
+
+/// The reject code for an error from [`PeerMessage::verify`].
+fn message_reason(e: &str) -> u64 {
+    if e.contains("expired") {
+        reject::EXPIRED
+    } else if e.contains("issued by this node") || e.contains("another node") {
+        reject::NOT_FOR_US
+    } else {
+        reject::BAD_SIGNATURE
+    }
+}
+
+/// This node's own checks on a verified message: the delegation allows
+/// `send`, and it has not been revoked.
+fn message_policy(m: &PeerMessage, revoked: &[u64]) -> Result<(), (u64, &'static str)> {
+    let send = 1u64 << crate::capability::Permission::SendMessage.tag();
+    if m.grant.perms & send == 0 {
+        return Err((reject::NO_SEND, "the delegation does not allow send"));
+    }
+    if revoked.contains(&m.grant.serial) {
+        return Err((reject::REVOKED, "the delegation was revoked"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -427,5 +720,63 @@ mod tests {
         assert_eq!(p.len(), 32);
         assert!(proxy_name(&node, "toolongobject").is_none());
         assert_eq!(proxy_name("hq", "alerts").unwrap().as_str(), "peer:hq/alerts");
+    }
+
+    /// A verified message still needs `send` in the delegation and must not
+    /// be revoked; verify errors map to their audit reasons.
+    #[test]
+    fn message_policy_and_reasons() {
+        use cdk_link::peer::{NodeCert, PortableCap};
+        use cdk_link::secure::hybrid::Keypair;
+        let k = Keypair::from_seeds(&[1; 32], &[2; 32]);
+        let zero = Signature::from_slice(&[0; cdk_link::secure::SIG_LEN]).unwrap();
+        let cert = NodeCert {
+            name: "hq".into(),
+            issuer: k.public().clone(),
+            registry: [0; 16],
+            serial: 1,
+            attested: [0; 32],
+            not_after: 10,
+            signature: zero.clone(),
+        };
+        let send = 1u64 << crate::capability::Permission::SendMessage.tag();
+        let grant = |perms: u64, serial: u64| PortableCap {
+            cert: cert.clone(),
+            object: "alerts".into(),
+            perms,
+            audience: "branch".into(),
+            serial,
+            not_after: 10,
+            signature: zero.clone(),
+        };
+        let msg = |g: PortableCap| PeerMessage {
+            sender: cert.clone(),
+            grant: g,
+            seq: 1,
+            from: "pid-1".into(),
+            payload: alloc::vec![1],
+            signature: zero.clone(),
+        };
+        assert_eq!(message_policy(&msg(grant(send, 5)), &[]), Ok(()));
+        assert_eq!(
+            message_policy(&msg(grant(1 << crate::capability::Permission::ReceiveMessage.tag(), 5)), &[]),
+            Err((reject::NO_SEND, "the delegation does not allow send"))
+        );
+        assert_eq!(
+            message_policy(&msg(grant(send, 5)), &[4, 5]),
+            Err((reject::REVOKED, "the delegation was revoked"))
+        );
+        for (e, want) in [
+            ("the sender's certificate is not signed by the pinned registry", reject::BAD_SIGNATURE),
+            ("the sender's certificate has expired", reject::EXPIRED),
+            ("the delegation's certificate is not signed by the pinned registry", reject::BAD_SIGNATURE),
+            ("the delegation was not issued by this node", reject::NOT_FOR_US),
+            ("the delegation was issued to another node", reject::NOT_FOR_US),
+            ("the delegation has expired", reject::EXPIRED),
+            ("the delegation's signature does not verify", reject::BAD_SIGNATURE),
+            ("the sender's signature does not verify", reject::BAD_SIGNATURE),
+        ] {
+            assert_eq!(message_reason(e), want, "{e}");
+        }
     }
 }

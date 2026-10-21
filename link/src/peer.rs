@@ -60,12 +60,19 @@ pub const MAX_NODE_NAME: usize = 16;
 /// `peer:<node>/<object>` fits a 32-byte object kind on the importer).
 pub const MAX_OBJECT_NAME: usize = 10;
 /// Largest portable capability or certificate accepted.
-pub const MAX_BLOB: usize = 16 * 1024;
+pub const MAX_BLOB: usize = 32 * 1024;
 const BLOB_DATA: usize = 512;
 
 pub const BLOB: u8 = 0x44;
 pub const IMPORT_REQUEST: u8 = 0x45;
 pub const PEER_STATUS: u8 = 0x46;
+/// CDK → gateway: send the next message from the inbox (stage 2).
+pub const NEXT_INBOUND: u8 = 0x47;
+/// CDK → gateway: `name_len u8 | name | accepted u8` — file the inbound
+/// message under `done/` or `rejected/`.
+pub const INBOUND_DONE: u8 = 0x48;
+/// CDK → gateway: `serial u64` — record a revocation (stage 2).
+pub const REVOKE: u8 = 0x49;
 /// Attestation-request flag: the gateway will certify this node.
 pub const CERTIFY: u8 = 0x02;
 
@@ -77,6 +84,12 @@ pub mod kind {
     pub const EXPORT: u8 = 2;
     /// Gateway → CDK: a portable capability read from the inbox.
     pub const IMPORT: u8 = 3;
+    /// CDK → gateway: a [`super::PeerMessage`] for the outbox.
+    pub const OUTBOUND: u8 = 4;
+    /// Gateway → CDK: `name_len u8 | name | now u64 | PeerMessage`.
+    pub const INBOUND: u8 = 5;
+    /// Gateway → CDK: revoked serials, `count u16 | serial u64 …`.
+    pub const REVOCATIONS: u8 = 6;
 }
 
 /// Node names: 1..=16 of `a-z 0-9 - _`.
@@ -427,7 +440,219 @@ pub fn decode_status(b: &[u8]) -> Option<(bool, &str)> {
 
 /// Messages of this module.
 pub fn is_peer(msg: &[u8]) -> bool {
-    matches!(msg.first(), Some(&(BLOB | IMPORT_REQUEST | PEER_STATUS)))
+    matches!(
+        msg.first(),
+        Some(&(BLOB | IMPORT_REQUEST | PEER_STATUS | NEXT_INBOUND | INBOUND_DONE | REVOKE))
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2: messages to a peer's object, and revocation
+// ---------------------------------------------------------------------------
+
+/// FIPS 204 context of a node's signature on a [`PeerMessage`].
+pub const MESSAGE_CONTEXT: &[u8] = b"CDK-PMSG-v1";
+const PMSG_MAGIC: &[u8] = b"CDK-PMSG-v1";
+/// Largest message payload (as an agent's `send`).
+pub const MAX_MESSAGE: usize = 64;
+/// Longest sender label (the agent on the sending node, e.g. `pid-3`).
+pub const MAX_SENDER: usize = 24;
+
+/// A message an agent on one node sends to an object on another, under a
+/// delegation (`grant`) the owning node issued to the sending node.
+///
+/// ```text
+/// "CDK-PMSG-v1" | sender_len u16 | sender NodeCert | grant_len u16 | grant PortableCap
+///               | seq u64 | from_len u8 | from | payload_len u8 | payload   (signed)
+///               | signature [3373]  (the sending node's issuer, MESSAGE_CONTEXT)
+/// ```
+///
+/// The owning node checks it when it arrives ([`PeerMessage::verify`]):
+/// the sender's certificate chains to the registry and has not expired;
+/// the grant was issued by a certified boot of *this* node (by name, so a
+/// delegation outlives this node's reboots until it expires) to the
+/// sender, and has not expired; both signatures verify. The caller then
+/// checks the permission, replay and revocation, and delivers.
+#[derive(Clone, Debug)]
+pub struct PeerMessage {
+    pub sender: NodeCert,
+    pub grant: PortableCap,
+    /// Unique per sending boot (replay protection at the receiver).
+    pub seq: u64,
+    /// The sending agent, e.g. `pid-3`.
+    pub from: String,
+    pub payload: Vec<u8>,
+    pub signature: Signature,
+}
+
+/// Sender labels: 1..=24 of `a-z A-Z 0-9 - _ : .`.
+pub fn valid_sender(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= MAX_SENDER
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_:.".contains(&b))
+}
+
+impl PeerMessage {
+    /// The fields the sending node signs, in order.
+    fn signed_part(&self) -> Vec<u8> {
+        let sender = self.sender.encode();
+        let grant = self.grant.encode();
+        let mut v = Vec::with_capacity(PMSG_MAGIC.len() + 4 + sender.len() + grant.len() + 100);
+        v.extend_from_slice(PMSG_MAGIC);
+        v.extend_from_slice(&(sender.len() as u16).to_le_bytes());
+        v.extend_from_slice(&sender);
+        v.extend_from_slice(&(grant.len() as u16).to_le_bytes());
+        v.extend_from_slice(&grant);
+        v.extend_from_slice(&self.seq.to_le_bytes());
+        v.push(self.from.len() as u8);
+        v.extend_from_slice(self.from.as_bytes());
+        v.push(self.payload.len() as u8);
+        v.extend_from_slice(&self.payload);
+        v
+    }
+
+    /// The digest the sending node signs.
+    pub fn digest(&self) -> [u8; 32] {
+        Sha256::digest(self.signed_part()).into()
+    }
+
+    /// The wire form: the signed part, then the signature.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut v = self.signed_part();
+        let mut sig = alloc::vec![0u8; SIG_LEN];
+        self.signature.write_to(&mut sig);
+        v.extend_from_slice(&sig);
+        v
+    }
+
+    /// Strict decoding (canonical: exactly one encoding per message).
+    pub fn decode(b: &[u8]) -> Option<PeerMessage> {
+        if b.len() > MAX_BLOB {
+            return None;
+        }
+        let mut r = Reader(b);
+        if r.take(PMSG_MAGIC.len())? != PMSG_MAGIC {
+            return None;
+        }
+        let n = r.u16()? as usize;
+        let sender = NodeCert::decode(r.take(n)?)?;
+        let n = r.u16()? as usize;
+        let grant = PortableCap::decode(r.take(n)?)?;
+        let seq = r.u64()?;
+        let from = r.name(valid_sender)?;
+        let n = r.u8()? as usize;
+        if n == 0 || n > MAX_MESSAGE {
+            return None;
+        }
+        let payload = r.take(n)?.to_vec();
+        let signature = Signature::from_slice(r.take(SIG_LEN)?)?;
+        r.0.is_empty().then_some(PeerMessage {
+            sender,
+            grant,
+            seq,
+            from,
+            payload,
+            signature,
+        })
+    }
+
+    /// Everything the owning node `me` checks that does not need its
+    /// state (permission bits, replay and revocation are the caller's).
+    pub fn verify(&self, registry: &Identity, me: &str, now: u64) -> Result<(), &'static str> {
+        if !self.sender.verify(registry) {
+            return Err("the sender's certificate is not signed by the pinned registry");
+        }
+        if now > self.sender.not_after {
+            return Err("the sender's certificate has expired");
+        }
+        let g = &self.grant;
+        if !g.cert.verify(registry) {
+            return Err("the delegation's certificate is not signed by the pinned registry");
+        }
+        if g.cert.name != me {
+            return Err("the delegation was not issued by this node");
+        }
+        if g.audience != self.sender.name {
+            return Err("the delegation was issued to another node");
+        }
+        if g.not_after > g.cert.not_after || now > g.not_after {
+            return Err("the delegation has expired");
+        }
+        if !hybrid::verify_with(&g.cert.issuer, &g.digest(), &g.signature, PORTABLE_CONTEXT) {
+            return Err("the delegation's signature does not verify");
+        }
+        if !hybrid::verify_with(
+            &self.sender.issuer,
+            &self.digest(),
+            &self.signature,
+            MESSAGE_CONTEXT,
+        ) {
+            return Err("the sender's signature does not verify");
+        }
+        Ok(())
+    }
+}
+
+/// `NextInbound`: ask for the next message in the gateway's inbox.
+pub fn encode_next_inbound() -> Vec<u8> {
+    alloc::vec![NEXT_INBOUND]
+}
+
+/// `InboundDone` for the inbox file `name`.
+pub fn encode_inbound_done(name: &str, accepted: bool) -> Vec<u8> {
+    let mut m = alloc::vec![INBOUND_DONE, name.len() as u8];
+    m.extend_from_slice(name.as_bytes());
+    m.push(accepted as u8);
+    m
+}
+
+/// `(file name, accepted)` of an `InboundDone`, if well formed.
+pub fn decode_inbound_done(b: &[u8]) -> Option<(&str, bool)> {
+    let r = b.strip_prefix(&[INBOUND_DONE])?;
+    let (&n, rest) = r.split_first()?;
+    let n = n as usize;
+    let name = core::str::from_utf8(rest.get(..n)?).ok()?;
+    let ok = match rest.get(n..)? {
+        [0] => false,
+        [1] => true,
+        _ => return None,
+    };
+    valid_file_name(name).then_some((name, ok))
+}
+
+/// `Revoke` for the delegation with `serial`.
+pub fn encode_revoke(serial: u64) -> Vec<u8> {
+    let mut m = alloc::vec![REVOKE];
+    m.extend_from_slice(&serial.to_le_bytes());
+    m
+}
+
+/// The serial of a `Revoke`.
+pub fn decode_revoke(b: &[u8]) -> Option<u64> {
+    let r = b.strip_prefix(&[REVOKE])?;
+    Some(u64::from_le_bytes(r.try_into().ok()?))
+}
+
+/// A revocation list: `count u16 | serial u64 …`.
+pub fn encode_revocations(serials: &[u64]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(2 + 8 * serials.len());
+    v.extend_from_slice(&(serials.len() as u16).to_le_bytes());
+    for s in serials {
+        v.extend_from_slice(&s.to_le_bytes());
+    }
+    v
+}
+
+/// The serials of a revocation list, if well formed.
+pub fn decode_revocations(b: &[u8]) -> Option<Vec<u64>> {
+    let mut r = Reader(b);
+    let n = r.u16()? as usize;
+    let mut out = Vec::with_capacity(n.min(1024));
+    for _ in 0..n {
+        out.push(r.u64()?);
+    }
+    r.0.is_empty().then_some(out)
 }
 
 #[cfg(test)]
@@ -560,5 +785,109 @@ mod tests {
         let status = encode_status(false, &long);
         let (ok, note) = decode_status(&status).unwrap();
         assert!(!ok && note.len() == 198 && note.chars().all(|c| c == '€'));
+    }
+
+    /// A message from `sender` under `grant`, signed by `key`.
+    fn pmsg(key: &Keypair, sender: NodeCert, grant: PortableCap, payload: &[u8]) -> PeerMessage {
+        let mut m = PeerMessage {
+            sender,
+            grant,
+            seq: 1,
+            from: "pid-1".into(),
+            payload: payload.to_vec(),
+            signature: Signature::from_slice(&[0; SIG_LEN]).unwrap(),
+        };
+        m.signature = key.sign_with(&m.digest(), MESSAGE_CONTEXT);
+        m
+    }
+
+    /// Stage 2: the owning node accepts a message only from the node it
+    /// delegated to, under its own unexpired delegation, correctly signed.
+    #[test]
+    fn peer_messages_are_checked_at_the_owning_node() {
+        let registry = Keypair::from_seeds(&[1; 32], &[2; 32]);
+        let hq = Keypair::from_seeds(&[3; 32], &[4; 32]);
+        let branch = Keypair::from_seeds(&[5; 32], &[6; 32]);
+        let grant = pcap(&hq, cert(&registry, &hq, "hq"), "alerts", "branch");
+        let sender = cert(&registry, &branch, "branch");
+        let m = pmsg(&branch, sender.clone(), grant.clone(), b"TXN 1002 HIGH");
+        let enc = m.encode();
+        let back = PeerMessage::decode(&enc).unwrap();
+        assert_eq!(back.encode(), enc);
+        assert_eq!(back.verify(registry.public(), "hq", 1_000), Ok(()));
+
+        // A later boot of hq (another issuer key, same name) still honours
+        // the delegation until it expires.
+        assert_eq!(back.verify(registry.public(), "hq", 1_500), Ok(()));
+        assert_eq!(
+            back.verify(registry.public(), "hq", 1_501),
+            Err("the delegation has expired")
+        );
+        assert_eq!(
+            back.verify(registry.public(), "other", 1_000),
+            Err("the delegation was not issued by this node")
+        );
+
+        // A third node replaying branch's delegation under its own name.
+        let mallory = Keypair::from_seeds(&[7; 32], &[8; 32]);
+        let m2 = pmsg(
+            &mallory,
+            cert(&registry, &mallory, "mallory"),
+            grant.clone(),
+            b"x",
+        );
+        assert_eq!(
+            m2.verify(registry.public(), "hq", 1_000),
+            Err("the delegation was issued to another node")
+        );
+        // Branch's certificate, someone else's signature.
+        let m3 = pmsg(&mallory, sender.clone(), grant.clone(), b"x");
+        assert_eq!(
+            m3.verify(registry.public(), "hq", 1_000),
+            Err("the sender's signature does not verify")
+        );
+        // A tampered payload, or the sender's certificate from another registry.
+        let mut tampered = back.clone();
+        tampered.payload[0] ^= 1;
+        assert!(tampered.verify(registry.public(), "hq", 1_000).is_err());
+        let other = Keypair::from_seeds(&[9; 32], &[9; 32]);
+        let m4 = pmsg(&branch, cert(&other, &branch, "branch"), grant, b"x");
+        assert!(m4.verify(registry.public(), "hq", 1_000).is_err());
+        // The sender's certificate expires too (2_000 in these fixtures).
+        assert!(back.verify(registry.public(), "hq", 2_001).is_err());
+
+        // Bounds: empty or oversized payloads do not decode.
+        let mut empty = back.clone();
+        empty.payload.clear();
+        assert!(PeerMessage::decode(&empty.encode()).is_none());
+        let mut huge = back.clone();
+        huge.payload = alloc::vec![0; MAX_MESSAGE + 1];
+        assert!(PeerMessage::decode(&huge.encode()).is_none());
+        assert!(PeerMessage::decode(&enc[..enc.len() - 1]).is_none());
+    }
+
+    /// Revocation lists and the inbox bookkeeping messages round-trip.
+    #[test]
+    fn revocations_and_inbox_codecs() {
+        let list = encode_revocations(&[1, u64::MAX, 42]);
+        assert_eq!(
+            decode_revocations(&list),
+            Some(alloc::vec![1, u64::MAX, 42])
+        );
+        assert_eq!(decode_revocations(&list[..list.len() - 1]), None);
+        assert_eq!(
+            decode_revocations(&encode_revocations(&[])),
+            Some(alloc::vec![])
+        );
+        assert_eq!(decode_revoke(&encode_revoke(7)), Some(7));
+        assert_eq!(
+            decode_inbound_done(&encode_inbound_done("msg-1", true)),
+            Some(("msg-1", true))
+        );
+        assert_eq!(
+            decode_inbound_done(&encode_inbound_done("../x", true)),
+            None
+        );
+        assert!(is_peer(&encode_next_inbound()) && is_peer(&encode_revoke(1)));
     }
 }
