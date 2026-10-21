@@ -163,6 +163,8 @@ const COMMANDS: &[&str] = &[
     "peer",
     "cap-export",
     "cap-import",
+    "cap-revoke",
+    "peer-sync",
     "boot",
     "capbench",
     "audit",
@@ -659,6 +661,8 @@ fn dispatch(
         "peer" => cmd_peer(),
         "cap-export" => cmd_cap_export(arg1, arg2, arg3, kernel),
         "cap-import" => cmd_cap_import(arg1, arg2, kernel, mem_graph),
+        "cap-revoke" => cmd_cap_revoke(arg1),
+        "peer-sync" => cmd_peer_sync(kernel),
         "boot" => crate::boot::report(|s| crate::print!("{}", s)),
         "capbench" => cmd_capbench(arg1, arg2, kernel),
         "audit" => cmd_audit(arg1),
@@ -779,6 +783,8 @@ fn cmd_help() {
     crate::println!("  peer              This node's certificate, the pinned registry, peer trust (roadmap 3.5)");
     crate::println!("  cap-export <pid> <h> <node> <file> [perms]  Delegate a handle to a peer node (gateway outbox)");
     crate::println!("  cap-import <file> <pid>  Verify a peer's capability (gateway inbox) and grant pid a handle");
+    crate::println!("  peer-sync         Send agents' messages on peer proxies; deliver peers' messages (gateway outbox/inbox)");
+    crate::println!("  cap-revoke <serial>  Revoke a delegation this node issued (serial from cap-export)");
     crate::println!("  boot              Verified-boot verdict, release key, measured registers and log");
     crate::println!("  policy check      Check every agent's handles against the rules");
     crate::println!("  policy reach      Show what each agent can reach, with labels");
@@ -1592,6 +1598,39 @@ fn cmd_peer() {
     for t in &p.trusts {
         crate::println!("  {}", t);
     }
+    for proxy in crate::peer::proxies() {
+        crate::println!("peer: proxy {} (messages go to its node at peer-sync)", proxy);
+    }
+    for serial in crate::peer::revoked() {
+        crate::println!("peer: revoked delegation {:016x}", serial);
+    }
+}
+
+/// `peer-sync`: send agents' messages on proxy objects to their owning
+/// nodes and deliver peers' messages from the gateway's inbox (roadmap 3.5).
+fn cmd_peer_sync(kernel: &mut Kernel) {
+    match crate::peer::sync(kernel) {
+        Ok(r) => crate::println!(
+            "peer-sync: {} sent, {} delivered, {} refused",
+            r.sent,
+            r.delivered,
+            r.rejected
+        ),
+        Err(e) => crate::println!("peer-sync: {}", e),
+    }
+}
+
+/// `cap-revoke <serial>`: refuse messages under a delegation this node
+/// issued, now and (recorded by the gateway) after reboots.
+fn cmd_cap_revoke(serial: &str) {
+    let Ok(serial) = u64::from_str_radix(serial.trim().trim_start_matches("0x"), 16) else {
+        crate::println!("Usage: cap-revoke <serial>   (hex, as printed by cap-export)");
+        return;
+    };
+    match crate::peer::revoke(serial) {
+        Ok(note) => crate::println!("cap-revoke: {:016x} revoked — {}", serial, note),
+        Err(e) => crate::println!("cap-revoke: {}", e),
+    }
 }
 
 /// `cap-export <pid> <h> <node> <file> [perms]`: delegate an agent's handle to a peer node through the gateway's outbox.
@@ -1628,11 +1667,12 @@ fn cmd_cap_export(pid: &str, handle: &str, rest: &str, kernel: &Kernel) {
         }
     };
     crate::println!(
-        "cap-export: '{}' [{}] for node '{}', signed by this node ('{}')",
+        "cap-export: '{}' [{}] for node '{}', signed by this node ('{}'), serial {:016x}",
         pcap.object,
         crate::agent::permission_names(pcap.perms),
         pcap.audience,
-        pcap.cert.name
+        pcap.cert.name,
+        pcap.serial
     );
     match crate::peer::send_export(file, &pcap) {
         Ok(note) => crate::println!("cap-export: {}", note),
@@ -2056,10 +2096,19 @@ fn cmd_recv(id: &str, kernel: &mut Kernel) {
         crate::println!("Usage: recv <id>");
         return;
     }
+    // Accept an object id or a unique name, as `send` does.
+    let resolved = kernel.resolve_object_ref(id);
+    let id = resolved.as_ref().map_or(id, |s| s.as_str());
     match kernel.receive_message_direct(id) {
         Ok(Some(msg)) => {
             crate::println!("From: {}", msg.from);
-            crate::println!("Payload: {:?}", msg.payload);
+            match &msg.payload {
+                crate::message::MessagePayload::Data(d) => match core::str::from_utf8(d) {
+                    Ok(text) => crate::println!("Payload: \"{}\" ({} bytes)", text.escape_debug(), d.len()),
+                    Err(_) => crate::println!("Payload: {:02x?}", d.as_slice()),
+                },
+                other => crate::println!("Payload: {:?}", other),
+            }
         }
         Ok(None) => crate::println!("(no messages)"),
         Err(e) => crate::println!("Error: {:?}", e),

@@ -245,6 +245,7 @@ fn certify(
     attestor: &attestation::Attestor,
     client: &Option<cdk_link::secure::Identity>,
     certified: &mut bool,
+    caps: &registry::CapDir,
 ) -> Vec<Vec<u8>> {
     let (Some(reg), Some(client)) = (reg, client) else {
         return Vec::new();
@@ -260,7 +261,21 @@ fn certify(
         hex(&client.id()[..8]),
         cert.serial
     );
-    cdk_link::peer::encode_blob(cdk_link::peer::kind::NODE_CERT, &cert.encode()).unwrap_or_default()
+    // This node's revocations first, so CDK refuses them from the start.
+    let revoked = caps.revocations();
+    let mut out = cdk_link::peer::encode_blob(
+        cdk_link::peer::kind::REVOCATIONS,
+        &cdk_link::peer::encode_revocations(&revoked),
+    )
+    .unwrap_or_default();
+    if !revoked.is_empty() {
+        eprintln!("gateway: -> {} revoked delegation(s)", revoked.len());
+    }
+    out.extend(
+        cdk_link::peer::encode_blob(cdk_link::peer::kind::NODE_CERT, &cert.encode())
+            .unwrap_or_default(),
+    );
+    out
 }
 
 /// Capability exports and imports: the gateway carries them between its
@@ -288,6 +303,10 @@ fn handle_peer(
                 )],
                 Err(e) => vec![peer::encode_status(false, &e)],
             },
+            Ok(Some((peer::kind::OUTBOUND, data))) => match caps.write_outbound(&data) {
+                Ok(name) => vec![peer::encode_status(true, &format!("queued {name}"))],
+                Err(e) => vec![peer::encode_status(false, &e)],
+            },
             Ok(_) => Vec::new(),
             Err(e) => vec![peer::encode_status(false, e)],
         },
@@ -303,6 +322,35 @@ fn handle_peer(
                 Err(e) => vec![peer::encode_status(false, &e)],
             }
         }
+        Some(&peer::NEXT_INBOUND) => match caps.next_inbound() {
+            Some(data) => {
+                eprintln!("gateway: -> inbound peer message to CDK");
+                peer::encode_blob(peer::kind::INBOUND, &data).unwrap_or_default()
+            }
+            None => vec![peer::encode_status(true, "none")],
+        },
+        Some(&peer::INBOUND_DONE) => {
+            if let Some((name, ok)) = peer::decode_inbound_done(msg) {
+                match caps.file_inbound(name, ok) {
+                    Ok(()) => eprintln!(
+                        "gateway: inbound {name}.pmsg {}",
+                        if ok { "delivered" } else { "REFUSED by CDK" }
+                    ),
+                    Err(e) => eprintln!("gateway: could not file {name}.pmsg: {e}"),
+                }
+            }
+            Vec::new()
+        }
+        Some(&peer::REVOKE) => match peer::decode_revoke(msg) {
+            Some(serial) => match caps.add_revocation(serial) {
+                Ok(()) => {
+                    eprintln!("gateway: revocation {serial:016x} recorded");
+                    vec![peer::encode_status(true, "recorded by the gateway")]
+                }
+                Err(e) => vec![peer::encode_status(false, &e)],
+            },
+            None => vec![peer::encode_status(false, "bad revocation")],
+        },
         _ => Vec::new(),
     }
 }
@@ -665,6 +713,7 @@ fn main() -> std::io::Result<()> {
                                     &attestor,
                                     &peer_identity,
                                     &mut certified,
+                                    &caps,
                                 ) {
                                     let mut out = [0u8; cdk_link::MAX_PAYLOAD];
                                     let len = s.seal(&msg, &mut out).expect("chunk fits");
@@ -678,6 +727,7 @@ fn main() -> std::io::Result<()> {
                                     &attestor,
                                     &peer_identity,
                                     &mut certified,
+                                    &caps,
                                 ) {
                                     let mut out = [0u8; cdk_link::MAX_PAYLOAD];
                                     let len = s.seal(&msg, &mut out).expect("chunk fits");

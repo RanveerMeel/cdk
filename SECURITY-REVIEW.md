@@ -53,6 +53,7 @@ the measurement chain and its limits are in §6), and denial of service by the h
 | Measuring UEFI loader (kernel and ramdisk files from the boot medium) | `boot/uefi-loader/src/main.rs` (`measure`, `PINNED_KERNEL`) | QEMU + OVMF + swtpm: PCRs 11–12 match `cdk-sign measure --loader`; the kernel's PCR 12 cross-check; gateway test: other kernel, BIOS boot (empty PCRs) refused; Secure Boot (OVMF SMM): unsigned loader and loader signed by another key refused by the firmware, changed kernel refused by the loader before parsing |
 | Boot manifest, kernel ELF measurement, attestation messages, expected-measurements file | `link/src/attest.rs`, `src/boot.rs` | `boot_attest` (accepted manifest ⇒ canonical; attestations re-encode exactly); QEMU tests: weakened policy, smuggled operator key, manifest re-signed with another key all lock down; unverified kernel refused by the gateway |
 | FPU/vector register isolation between agents | `src/fpu.rs`, `src/process.rs` (reset, restore, save on switch/block) | `fpu` agent in QEMU: 16 × 256-bit registers checked across preemptions and CPU migrations; negative control with switching disabled; `tools/check_kernel_no_simd.sh` keeps vector code out of the kernel (CI) |
+| Peer messages and revocation lists (roadmap 3.5 stage 2): from an untrusted courier | `link/src/peer.rs` (`PeerMessage`), `src/peer.rs` (`deliver`, `message_policy`), `gateway/src/registry.rs` | `link_messages` (strict decode, verify never panics, revocation and inbox codecs); unit tests: wrong audience, another node replaying a delegation, forged sender signature, tampered payload, foreign registry, expiry, payload bounds, `send` permission, revocation; QEMU, three boots: delivered after the owner rebooted, replayed copy and revoked delegation refused |
 | Peer capabilities and node certificates (roadmap 3.5): from an untrusted courier | `link/src/peer.rs`, `src/peer.rs`, `gateway/src/registry.rs` | `link_messages` (strict decode ⇒ canonical re-encode, verify never panics, blob reassembly bounds); unit tests: other registry, renamed certificate, widened permissions, another object, forged issuer, wrong audience, own node, expiry, outliving the certificate; QEMU with two nodes: replay, wrong audience, untrusted object, tampered file, expired after reboot refused |
 | Syscalls (every argument) | `src/syscall.rs`, `src/agent.rs`, `src/tools.rs`, `src/paging.rs` | `chaos` ring-3 program in QEMU: 20,000 syscalls with kernel, unmapped, read-only and boundary-straddling pointers, huge lengths, unknown numbers and handles |
 | MCP and model server responses | `gateway/src/mcp.rs`, `gateway/src/models.rs` | Gateway tests (status mapping, wrong-key redaction, redirects); not yet fuzzed |
@@ -113,9 +114,11 @@ host test suites also run under AddressSanitizer
   is detected (PCR 4) but not prevented. Secure Boot signatures are RSA
   (classical, a UEFI constraint); one key serves as PK, KEK and db in the
   QEMU setup.
-- Distributed capabilities (3.5, stage 1): each certifying gateway holds the
-  registry key; there is no revocation before expiry; time comes from the
-  gateway's clock.
+- Distributed capabilities (3.5): each certifying gateway holds the
+  registry key; time comes from the gateway's clock; replay protection for
+  peer messages is per boot of the receiving node (a courier could
+  re-deliver an old message after it reboots, until expiry); revocation
+  is enforced by the issuing node for messages, not by importers.
 - Under Secure Boot the loader still reads `boot.json` from the boot
   partition unsigned; it sets display and logging options only (the
   kernel's boot configuration is compiled into the pinned kernel).

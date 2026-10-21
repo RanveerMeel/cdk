@@ -17,6 +17,17 @@ fuzz_target!(|data: &[u8]| {
         let registry = p.cert.issuer.clone();
         let _ = p.verify(&registry, "fuzz", 0);
     }
+    if let Some(m) = peer::PeerMessage::decode(data) {
+        assert_eq!(m.encode(), data);
+        let registry = m.sender.issuer.clone();
+        let _ = m.verify(&registry, "fuzz", 0);
+    }
+    if let Some(list) = peer::decode_revocations(data) {
+        assert_eq!(peer::encode_revocations(&list), data);
+    }
+    if let Some((name, ok)) = peer::decode_inbound_done(data) {
+        assert_eq!(peer::encode_inbound_done(name, ok), data);
+    }
     let mut blobs = peer::BlobAssembler::default();
     for part in data.split(|&b| b == 0xfe) {
         if let Ok(Some((_, out))) = blobs.push(part) {

@@ -141,6 +141,19 @@ pub enum EventKind {
     /// signature, 3 not addressed to this node, 4 replayed, 5 not trusted by
     /// policy, 6 malformed, 7 expired).
     CapImportRejected = 34,
+    /// A delegation this node issued was revoked (roadmap 3.5 stage 2).
+    /// `detail` = its serial.
+    CapRevoked = 35,
+    /// An agent's message on a proxy was sent to the owning node. Subject
+    /// `<agent>><proxy>`; `detail` = sequence number.
+    PeerMessageSent = 36,
+    /// A peer's message was verified and delivered. Subject
+    /// `peer:<node>/<agent>><object>`; `detail` = payload bytes.
+    PeerMessageDelivered = 37,
+    /// A peer's message was refused. Subject as above; `detail` = reason
+    /// (as `cap-import-rejected`, plus 8 no send permission, 9 revoked,
+    /// 10 no such object).
+    PeerMessageRejected = 38,
 }
 
 impl EventKind {
@@ -180,6 +193,10 @@ impl EventKind {
             EventKind::CapExported => "cap-exported",
             EventKind::CapImported => "cap-imported",
             EventKind::CapImportRejected => "cap-import-rejected",
+            EventKind::CapRevoked => "cap-revoked",
+            EventKind::PeerMessageSent => "peer-msg-sent",
+            EventKind::PeerMessageDelivered => "peer-msg-delivered",
+            EventKind::PeerMessageRejected => "peer-msg-rejected",
         }
     }
 }
