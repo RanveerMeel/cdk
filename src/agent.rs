@@ -765,6 +765,13 @@ fn open_signed(req: &mut Pending) {
     let text = describe_request(req);
     crate::println!();
     crate::print!("{}", text);
+    // Operators sign the full payload, so they must see all of it: a
+    // description that does not fit one signed request is denied, never cut.
+    let Some(shown) = crate::approvals::whole_text(&text) else {
+        crate::println!("  signed approval: request too long to show operators in full — denied");
+        req.unsendable = true;
+        return;
+    };
     let (quorum, ttl) = {
         let policy = crate::policy::policy();
         let kind: heapless::String<32> = kernel_ref()
@@ -781,7 +788,7 @@ fn open_signed(req: &mut Pending) {
         quorum,
         ttl,
         &req.payload,
-        crate::approvals::fit_text(&text),
+        shown,
     ) {
         Ok(sid) => req.signed = Some(sid),
         Err(e) => {
@@ -881,6 +888,35 @@ mod tests {
     const SEND: u64 = 1 << 4;
     const RECV: u64 = 1 << 5;
     const DELETE: u64 = 1 << 6;
+
+    /// A tool call whose description is too long for one signed request
+    /// is not shown cut short: operators would sign more than they saw.
+    #[test]
+    fn long_tool_requests_do_not_fit_a_signed_approval() {
+        let req = |payload: &[u8]| Pending {
+            id: 1,
+            pid: 1,
+            handle: 0,
+            cap: cap(&[Permission::SendMessage]),
+            payload: heapless::Vec::from_slice(payload).unwrap(),
+            action: Action::Tool {
+                tool: "transfer".try_into().unwrap(),
+                out_ptr: 0,
+                out_len: 0,
+                pml4: 0,
+            },
+            signed: None,
+            unsendable: false,
+        };
+        let short = describe_request(&req(br#"{"amount":10}"#));
+        assert!(crate::approvals::whole_text(&short).is_some());
+        // Benign prefix, harmful tail, escaped to 4 bytes each.
+        let mut long = std::vec![b'a'; 200];
+        long.extend(core::iter::repeat_n(0x01u8, 300));
+        let text = describe_request(&req(&long));
+        assert!(text.len() > cdk_link::approval::MAX_TEXT);
+        assert!(crate::approvals::whole_text(&text).is_none());
+    }
 
     #[test]
     fn permission_bits_match_capability_mask() {

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Security: a signed approval for a gated action whose description does not
+  fit one request is now denied instead of shown cut short (operators could
+  otherwise sign data they never saw); the kernel RNG reports an insecure
+  source once RDRAND has failed and the software fallback was used, not only
+  when RDRAND is absent.
 - Security review of distributed capabilities: gateways no longer hold the
   registry root key. `cdk-sign node-authority <node> --root registry.key`
   authorizes one gateway key for one node name (`--registry-auth`; created

@@ -753,13 +753,12 @@ pub fn confirm(question: &str, reviewed: &str) -> bool {
     if crate::approvals::signed_mode() {
         let p = policy();
         crate::println!("{} — operator signatures required", question);
-        let text = crate::approvals::fit_text(reviewed);
-        if text.len() < reviewed.len() {
+        let Some(text) = crate::approvals::whole_text(reviewed) else {
             crate::println!(
                 "policy: too much to review in one signed request; split it into smaller changes"
             );
             return false;
-        }
+        };
         return match crate::approvals::open(
             cdk_link::approval::KIND_POLICY,
             p.policy_quorum(),

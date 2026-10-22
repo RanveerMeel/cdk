@@ -29,6 +29,8 @@ mod backend {
     const MAX_RETRIES: usize = 10;
 
     static RDRAND_WARNED: AtomicBool = AtomicBool::new(false);
+    /// Set once any output came from the software fallback (sticky).
+    static FALLBACK_USED: AtomicBool = AtomicBool::new(false);
     /// SplitMix64-style state for the software fallback (updated atomically).
     static SOFT_STATE: AtomicU64 = AtomicU64::new(0);
 
@@ -81,10 +83,17 @@ mod backend {
         crate::cpu::cpuid_has_rdrand()
     }
 
+    /// Whether any output so far came from the insecure fallback.
+    pub fn fallback_used() -> bool {
+        FALLBACK_USED.load(Ordering::SeqCst)
+    }
+
     fn soft_next_u64() -> u64 {
+        FALLBACK_USED.store(true, Ordering::SeqCst);
         if !RDRAND_WARNED.swap(true, Ordering::Relaxed) {
             crate::println!(
-                "RNG: WARNING — RDRAND unavailable; using INSECURE software fallback (SplitMix64 seeded from RDTSC)"
+                "RNG: WARNING — RDRAND {}; using INSECURE software fallback (SplitMix64 seeded from RDTSC)",
+                if rdrand_available() { "failing" } else { "unavailable" }
             );
             // Ensure non-zero seed so SplitMix never stalls at 0.
             let seed = seed_from_tsc() | 1;
@@ -184,18 +193,28 @@ impl EntropySource {
     }
 }
 
-/// Report the entropy source currently backing [`KernelRng`].
+/// Report the entropy source behind [`KernelRng`]'s output so far: insecure
+/// if the CPU lacks RDRAND *or* any draw has fallen back to SplitMix64
+/// (RDRAND advertised but failing). Key generation checks this *after*
+/// drawing its seeds, so a fallback during generation is reported.
 pub fn entropy_source() -> EntropySource {
     #[cfg(target_os = "none")]
     {
-        if crate::cpu::cpuid_has_rdrand() {
-            EntropySource::Hardware
-        } else {
-            EntropySource::InsecureFallback
-        }
+        hardware_source(crate::cpu::cpuid_has_rdrand(), backend::fallback_used())
     }
     #[cfg(not(target_os = "none"))]
     EntropySource::Os
+}
+
+/// The bare-metal source, given whether RDRAND is advertised and whether
+/// the fallback has been used.
+#[cfg_attr(not(target_os = "none"), allow(dead_code))]
+fn hardware_source(rdrand: bool, fallback_used: bool) -> EntropySource {
+    if rdrand && !fallback_used {
+        EntropySource::Hardware
+    } else {
+        EntropySource::InsecureFallback
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -206,6 +225,15 @@ pub fn entropy_source() -> EntropySource {
 mod tests {
     use super::*;
     use rand_core::RngCore;
+
+    /// RDRAND advertised is not enough: one fallback draw makes it insecure.
+    #[test]
+    fn fallback_after_rdrand_failure_is_insecure() {
+        assert_eq!(hardware_source(true, false), EntropySource::Hardware);
+        assert_eq!(hardware_source(true, true), EntropySource::InsecureFallback);
+        assert_eq!(hardware_source(false, false), EntropySource::InsecureFallback);
+        assert!(!hardware_source(true, true).is_secure());
+    }
 
     #[test]
     fn next_u64_produces_non_zero_values() {
