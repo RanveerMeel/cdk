@@ -153,16 +153,11 @@ pub fn has_open() -> bool {
     !OPEN.lock().is_empty()
 }
 
-/// Cut `text` to fit a request (at a character boundary).
-pub fn fit_text(text: &str) -> &str {
-    if text.len() <= ap::MAX_TEXT {
-        return text;
-    }
-    let mut end = ap::MAX_TEXT;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    &text[..end]
+/// `text` if operators can be shown all of it in one signed request;
+/// `None` if it does not fit. Never cut: a signature must not cover more
+/// than the operator saw.
+pub fn whole_text(text: &str) -> Option<&str> {
+    (text.len() <= ap::MAX_TEXT).then_some(text)
 }
 
 /// Open a signed request and send it to the gateway. `payload` is digested
@@ -404,5 +399,21 @@ pub fn wait_any() {
 pub fn for_each_open(mut f: impl FnMut(u32, u8, usize, u8)) {
     for r in OPEN.lock().iter() {
         f(r.id, r.kind, r.approvals.len(), r.quorum);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Text that does not fit one request is refused, not truncated.
+    #[test]
+    fn long_text_is_refused_not_cut() {
+        let fits = "x".repeat(ap::MAX_TEXT);
+        assert_eq!(whole_text(&fits), Some(fits.as_str()));
+        assert_eq!(whole_text(&"x".repeat(ap::MAX_TEXT + 1)), None);
+        // A multi-byte character straddling the limit is not split either.
+        let straddle = alloc::format!("{}é", "x".repeat(ap::MAX_TEXT - 1));
+        assert_eq!(whole_text(&straddle), None);
     }
 }

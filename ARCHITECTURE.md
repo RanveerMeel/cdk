@@ -63,7 +63,7 @@ ML-DSA-65 needs more stack than any kernel stack provides (host measurements: ~2
 #### RNG (`src/rng.rs`)
 
 `KernelRng` implements `rand_core::CryptoRng + RngCore`:
-- **Bare-metal**: RDRAND (retried up to 10 times). Without RDRAND it falls back to SplitMix64 seeded from RDTSC, which is **not secure**; `rng::entropy_source()` reports this and the issuer prints a warning that tokens are forgeable.
+- **Bare-metal**: RDRAND (retried up to 10 times). Without RDRAND it falls back to SplitMix64 seeded from RDTSC, which is **not secure**; `rng::entropy_source()` reports this — also when RDRAND is advertised but all 10 draws of any call failed and the fallback was used (sticky for the boot) — and the issuer, which checks it after drawing its seeds, prints a warning that tokens are forgeable.
 - **Host tests**: `rand_core::OsRng` backed by OS entropy
 
 ### Objects (`src/object.rs`)
@@ -256,7 +256,7 @@ agent blocks on a gated handle            policy change (grant, edit, listing)
      verify(pinned key, statement(request, decision), signature, "CDK-APPROVAL-v1")
 ```
 
-**The statement** each operator signs is SHA-256(`CDK-APPROVAL-v1` ‖ 0 ‖ id ‖ kernel issuer id ‖ kind ‖ quorum ‖ ttl ‖ payload digest ‖ text length ‖ text ‖ decision). The issuer id is regenerated every boot, so a decision cannot be replayed into another boot; the id makes it single-use within a boot; the decision byte means an approval can't be turned into a denial or the reverse. `cdk-approve` decodes the request itself, shows its text, and signs the statement it computes from the same bytes, so what the operator sees is what they sign. The signature (3,373 bytes) travels back in four `DecisionPart`s and is reassembled in order on the sealed channel.
+**The statement** each operator signs is SHA-256(`CDK-APPROVAL-v1` ‖ 0 ‖ id ‖ kernel issuer id ‖ kind ‖ quorum ‖ ttl ‖ payload digest ‖ text length ‖ text ‖ decision). The issuer id is regenerated every boot, so a decision cannot be replayed into another boot; the id makes it single-use within a boot; the decision byte means an approval can't be turned into a denial or the reverse. `cdk-approve` decodes the request itself, shows its text, and signs the statement it computes from the same bytes, so what the operator sees is what they sign. The text is never shortened: a gated action or policy change whose description (the payload escaped byte by byte) does not fit one request (`approval::MAX_TEXT`, 941 bytes) is denied, since the digest would cover data the operator never saw. The signature (3,373 bytes) travels back in four `DecisionPart`s and is reassembled in order on the sealed channel.
 
 **Counting.** A vote counts only if the operator key is pinned, the request is open, and the hybrid signature verifies (both halves; Ed25519 strictly). Any valid denial vetoes the request. It is approved once `quorum` distinct operators have approved, and denied once `approval-timeout` passes. Policy rules: `quorum <label> <n>` for actions on objects with that label (the largest applicable quorum wins, default 1), `quorum policy <n>` for policy changes, `approval-timeout <s>` (10–3600, default 300). A boot policy whose quorum exceeds the number of pinned operators fails closed. `policy review off` is refused in signed mode. The scheduler keeps other agents running while one waits, and idles on the link when all are waiting.
 
