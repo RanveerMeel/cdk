@@ -30,7 +30,8 @@
 //! cdk-gateway --init [--identity FILE] [--pub-out FILE]   create identity, export public key
 //! cdk-gateway [--identity FILE] [--mcp NAME=COMMAND]... [--model SPEC]... [--allow t1,t2]
 //!             [--spool DIR] [--expect FILE] [--tpm FILE] [--tpm-ca DIR]
-//!             [--registry-key FILE --node NAME [--cert-validity S]] [--cap-dir DIR] [SOCKET]
+//!             [--registry-key FILE --registry-auth FILE [--node NAME] [--cert-validity S]]
+//!             [--cap-dir DIR] [SOCKET]
 //! ```
 //! The public key file (1984 bytes) is packed into CDK's ramdisk as
 //! `gateway.pub`; CDK refuses any other gateway.
@@ -233,6 +234,7 @@ struct Args {
     tpm: Option<PathBuf>,
     tpm_ca: Option<PathBuf>,
     registry_key: Option<PathBuf>,
+    registry_auth: Option<PathBuf>,
     node: Option<String>,
     cert_validity: Option<u64>,
     cap_dir: PathBuf,
@@ -368,6 +370,7 @@ fn args() -> Args {
         tpm: None,
         tpm_ca: None,
         registry_key: None,
+        registry_auth: None,
         node: None,
         cert_validity: None,
         cap_dir: PathBuf::from("target/caps"),
@@ -393,6 +396,9 @@ fn args() -> Args {
             "--tpm-ca" => a.tpm_ca = Some(it.next().expect("--tpm-ca DIR").into()),
             "--registry-key" => {
                 a.registry_key = Some(it.next().expect("--registry-key FILE").into())
+            }
+            "--registry-auth" => {
+                a.registry_auth = Some(it.next().expect("--registry-auth FILE").into())
             }
             "--node" => a.node = Some(it.next().expect("--node NAME")),
             "--cert-validity" => {
@@ -462,6 +468,31 @@ fn main() -> std::io::Result<()> {
         }
     }
     let allowed = |t: &str| a.allow.as_ref().is_none_or(|l| l.iter().any(|x| x == t));
+    // Distributed capabilities (roadmap 3.5): certify the attested CDK.
+    // Checked before connecting, so a wrong authority fails at once.
+    let node_registry = a.registry_key.as_deref().map(|path| {
+        let auth = a.registry_auth.as_deref().unwrap_or_else(|| {
+            eprintln!("gateway: --registry-key needs --registry-auth FILE (cdk-sign node-authority)");
+            std::process::exit(2)
+        });
+        if a.expect.is_none() && a.tpm.is_none() && a.tpm_ca.is_none() {
+            eprintln!("gateway: refusing to certify an unattested node: --registry-key needs --expect, --tpm or --tpm-ca");
+            std::process::exit(2)
+        }
+        let mut reg = registry::Registry::load(path, auth, a.node.as_deref()).unwrap_or_else(|e| {
+            eprintln!("gateway: --registry-key: {e}");
+            std::process::exit(2)
+        });
+        if let Some(v) = a.cert_validity {
+            reg.validity_s = v;
+        }
+        eprintln!(
+            "gateway: authority for node '{}' under registry {}… will certify this CDK after its attestation is accepted",
+            reg.node,
+            hex(&reg.root_id()[..8])
+        );
+        reg
+    });
     eprintln!(
         "gateway: connecting to {} (waiting up to 60 s for CDK)",
         a.socket
@@ -534,30 +565,6 @@ fn main() -> std::io::Result<()> {
         store
     });
     let mut attestor = attestation::Attestor::new(expect, expect_loader, a.tpm.as_deref(), trust);
-    // Distributed capabilities (roadmap 3.5): certify the attested CDK.
-    let node_registry = a.registry_key.as_deref().map(|path| {
-        let node = a.node.as_deref().unwrap_or_else(|| {
-            eprintln!("gateway: --registry-key needs --node NAME");
-            std::process::exit(2)
-        });
-        if a.expect.is_none() && a.tpm.is_none() && a.tpm_ca.is_none() {
-            eprintln!("gateway: refusing to certify an unattested node: --registry-key needs --expect, --tpm or --tpm-ca");
-            std::process::exit(2)
-        }
-        let mut reg = registry::Registry::load(path, node).unwrap_or_else(|e| {
-            eprintln!("gateway: --registry-key: {e}");
-            std::process::exit(2)
-        });
-        if let Some(v) = a.cert_validity {
-            reg.validity_s = v;
-        }
-        eprintln!(
-            "gateway: registry {}… will certify this CDK as node '{}' after its attestation is accepted",
-            hex(&reg.public().id()[..8]),
-            reg.node
-        );
-        reg
-    });
     attestor.certify = node_registry.is_some();
     let caps = registry::CapDir(a.cap_dir.clone());
     let mut blobs = cdk_link::peer::BlobAssembler::default();

@@ -5,6 +5,8 @@
 #   tools/sign.sh manifest target/initrd       sign a staged ramdisk (build_user_programs.sh does this)
 #   tools/sign.sh measure KERNEL RAMDISK       write target/boot.measurements (run_qemu.sh does this)
 #   tools/sign.sh verify target/initrd         check a staged ramdisk
+#   tools/sign.sh node-authority NODE --root target/registry.key
+#                                              let one gateway certify node NODE
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 HOST="$(rustc -vV | sed -n 's/^host: //p')"

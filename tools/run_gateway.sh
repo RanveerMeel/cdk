@@ -48,15 +48,25 @@ if [ "${CDK_TPM:-1}" != "0" ] && command -v swtpm &> /dev/null; then
     fi
     if [ -n "$TPM_CA" ] && [ "$TPM_CA" != "none" ]; then EXPECT+=(--tpm-ca "$TPM_CA"); fi
 fi
-# Distributed capabilities (roadmap 3.5): CDK_NODE=<name> makes this gateway
-# the registry authority for the CDK it serves — once the attestation is
-# accepted it certifies CDK as node <name> with the registry key
-# (CDK_REGISTRY_KEY, default target/registry.key: tools/sign.sh init --key
-# target/registry.key --pub-out target/registry.pub). Exports and imports go
-# through CDK_CAP_DIR (default target/caps/{outbox,inbox}); CDK_CERT_VALIDITY
-# sets the certificate lifetime in seconds (default 24 h).
+# Distributed capabilities (roadmap 3.5): CDK_NODE=<name> lets this gateway
+# certify the CDK it serves as node <name> once its attestation is accepted.
+# It signs with its own key (target/node-<name>.key), which the registry
+# root authorized for that one name (target/node-<name>.auth, from
+# tools/sign.sh node-authority <name> --root target/registry.key); a
+# stolen gateway key cannot speak for any other node. In development the
+# pair is created here when the root key (CDK_REGISTRY_KEY, default
+# target/registry.key) is present. Exports and imports go through
+# CDK_CAP_DIR (default target/caps/{outbox,inbox}); CDK_CERT_VALIDITY sets
+# the certificate lifetime in seconds (default 24 h).
 if [ -n "${CDK_NODE:-}" ]; then
-    EXPECT+=(--registry-key "${CDK_REGISTRY_KEY:-$ROOT/target/registry.key}" --node "$CDK_NODE" \
+    NODE_KEY="$ROOT/target/node-$CDK_NODE.key"
+    NODE_AUTH="$ROOT/target/node-$CDK_NODE.auth"
+    REGISTRY_ROOT="${CDK_REGISTRY_KEY:-$ROOT/target/registry.key}"
+    if [ ! -e "$NODE_AUTH" ] && [ -e "$REGISTRY_ROOT" ]; then
+        "$ROOT/tools/sign.sh" node-authority "$CDK_NODE" --root "$REGISTRY_ROOT" \
+            --key-out "$NODE_KEY" --out "$NODE_AUTH" >&2
+    fi
+    EXPECT+=(--registry-key "$NODE_KEY" --registry-auth "$NODE_AUTH" --node "$CDK_NODE" \
         --cap-dir "${CDK_CAP_DIR:-$ROOT/target/caps}" ${CDK_CERT_VALIDITY:+--cert-validity "$CDK_CERT_VALIDITY"})
 fi
 exec "$BIN" "${ID[@]}" "${MCP[@]}" "${MODELS[@]}" "${SPOOL[@]}" "${EXPECT[@]}" ${CDK_MCP_ALLOW:+--allow "$CDK_MCP_ALLOW"} "${1:-$ROOT/target/cdk-link.sock}"

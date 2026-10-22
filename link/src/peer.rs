@@ -2,12 +2,20 @@
 //! capabilities, shared by the kernel and the gateway.
 //!
 //! **Node certificates.** A CDK kernel's issuer key is generated at every
-//! boot, so peers cannot pin it. Instead a *registry authority* (the
-//! gateway, holding the registry key) certifies it right after the node's
-//! attestation has been accepted: [`NodeCert`] binds a node name to this
-//! boot's issuer public key, hybrid-signed by the registry (FIPS 204 context
-//! [`NODE_CONTEXT`]). Every node pins the registry's public key in its
-//! release-signed ramdisk (`registry.pub`). A reboot means a new key and a
+//! boot, so peers cannot pin it. Instead it is certified right after the
+//! node's attestation has been accepted, through a two-level chain:
+//!
+//! * the **registry root** key stays offline; every node pins its public
+//!   key in its release-signed ramdisk (`registry.pub`);
+//! * the root signs one [`NodeAuthority`] per gateway: a gateway key that
+//!   may certify **one node name** and nothing else (FIPS 204 context
+//!   [`AUTHORITY_CONTEXT`]);
+//! * that gateway signs a [`NodeCert`] binding its node name to this boot's
+//!   issuer public key (context [`NODE_CONTEXT`]); the certificate carries
+//!   its authority, and verifiers check root → authority (same name) →
+//!   certificate.
+//!
+//! So a compromised gateway can speak only for its own node. A reboot means a new key and a
 //! new certificate; tokens from the previous boot stop verifying.
 //!
 //! **Portable capabilities.** [`PortableCap`] lets node A delegate a
@@ -48,8 +56,11 @@ use sha2::{Digest, Sha256};
 
 use crate::secure::{hybrid, Identity, Signature, IDENTITY_LEN, SIG_LEN};
 
-/// FIPS 204 context of registry signatures on node certificates.
+/// FIPS 204 context of a node authority's signature on a node certificate.
 pub const NODE_CONTEXT: &[u8] = b"CDK-NODE-v1";
+/// FIPS 204 context of the registry root's signature on a node authority.
+pub const AUTHORITY_CONTEXT: &[u8] = b"CDK-NODEAUTH-v1";
+const AUTH_MAGIC: &[u8] = b"CDK-NODE-AUTH-v1";
 /// FIPS 204 context of a node's signature on a portable capability.
 pub const PORTABLE_CONTEXT: &[u8] = b"CDK-PCAP-v1";
 const CERT_MAGIC: &[u8] = b"CDK-NODE-CERT-v1";
@@ -60,7 +71,7 @@ pub const MAX_NODE_NAME: usize = 16;
 /// `peer:<node>/<object>` fits a 32-byte object kind on the importer).
 pub const MAX_OBJECT_NAME: usize = 10;
 /// Largest portable capability or certificate accepted.
-pub const MAX_BLOB: usize = 32 * 1024;
+pub const MAX_BLOB: usize = 48 * 1024;
 const BLOB_DATA: usize = 512;
 
 pub const BLOB: u8 = 0x44;
@@ -140,7 +151,97 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// A registry's certificate for one boot of one node.
+/// The registry root's permission for one gateway key to certify one
+/// node name.
+///
+/// ```text
+/// "CDK-NODE-AUTH-v1" | name_len u8 | node | key [1984] | root id [16] | not_after u64  (signed by the root)
+///                    | signature [3373]
+/// ```
+#[derive(Clone, Debug)]
+pub struct NodeAuthority {
+    /// The only node name this authority may certify.
+    pub node: String,
+    /// The gateway's certifying key.
+    pub key: Identity,
+    /// Id of the root that signs it (copied into its certificates).
+    pub root: [u8; 16],
+    /// Valid until (Unix seconds).
+    pub not_after: u64,
+    pub signature: Signature,
+}
+
+impl NodeAuthority {
+    /// The fields the root signs, in order.
+    fn signed_part(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(AUTH_MAGIC.len() + 1 + self.node.len() + IDENTITY_LEN + 8);
+        v.extend_from_slice(AUTH_MAGIC);
+        v.push(self.node.len() as u8);
+        v.extend_from_slice(self.node.as_bytes());
+        let mut id = alloc::vec![0u8; IDENTITY_LEN];
+        self.key.write_to(&mut id);
+        v.extend_from_slice(&id);
+        v.extend_from_slice(&self.root);
+        v.extend_from_slice(&self.not_after.to_le_bytes());
+        v
+    }
+
+    /// The digest the root signs.
+    pub fn digest(&self) -> [u8; 32] {
+        Sha256::digest(self.signed_part()).into()
+    }
+
+    /// The wire form: the signed part, then the signature.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut v = self.signed_part();
+        let mut sig = alloc::vec![0u8; SIG_LEN];
+        self.signature.write_to(&mut sig);
+        v.extend_from_slice(&sig);
+        v
+    }
+
+    /// Strict decoding.
+    pub fn decode(b: &[u8]) -> Option<NodeAuthority> {
+        let mut r = Reader(b);
+        if r.take(AUTH_MAGIC.len())? != AUTH_MAGIC {
+            return None;
+        }
+        let node = r.name(valid_node_name)?;
+        let key = Identity::from_bytes(r.take(IDENTITY_LEN)?)?;
+        let root = r.take(16)?.try_into().ok()?;
+        let not_after = r.u64()?;
+        let signature = Signature::from_slice(r.take(SIG_LEN)?)?;
+        r.0.is_empty().then_some(NodeAuthority {
+            node,
+            key,
+            root,
+            not_after,
+            signature,
+        })
+    }
+
+    /// The registry `root` lets `key` certify node `node` until `not_after`.
+    pub fn issue(root: &hybrid::Keypair, node: &str, key: Identity, not_after: u64) -> NodeAuthority {
+        let mut a = NodeAuthority {
+            node: node.into(),
+            key,
+            root: root.public().id(),
+            not_after,
+            signature: Signature::from_slice(&[0; SIG_LEN]).expect("length"),
+        };
+        a.signature = root.sign_with(&a.digest(), AUTHORITY_CONTEXT);
+        a
+    }
+
+    /// Signed by the registry `root` (and naming it).
+    pub fn verify(&self, root: &Identity) -> bool {
+        self.root == root.id()
+            && hybrid::verify_with(root, &self.digest(), &self.signature, AUTHORITY_CONTEXT)
+    }
+}
+
+/// A certificate for one boot of one node, issued by that node's
+/// [`NodeAuthority`].
 #[derive(Clone, Debug)]
 pub struct NodeCert {
     pub name: String,
@@ -151,8 +252,11 @@ pub struct NodeCert {
     /// What the registry attested before certifying (a digest of the
     /// node's measured-boot registers and TPM PCRs).
     pub attested: [u8; 32],
-    /// Valid until (Unix seconds).
+    /// Valid until (Unix seconds); at most the authority's.
     pub not_after: u64,
+    /// The authority that issued it (carried so verifiers need only the
+    /// pinned root).
+    pub authority: NodeAuthority,
     pub signature: Signature,
 }
 
@@ -170,10 +274,13 @@ impl NodeCert {
         v.extend_from_slice(&self.serial.to_le_bytes());
         v.extend_from_slice(&self.attested);
         v.extend_from_slice(&self.not_after.to_le_bytes());
+        let auth = self.authority.encode();
+        v.extend_from_slice(&(auth.len() as u16).to_le_bytes());
+        v.extend_from_slice(&auth);
         v
     }
 
-    /// The digest the registry signs.
+    /// The digest the authority signs.
     pub fn digest(&self) -> [u8; 32] {
         Sha256::digest(self.signed_part()).into()
     }
@@ -199,6 +306,8 @@ impl NodeCert {
         let serial = r.u64()?;
         let attested = r.take(32)?.try_into().ok()?;
         let not_after = r.u64()?;
+        let n = r.u16()? as usize;
+        let authority = NodeAuthority::decode(r.take(n)?)?;
         let signature = Signature::from_slice(r.take(SIG_LEN)?)?;
         r.0.is_empty().then_some(NodeCert {
             name,
@@ -207,14 +316,25 @@ impl NodeCert {
             serial,
             attested,
             not_after,
+            authority,
             signature,
         })
     }
 
-    /// Signed by `registry` (and naming it).
-    pub fn verify(&self, registry: &Identity) -> bool {
-        self.registry == registry.id()
-            && hybrid::verify_with(registry, &self.digest(), &self.signature, NODE_CONTEXT)
+    /// The chain from the pinned registry `root`: the root signed the
+    /// authority, the authority may certify exactly this node name and
+    /// outlives the certificate, and the authority signed the certificate.
+    pub fn verify(&self, root: &Identity) -> bool {
+        self.registry == root.id()
+            && self.authority.node == self.name
+            && self.not_after <= self.authority.not_after
+            && self.authority.verify(root)
+            && hybrid::verify_with(
+                &self.authority.key,
+                &self.digest(),
+                &self.signature,
+                NODE_CONTEXT,
+            )
     }
 }
 
@@ -662,17 +782,97 @@ mod tests {
 
     /// A node certificate for `node`'s key, signed by `registry`.
     fn cert(registry: &Keypair, node: &Keypair, name: &str) -> NodeCert {
+        let gateway = gateway_key(name);
+        cert_by(
+            registry,
+            &authority(registry, &gateway, name),
+            &gateway,
+            node,
+            name,
+        )
+    }
+
+    /// The certifying key of `name`'s gateway (deterministic per name).
+    fn gateway_key(name: &str) -> Keypair {
+        let b = name.len() as u8;
+        Keypair::from_seeds(&[0x40 + b; 32], &[0x60 + b; 32])
+    }
+
+    /// The root's permission for `gateway` to certify `node`.
+    fn authority(root: &Keypair, gateway: &Keypair, node: &str) -> NodeAuthority {
+        let mut a = NodeAuthority {
+            node: node.into(),
+            key: gateway.public().clone(),
+            root: root.public().id(),
+            not_after: 3_000,
+            signature: Signature::from_slice(&[0; SIG_LEN]).unwrap(),
+        };
+        a.signature = root.sign_with(&a.digest(), AUTHORITY_CONTEXT);
+        a
+    }
+
+    /// A certificate for `node`'s key as `name`, signed by `gateway` under
+    /// `auth`, naming `root`.
+    fn cert_by(
+        root: &Keypair,
+        auth: &NodeAuthority,
+        gateway: &Keypair,
+        node: &Keypair,
+        name: &str,
+    ) -> NodeCert {
         let mut c = NodeCert {
             name: name.into(),
             issuer: node.public().clone(),
-            registry: registry.public().id(),
+            registry: root.public().id(),
             serial: 7,
             attested: [3; 32],
             not_after: 2_000,
+            authority: auth.clone(),
             signature: Signature::from_slice(&[0; SIG_LEN]).unwrap(),
         };
-        c.signature = registry.sign_with(&c.digest(), NODE_CONTEXT);
+        c.signature = gateway.sign_with(&c.digest(), NODE_CONTEXT);
         c
+    }
+
+    /// Security review 2026-10-21: a gateway's authority covers one node
+    /// name, so a compromised gateway cannot certify another node.
+    #[test]
+    fn authorities_are_scoped_to_one_node() {
+        let root = Keypair::from_seeds(&[1; 32], &[2; 32]);
+        let node = Keypair::from_seeds(&[3; 32], &[4; 32]);
+        let branch_gw = gateway_key("branch");
+        let branch_auth = authority(&root, &branch_gw, "branch");
+        assert!(cert_by(&root, &branch_auth, &branch_gw, &node, "branch").verify(root.public()));
+        // Branch's gateway signing a certificate for "hq": refused.
+        let forged = cert_by(&root, &branch_auth, &branch_gw, &node, "hq");
+        assert!(!forged.verify(root.public()));
+        // An authority not signed by the pinned root: refused.
+        let other_root = Keypair::from_seeds(&[9; 32], &[9; 32]);
+        let rogue = authority(&other_root, &branch_gw, "hq");
+        assert!(!cert_by(&root, &rogue, &branch_gw, &node, "hq").verify(root.public()));
+        // A certificate signed by some other key than the authority's: refused.
+        let mallory = Keypair::from_seeds(&[7; 32], &[7; 32]);
+        assert!(!cert_by(&root, &branch_auth, &mallory, &node, "branch").verify(root.public()));
+        // A certificate outliving its authority: refused.
+        let mut long = cert_by(&root, &branch_auth, &branch_gw, &node, "branch");
+        long.not_after = 3_001;
+        long.signature = branch_gw.sign_with(&long.digest(), NODE_CONTEXT);
+        assert!(!long.verify(root.public()));
+        // The root key itself is not a node authority.
+        let direct = cert_by(
+            &root,
+            &authority(&root, &root, "branch"),
+            &root,
+            &node,
+            "branch",
+        );
+        assert!(
+            direct.verify(root.public()),
+            "only if the root signs an authority for itself"
+        );
+        let enc = branch_auth.encode();
+        assert_eq!(NodeAuthority::decode(&enc).unwrap().encode(), enc);
+        assert!(NodeAuthority::decode(&enc[..enc.len() - 1]).is_none());
     }
 
     /// A portable capability on `object` for `audience`, signed by `node`.

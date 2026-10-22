@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Security review of distributed capabilities: gateways no longer hold the
+  registry root key. `cdk-sign node-authority <node> --root registry.key`
+  authorizes one gateway key for one node name (`--registry-auth`; created
+  automatically by `run_gateway.sh` in development), and certificates carry
+  and are checked against that authority — **existing node certificates and
+  portable capabilities no longer verify; rebuild and re-export.** Inbound
+  peer messages match object names exactly; `cap-export` asks for operator
+  confirmation (or a signed approval) after a delegation review.
 - Distributed capabilities, stage 2 (roadmap 3.5): `peer-sync` carries
   agents' messages on proxy objects to the owning node, which verifies the
   sender, its own delegation, signatures, permission, replay and

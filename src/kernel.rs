@@ -778,6 +778,23 @@ impl Kernel {
     /// Resolve `ref_name` to an object id.
     ///
     /// Lookup order: exact id → unique `kind` (create name) → unique `intent`.
+    /// The id of the one object named `name` (its kind), matched exactly:
+    /// never by id or intent. For names that cross a trust boundary (a
+    /// peer's delegation, roadmap 3.5), where `obj-N` ids are reassigned
+    /// every boot and intents are free text. Ambiguous names are refused.
+    pub fn find_by_name(&self, name: &str) -> KernelResult<String<MAX_ID_LEN>> {
+        let mut found: Option<String<MAX_ID_LEN>> = None;
+        for obj in self.objects.values() {
+            if obj.kind.as_str() == name {
+                if found.is_some() {
+                    return Err(KernelError::ObjectNotFound);
+                }
+                found = Some(obj.id.clone());
+            }
+        }
+        found.ok_or(KernelError::ObjectNotFound)
+    }
+
     pub fn resolve_object_ref(&self, ref_name: &str) -> KernelResult<String<MAX_ID_LEN>> {
         if ref_name.is_empty() {
             return Err(KernelError::ObjectNotFound);
@@ -1139,6 +1156,21 @@ mod tests {
         let mut cap = Capability::with_permissions(obj, perms);
         cap.issue().unwrap();
         cap
+    }
+
+    /// Security review 2026-10-21: peer delegations name objects by exact
+    /// name — never by id (reassigned every boot) or intent (free text).
+    #[test]
+    fn find_by_name_matches_names_only() {
+        let mut k = Kernel::new();
+        let a = k.register_object(KernelObject::new_compute("alerts", "normal")).object_id;
+        let _ = k.register_object(KernelObject::new_compute("ledger", "alerts2"));
+        assert_eq!(k.find_by_name("alerts").unwrap(), a);
+        assert!(k.find_by_name(&a).is_err(), "an id is not a name");
+        assert!(k.find_by_name("normal").is_err(), "an intent is not a name");
+        assert!(k.resolve_object_ref("normal").is_ok(), "(the console's lookup does accept intents)");
+        let _ = k.register_object(KernelObject::new_compute("alerts", "other"));
+        assert!(k.find_by_name("alerts").is_err(), "ambiguous names are refused");
     }
 
     #[test]
