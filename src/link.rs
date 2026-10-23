@@ -85,6 +85,8 @@ pub fn secure_connect(timeout_ms: u64) -> Result<[u8; 16], SecureError> {
     let result = secure_connect_inner(timeout_ms);
     if let Ok(id) = &result {
         answer_attestation(id, 3000);
+        // Roadmap 4.5: the sealed store, from a gateway that accepted us.
+        crate::store::load();
     }
     match &result {
         Ok(id) => crate::audit::record_fmt(

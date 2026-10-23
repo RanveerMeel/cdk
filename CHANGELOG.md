@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Persistent sealed storage (roadmap 4.5): revocations and the replay
+  records of peer messages and imports survive reboots in an envelope the
+  gateway keeps (`cdk-gateway --store FILE`; `CDK_STORE` in
+  `run_gateway.sh`) but cannot read, change or roll back — ChaCha20-Poly1305
+  under a key the TPM seals to PCRs 0, 2, 4, 7 and 11, plus a monotonic TPM
+  NV counter (index `0x01004344`). Acceptance is committed before delivery;
+  a missing, rolled-back, tampered or foreign store fails closed until the
+  reviewed `store-reset`, which also creates the first store on a TPM. New
+  console commands `store`, `store-reset`; new policy rule
+  `require sealed-store` (in `policy/default.rules`: TPM-less lab setups
+  that use distributed capabilities must remove it); audit `store-loaded`,
+  `store-failed`, `store-reset`; peer refusal reason 11. **Upgrading:** run
+  `store-reset` once per TPM machine, and again after each kernel or
+  firmware update.
+
 ## v0.2.0 — preview (2026-10-23)
 
 **Upgrading from v0.1.0:** re-enroll TPM machines once (the UEFI loader and

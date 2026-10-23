@@ -165,6 +165,8 @@ const COMMANDS: &[&str] = &[
     "cap-import",
     "cap-revoke",
     "peer-sync",
+    "store",
+    "store-reset",
     "boot",
     "capbench",
     "audit",
@@ -663,6 +665,8 @@ fn dispatch(
         "cap-import" => cmd_cap_import(arg1, arg2, kernel, mem_graph),
         "cap-revoke" => cmd_cap_revoke(arg1),
         "peer-sync" => cmd_peer_sync(kernel),
+        "store" => cmd_store(),
+        "store-reset" => cmd_store_reset(),
         "boot" => crate::boot::report(|s| crate::print!("{}", s)),
         "capbench" => cmd_capbench(arg1, arg2, kernel),
         "audit" => cmd_audit(arg1),
@@ -785,6 +789,8 @@ fn cmd_help() {
     crate::println!("  cap-import <file> <pid>  Verify a peer's capability (gateway inbox) and grant pid a handle");
     crate::println!("  peer-sync         Send agents' messages on peer proxies; deliver peers' messages (gateway outbox/inbox)");
     crate::println!("  cap-revoke <serial>  Revoke a delegation this node issued (serial from cap-export)");
+    crate::println!("  store             The TPM-sealed store of revocations and replay records (roadmap 4.5)");
+    crate::println!("  store-reset       Start a new sealed store from this boot's state (reviewed)");
     crate::println!("  boot              Verified-boot verdict, release key, measured registers and log");
     crate::println!("  policy check      Check every agent's handles against the rules");
     crate::println!("  policy reach      Show what each agent can reach, with labels");
@@ -1606,6 +1612,39 @@ fn cmd_peer() {
     }
 }
 
+/// `store`: the sealed store's state and what it holds.
+fn cmd_store() {
+    crate::println!("store: {}", crate::store::status());
+    let r = crate::peer::snapshot();
+    crate::println!(
+        "store: this boot holds {} revocation(s), {} delivered message(s), {} import(s)",
+        r.revoked.len(),
+        r.delivered.len(),
+        r.imported.len()
+    );
+}
+
+/// `store-reset`: after review, abandon the current sealed store and start
+/// a new one, sealed to this boot chain, from this boot's records.
+fn cmd_store_reset() {
+    let r = crate::peer::snapshot();
+    let text = alloc::format!(
+        "=== SEALED STORE RESET ===\n  - the current store is abandoned: revocations and replay records only it holds are lost\n  + a new store sealed to this boot chain (PCRs 0,2,4,7,11) with this boot's {} revocation(s), {} delivered, {} imported\n",
+        r.revoked.len(),
+        r.delivered.len(),
+        r.imported.len()
+    );
+    crate::print!("{}", text);
+    if !crate::policy::confirm("Start a new sealed store?", &text) {
+        crate::println!("store-reset: not approved");
+        return;
+    }
+    match crate::store::reset() {
+        Ok(c) => crate::println!("store-reset: new sealed store (TPM counter {})", c),
+        Err(e) => crate::println!("store-reset: {}", e),
+    }
+}
+
 /// `peer-sync`: send agents' messages on proxy objects to their owning
 /// nodes and deliver peers' messages from the gateway's inbox (roadmap 3.5).
 fn cmd_peer_sync(kernel: &mut Kernel) {
@@ -1751,8 +1790,11 @@ fn cmd_cap_import(file: &str, pid: &str, kernel: &mut Kernel, mem_graph: &mut Me
         }
     };
     if crate::policy::review_grants(kernel, &[g.clone()]) {
-        apply_grant(&g, &ps, kernel);
-        crate::peer::mark_imported(&a);
+        // Recorded (in the sealed store too) before the grant takes effect.
+        match crate::peer::mark_imported(&a) {
+            Ok(()) => apply_grant(&g, &ps, kernel),
+            Err(e) => crate::println!("cap-import: REFUSED — {}", e),
+        }
     } else {
         crate::println!("cap-import: not granted (policy review); the capability can be imported again");
     }
@@ -1816,6 +1858,9 @@ fn policy_show() {
     }
     for (sel, l) in &p.labels {
         crate::println!("  {} -> {}", sel.as_str(), l.as_str());
+    }
+    if p.require_sealed_store {
+        crate::println!("require sealed-store: peer messages and imports need the TPM-sealed store ({})", crate::store::status());
     }
     if crate::approvals::signed_mode() {
         crate::print!("approvals: signed by operators; time-out {} s; quorum", p.approval_timeout_s);

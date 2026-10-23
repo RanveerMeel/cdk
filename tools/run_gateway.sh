@@ -47,6 +47,9 @@ if [ "${CDK_TPM:-1}" != "0" ] && command -v swtpm &> /dev/null; then
         TPM_CA="$ROOT/target/tpm-manufacturer/trust"
     fi
     if [ -n "$TPM_CA" ] && [ "$TPM_CA" != "none" ]; then EXPECT+=(--tpm-ca "$TPM_CA"); fi
+    # Sealed store (roadmap 4.5): CDK's TPM-sealed revocation and replay
+    # records, kept here as an opaque file (CDK_STORE; one per TPM).
+    EXPECT+=(--store "${CDK_STORE:-$ROOT/target/sealed-store.bin}")
 fi
 # Distributed capabilities (roadmap 3.5): CDK_NODE=<name> lets this gateway
 # certify the CDK it serves as node <name> once its attestation is accepted.

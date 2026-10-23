@@ -1,14 +1,25 @@
 //! Tool, model, approval and peer (roadmap 3.5) messages inside the sealed
-//! channel, and portable capabilities / node certificates and authorities from a peer. Anything
+//! channel, and portable capabilities / node certificates and authorities from a peer,
+//! and the sealed store from the gateway. Anything
 //! that decodes must re-encode to the same bytes (no two encodings of one
 //! message), and reassembly must never produce more than it was given.
 #![no_main]
-use cdk_link::{approval, peer, tool};
+use cdk_link::{approval, peer, store, tool};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     // Peer capabilities come from an untrusted courier: decoding is strict
     // (canonical), and verification never panics.
+    // The sealed store comes back from an untrusted gateway: strict
+    // decoding, and opening (authentication) never panics.
+    if let Some(e) = store::Envelope::decode(data) {
+        assert_eq!(e.encode(), data);
+        assert!(data.len() <= store::MAX_ENVELOPE);
+        let _ = e.open(&[0; store::KEY_LEN]);
+    }
+    if let Some(r) = store::Records::decode(data) {
+        assert_eq!(r.encode().as_deref(), Some(data));
+    }
     if let Some(a) = peer::NodeAuthority::decode(data) {
         assert_eq!(a.encode(), data);
         let _ = a.verify(&a.key);

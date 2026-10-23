@@ -154,6 +154,18 @@ pub enum EventKind {
     /// (as `cap-import-rejected`, plus 8 no send permission, 9 revoked,
     /// 10 no such object).
     PeerMessageRejected = 38,
+    /// The sealed store was opened at boot (roadmap 4.5). Subject
+    /// `store:loaded`; `detail` = TPM counter value.
+    StoreLoaded = 39,
+    /// The sealed store could not be used: acceptance of peer messages and
+    /// imports is refused until `store-reset`. `detail` = reason (1 missing,
+    /// 2 sealed to another boot chain, 3 tampered, 4 rolled back, 5 TPM
+    /// error, 6 counter without a store or store without a counter, 7 none
+    /// yet).
+    StoreFailed = 40,
+    /// The operator started a new sealed store (`store-reset`). `detail` =
+    /// TPM counter value.
+    StoreReset = 41,
 }
 
 impl EventKind {
@@ -197,6 +209,9 @@ impl EventKind {
             EventKind::PeerMessageSent => "peer-msg-sent",
             EventKind::PeerMessageDelivered => "peer-msg-delivered",
             EventKind::PeerMessageRejected => "peer-msg-rejected",
+            EventKind::StoreLoaded => "store-loaded",
+            EventKind::StoreFailed => "store-failed",
+            EventKind::StoreReset => "store-reset",
         }
     }
 }
