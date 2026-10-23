@@ -1,6 +1,6 @@
 # CDK — Quantum-Safe Agent Trust Kernel
 
-**Website:** [https://ranveermeel.github.io/cdk/](https://ranveermeel.github.io/cdk/) _(GitHub Pages)_ · **Release:** [v0.1.0 preview](https://github.com/RanveerMeel/cdk/releases/tag/v0.1.0) · **Demo:** [DEMO.md](DEMO.md) · **Plan:** [ROADMAP.md](ROADMAP.md) · **Security:** [SECURITY.md](SECURITY.md) · **Review brief:** [SECURITY-REVIEW.md](SECURITY-REVIEW.md)
+**Website:** [https://ranveermeel.github.io/cdk/](https://ranveermeel.github.io/cdk/) _(GitHub Pages)_ · **Release:** [v0.2.0 preview](https://github.com/RanveerMeel/cdk/releases/tag/v0.2.0) · **Demo:** [DEMO.md](DEMO.md) · **Plan:** [ROADMAP.md](ROADMAP.md) · **Security:** [SECURITY.md](SECURITY.md) · **Review brief:** [SECURITY-REVIEW.md](SECURITY-REVIEW.md)
 
 CDK (Cognitive Distributed Kernel) is an open-source, bare-metal Rust kernel for running **AI agents under kernel-enforced, cryptographically provable permissions**, built on **post-quantum cryptography** from the start.
 
@@ -129,12 +129,12 @@ CDK is **open core**. This repository — the kernel, the capability model, the 
 
 ### Try a release
 
-The [v0.1.0 preview](https://github.com/RanveerMeel/cdk/releases/tag/v0.1.0) ships a ready-to-boot evaluation image, built reproducibly (two independent builds are byte-identical) and with an SBOM. Check its signed checksums before running it; the release key ID `0b57f6795dcdf315f2512079b8e16ba8` is stated in the [release notes](docs/releases/v0.1.0.md):
+The [v0.2.0 preview](https://github.com/RanveerMeel/cdk/releases/tag/v0.2.0) ships a ready-to-boot evaluation image, built reproducibly (two independent builds are byte-identical) and with an SBOM. Check its signed checksums before running it; the release key ID `0b57f6795dcdf315f2512079b8e16ba8` is stated in the [release notes](docs/releases/v0.2.0.md):
 
 ```bash
 sha256sum -c SHA256SUMS
 tools/sign.sh verify-file SHA256SUMS --pub cdk-release.pub   # from a source checkout
-qemu-system-x86_64 -cpu max -drive format=raw,file=cdk-0.1.0-eval.img -serial stdio -display none
+qemu-system-x86_64 -cpu max -smp 4 -drive format=raw,file=cdk-0.2.0-eval.img -serial stdio -display none
 ```
 
 To cut a release yourself: `tools/release.sh VERSION` (see [CHANGELOG.md](CHANGELOG.md)).

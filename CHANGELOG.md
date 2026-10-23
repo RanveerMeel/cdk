@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## v0.2.0 — preview (2026-10-23)
+
+**Upgrading from v0.1.0:** re-enroll TPM machines once (the UEFI loader and
+the CPU count are measured: delete `target/tpm-enrollment*`); rebuild user
+programs (new target `user/x86_64-cdk-user.json`); for distributed
+capabilities, create a node authority per gateway (`tools/sign.sh
+node-authority <node>`) — node certificates and portable capabilities from
+earlier builds do not verify.
+
 - Security: a signed approval for a gated action whose description does not
   fit one request is now denied instead of shown cut short (operators could
   otherwise sign data they never saw); the kernel RNG reports an insecure
