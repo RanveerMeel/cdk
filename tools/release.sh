@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build a CDK release reproducibly, sign it, and write its SBOM.
 #
-#   tools/release.sh 0.1.0 [--allow-dirty]
+#   tools/release.sh 0.2.0 [--allow-dirty]
 #
 # 1. Archives the committed source (git archive HEAD).
 # 2. Unpacks it into two different directories and builds each from scratch,
