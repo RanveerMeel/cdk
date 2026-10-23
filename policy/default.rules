@@ -8,9 +8,18 @@
 #   approval <label>            exec/send/write/delete on such objects must
 #                               carry the human-approval constraint
 #   label <object-or-kind> <l>  attach a label to an object id or kind
+#   require sealed-store        peer messages and imports need the TPM-sealed
+#                               store (roadmap 4.5)
 #
 # Automatic labels: tool, model, credential (the gateway adds a key),
 # remote (requests leave this machine).
+
+# Distributed capabilities (roadmap 3.5): accept peers' messages and
+# capabilities only while the TPM-sealed store (roadmap 4.5) holds the
+# revocation and replay records — so a boot without it (TPM removed or
+# disabled, BIOS instead of UEFI) cannot be used to replay them. Lab setups
+# without a TPM can remove this line; their records then last one boot.
+require sealed-store
 
 # Anything that spends a credential or leaves the machine needs a human
 # decision on every use.

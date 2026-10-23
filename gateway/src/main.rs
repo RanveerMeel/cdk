@@ -31,7 +31,7 @@
 //! cdk-gateway [--identity FILE] [--mcp NAME=COMMAND]... [--model SPEC]... [--allow t1,t2]
 //!             [--spool DIR] [--expect FILE] [--tpm FILE] [--tpm-ca DIR]
 //!             [--registry-key FILE --registry-auth FILE [--node NAME] [--cert-validity S]]
-//!             [--cap-dir DIR] [SOCKET]
+//!             [--cap-dir DIR] [--store FILE] [SOCKET]
 //! ```
 //! The public key file (1984 bytes) is packed into CDK's ramdisk as
 //! `gateway.pub`; CDK refuses any other gateway.
@@ -54,6 +54,7 @@ mod mcp;
 mod models;
 mod registry;
 mod spool;
+mod store;
 
 fn send(stream: &mut UnixStream, k: u8, flags: u8, payload: &[u8]) -> std::io::Result<()> {
     let mut buf = [0u8; MAX_FRAME];
@@ -238,6 +239,7 @@ struct Args {
     node: Option<String>,
     cert_validity: Option<u64>,
     cap_dir: PathBuf,
+    store: Option<PathBuf>,
 }
 
 /// Once the attestation is accepted: the node certificate for the key CDK
@@ -286,6 +288,7 @@ fn handle_peer(
     msg: &[u8],
     serving: bool,
     caps: &registry::CapDir,
+    sealed: Option<&store::StoreFile>,
     blobs: &mut cdk_link::peer::BlobAssembler,
 ) -> Vec<Vec<u8>> {
     use cdk_link::peer;
@@ -308,6 +311,20 @@ fn handle_peer(
             Ok(Some((peer::kind::OUTBOUND, data))) => match caps.write_outbound(&data) {
                 Ok(name) => vec![peer::encode_status(true, &format!("queued {name}"))],
                 Err(e) => vec![peer::encode_status(false, &e)],
+            },
+            Ok(Some((peer::kind::STORE, data))) => match sealed.map(|f| f.write(&data)) {
+                None => vec![peer::encode_status(
+                    false,
+                    "the gateway keeps no store (--store)",
+                )],
+                Some(Ok(counter)) => {
+                    eprintln!("gateway: sealed store written (counter {counter})");
+                    vec![peer::encode_status(true, "stored")]
+                }
+                Some(Err(e)) => {
+                    eprintln!("gateway: sealed store NOT written: {e}");
+                    vec![peer::encode_status(false, &e)]
+                }
             },
             Ok(_) => Vec::new(),
             Err(e) => vec![peer::encode_status(false, e)],
@@ -343,6 +360,18 @@ fn handle_peer(
             }
             Vec::new()
         }
+        Some(&cdk_link::store::STORE_GET) => match sealed.map(|f| f.read()) {
+            None => vec![peer::encode_status(
+                false,
+                "the gateway keeps no store (--store)",
+            )],
+            Some(Ok(Some(data))) => {
+                eprintln!("gateway: -> sealed store to CDK ({} bytes)", data.len());
+                peer::encode_blob(peer::kind::STORE, &data).unwrap_or_default()
+            }
+            Some(Ok(None)) => vec![peer::encode_status(true, "no store yet")],
+            Some(Err(e)) => vec![peer::encode_status(false, &e)],
+        },
         Some(&peer::REVOKE) => match peer::decode_revoke(msg) {
             Some(serial) => match caps.add_revocation(serial) {
                 Ok(()) => {
@@ -374,6 +403,7 @@ fn args() -> Args {
         node: None,
         cert_validity: None,
         cap_dir: PathBuf::from("target/caps"),
+        store: None,
         allow: None,
     };
     let mut it = std::env::args().skip(1);
@@ -410,6 +440,7 @@ fn args() -> Args {
                 )
             }
             "--cap-dir" => a.cap_dir = it.next().expect("--cap-dir DIR").into(),
+            "--store" => a.store = Some(it.next().expect("--store FILE").into()),
             "--allow" => {
                 let list = it.next().expect("--allow tool1,tool2");
                 a.allow = Some(list.split(',').map(str::to_string).collect());
@@ -567,6 +598,7 @@ fn main() -> std::io::Result<()> {
     let mut attestor = attestation::Attestor::new(expect, expect_loader, a.tpm.as_deref(), trust);
     attestor.certify = node_registry.is_some();
     let caps = registry::CapDir(a.cap_dir.clone());
+    let sealed = a.store.clone().map(store::StoreFile);
     let mut blobs = cdk_link::peer::BlobAssembler::default();
     let mut peer_identity: Option<cdk_link::secure::Identity> = None;
     let mut certified = false;
@@ -742,9 +774,13 @@ fn main() -> std::io::Result<()> {
                                 }
                             }
                             Ok(m) if m > 0 && cdk_link::peer::is_peer(&plain[..m]) => {
-                                for msg in
-                                    handle_peer(&plain[..m], attestor.serving(), &caps, &mut blobs)
-                                {
+                                for msg in handle_peer(
+                                    &plain[..m],
+                                    attestor.serving(),
+                                    &caps,
+                                    sealed.as_ref(),
+                                    &mut blobs,
+                                ) {
                                     let mut out = [0u8; cdk_link::MAX_PAYLOAD];
                                     let len = s.seal(&msg, &mut out).expect("message fits");
                                     send(&mut stream, kind::SEALED, 0, &out[..len])?;

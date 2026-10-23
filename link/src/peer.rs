@@ -101,6 +101,10 @@ pub mod kind {
     pub const INBOUND: u8 = 5;
     /// Gateway → CDK: revoked serials, `count u16 | serial u64 …`.
     pub const REVOCATIONS: u8 = 6;
+    /// Both ways: a sealed-store envelope ([`crate::store::Envelope`]);
+    /// CDK → gateway to store it, gateway → CDK answering
+    /// [`crate::store::STORE_GET`].
+    pub const STORE: u8 = 7;
 }
 
 /// Node names: 1..=16 of `a-z 0-9 - _`.
@@ -221,7 +225,12 @@ impl NodeAuthority {
     }
 
     /// The registry `root` lets `key` certify node `node` until `not_after`.
-    pub fn issue(root: &hybrid::Keypair, node: &str, key: Identity, not_after: u64) -> NodeAuthority {
+    pub fn issue(
+        root: &hybrid::Keypair,
+        node: &str,
+        key: Identity,
+        not_after: u64,
+    ) -> NodeAuthority {
         let mut a = NodeAuthority {
             node: node.into(),
             key,
@@ -558,11 +567,20 @@ pub fn decode_status(b: &[u8]) -> Option<(bool, &str)> {
     Some((ok == 1, core::str::from_utf8(text).ok()?))
 }
 
-/// Messages of this module.
+/// Messages of this module (and the sealed store's, which travel the same
+/// way).
 pub fn is_peer(msg: &[u8]) -> bool {
     matches!(
         msg.first(),
-        Some(&(BLOB | IMPORT_REQUEST | PEER_STATUS | NEXT_INBOUND | INBOUND_DONE | REVOKE))
+        Some(
+            &(BLOB
+                | IMPORT_REQUEST
+                | PEER_STATUS
+                | NEXT_INBOUND
+                | INBOUND_DONE
+                | REVOKE
+                | crate::store::STORE_GET)
+        )
     )
 }
 

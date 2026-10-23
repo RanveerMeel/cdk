@@ -23,6 +23,11 @@
 //! name, so it outlives this node's reboots until it expires), both
 //! signatures, `send` permission, replay, and revocation ([`revoke`],
 //! console `cap-revoke`) — before they are delivered to the named object.
+//!
+//! With a TPM and a measured boot, revocations and the replay lists persist
+//! across reboots in the sealed store ([`crate::store`]): an entry is
+//! committed before the message is delivered or the import granted, and if
+//! the store is unusable both are refused.
 
 extern crate alloc;
 
@@ -30,6 +35,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use cdk_link::peer::{self, NodeCert, PeerMessage, PortableCap};
 use cdk_link::secure::{Identity, Signature};
+use cdk_link::store::{Records, Seen};
+use alloc::string::String;
 use spin::Mutex;
 
 use crate::audit::{self, EventKind};
@@ -38,22 +45,24 @@ use crate::issuer::{self, SigDomain};
 pub const REGISTRY_FILE: &str = "registry.pub";
 
 static MY_CERT: Mutex<Option<NodeCert>> = Mutex::new(None);
-/// Imports one boot can record; more are refused (see [`replay_check`]).
-const REPLAY_CAPACITY: usize = 64;
-/// `(issuer id, serial)` of every portable capability imported this boot.
-static IMPORTED: Mutex<heapless::Vec<([u8; 16], u64), REPLAY_CAPACITY>> =
-    Mutex::new(heapless::Vec::new());
+/// Imports that can be recorded at once (expired ones are dropped first);
+/// more are refused (see [`replay_check`]).
+const REPLAY_CAPACITY: usize = cdk_link::store::MAX_IMPORTED;
+/// Every portable capability imported (this boot, or earlier ones through
+/// the sealed store): issuer id, serial, expiry.
+static IMPORTED: Mutex<heapless::Vec<Seen, REPLAY_CAPACITY>> = Mutex::new(heapless::Vec::new());
 static EXPORTS: AtomicU64 = AtomicU64::new(0);
 /// The delegation behind each proxy object: `(proxy kind, PortableCap)`.
 static GRANTS: Mutex<heapless::Vec<(heapless::String<32>, alloc::vec::Vec<u8>), 16>> =
     Mutex::new(heapless::Vec::new());
-/// Serials of delegations this node revoked (from the gateway at
-/// certification, plus `cap-revoke`).
-static REVOKED: Mutex<heapless::Vec<u64, 128>> = Mutex::new(heapless::Vec::new());
-/// Inbound messages one boot can record; more are refused.
-const SEEN_CAPACITY: usize = 256;
-/// `(sender issuer id, seq)` of every peer message delivered this boot.
-static SEEN: Mutex<heapless::Vec<([u8; 16], u64), SEEN_CAPACITY>> = Mutex::new(heapless::Vec::new());
+/// Serials of delegations this node revoked (sealed store, the gateway's
+/// list at certification, and `cap-revoke`).
+static REVOKED: Mutex<heapless::Vec<u64, { cdk_link::store::MAX_REVOKED }>> = Mutex::new(heapless::Vec::new());
+/// Delivered messages that can be recorded at once (expired ones are
+/// dropped first); more are refused.
+const SEEN_CAPACITY: usize = cdk_link::store::MAX_DELIVERED;
+/// Every peer message delivered: sender issuer id, seq, expiry.
+static SEEN: Mutex<heapless::Vec<Seen, SEEN_CAPACITY>> = Mutex::new(heapless::Vec::new());
 /// Sequence numbers of this boot's outbound peer messages.
 static OUT_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -72,6 +81,41 @@ pub mod reject {
     pub const REVOKED: u64 = 9;
     /// Peer messages: no object of that name on this node.
     pub const NO_OBJECT: u64 = 10;
+    /// The sealed store is unusable, or the acceptance could not be
+    /// committed to it.
+    pub const STORE: u64 = 11;
+}
+
+/// The records the sealed store keeps.
+pub fn snapshot() -> Records {
+    Records {
+        revoked: REVOKED.lock().to_vec(),
+        delivered: SEEN.lock().to_vec(),
+        imported: IMPORTED.lock().to_vec(),
+    }
+}
+
+/// Merge records from the sealed store into this boot's lists.
+pub fn restore(r: &Records) {
+    let mut revoked = REVOKED.lock();
+    for s in &r.revoked {
+        if !revoked.contains(s) && revoked.push(*s).is_err() {
+            crate::println!("peer: revocation list full");
+        }
+    }
+    drop(revoked);
+    merge(&mut SEEN.lock(), &r.delivered);
+    merge(&mut IMPORTED.lock(), &r.imported);
+}
+
+/// Add the entries of `from` that `list` lacks, while it has room.
+fn merge<const N: usize>(list: &mut heapless::Vec<Seen, N>, from: &[Seen]) {
+    for e in from {
+        if !list.iter().any(|x| x.id == e.id && x.n == e.n) && list.push(*e).is_err() {
+            crate::println!("peer: replay list full while restoring the sealed store");
+            break;
+        }
+    }
 }
 
 /// The pinned registry key, if the ramdisk carries one.
@@ -202,6 +246,9 @@ pub struct Accepted {
     pub mask: u64,
     /// Seconds until it expires (by the gateway's clock).
     pub valid_s: u64,
+    /// The gateway's clock at import, and the capability's expiry.
+    now: u64,
+    not_after: u64,
     issuer: [u8; 16],
     serial: u64,
     /// The portable capability, kept as the proxy's delegation.
@@ -231,9 +278,16 @@ pub fn check_import(delivered: &[u8]) -> Result<Accepted, &'static str> {
         .ok_or_else(|| refused(&subject, reject::NOT_FOR_US, "this node has no certificate yet"))?;
     issuer::crypto_stack::run(|| pcap.verify(&registry, &me, now))
         .map_err(|e| refused(&subject, verify_reason(e), e))?;
+    if let Some(why) = crate::store::acceptance_blocked() {
+        crate::println!("cap-import: {}", why);
+        return Err(refused(&subject, reject::STORE, "the sealed store is unusable"));
+    }
     let issuer_id = pcap.cert.issuer.id();
-    replay_check(&IMPORTED.lock(), issuer_id, pcap.serial)
-        .map_err(|e| refused(&subject, reject::REPLAYED, e))?;
+    {
+        let mut imported = IMPORTED.lock();
+        imported.retain(|e| e.not_after >= now);
+        replay_check(&imported, issuer_id, pcap.serial).map_err(|e| refused(&subject, reject::REPLAYED, e))?;
+    }
     let trusted = crate::policy::policy().trusted(&pcap.cert.name, &pcap.object);
     let mask = grant_mask(pcap.perms, trusted).ok_or_else(|| {
         refused(
@@ -250,18 +304,29 @@ pub fn check_import(delivered: &[u8]) -> Result<Accepted, &'static str> {
         proxy,
         mask,
         valid_s: pcap.not_after.saturating_sub(now),
+        now,
+        not_after: pcap.not_after,
         issuer: issuer_id,
         serial: pcap.serial,
         grant: bytes.to_vec(),
     })
 }
 
-/// Record a granted import so the same token cannot be used again.
-/// `check_import` refuses imports once the list is full, so the push
-/// cannot fail; nothing is ever evicted (that would reopen replay).
-pub fn mark_imported(a: &Accepted) {
-    if IMPORTED.lock().push((a.issuer, a.serial)).is_err() {
-        crate::println!("peer: replay list full; import not recorded");
+/// Record an approved import so the same token cannot be used again —
+/// committed to the sealed store when there is one — *before* the caller
+/// grants it. Unexpired entries are never evicted (that would reopen
+/// replay); `check_import` refuses imports while the list is full.
+pub fn mark_imported(a: &Accepted) -> Result<(), String> {
+    let entry = Seen {
+        id: a.issuer,
+        n: a.serial,
+        not_after: a.not_after,
+    };
+    IMPORTED.lock().push(entry).map_err(|_| "replay list full")?;
+    if let Err(e) = crate::store::commit(Some(a.now)) {
+        IMPORTED.lock().retain(|x| *x != entry);
+        audit::record_fmt(EventKind::CapImportRejected, format_args!("{}", a.proxy), reject::STORE);
+        return Err(alloc::format!("not recorded in the sealed store ({e}); not granted"));
     }
     // The newest delegation backs the proxy's outbound messages.
     let mut grants = GRANTS.lock();
@@ -271,6 +336,7 @@ pub fn mark_imported(a: &Accepted) {
     }
     drop(grants);
     audit::record_fmt(EventKind::CapImported, format_args!("{}", a.proxy), a.mask);
+    Ok(())
 }
 
 /// The reject code for an error from [`PortableCap::verify`].
@@ -286,12 +352,12 @@ fn verify_reason(e: &str) -> u64 {
 
 /// Refuse a capability imported before this boot, and fail closed once the
 /// replay list is full (at most its capacity of imports per boot).
-fn replay_check(seen: &[([u8; 16], u64)], issuer: [u8; 16], serial: u64) -> Result<(), &'static str> {
-    if seen.iter().any(|(i, s)| *i == issuer && *s == serial) {
+fn replay_check(seen: &[Seen], issuer: [u8; 16], serial: u64) -> Result<(), &'static str> {
+    if seen.iter().any(|e| e.id == issuer && e.n == serial) {
         return Err("already imported");
     }
     if seen.len() >= REPLAY_CAPACITY {
-        return Err("replay list full: no more imports this boot");
+        return Err("replay list full: no more imports until some expire");
     }
     Ok(())
 }
@@ -396,6 +462,35 @@ pub fn fetch_import(file: &str) -> Result<alloc::vec::Vec<u8>, alloc::string::St
     }
 }
 
+/// The gateway's stored sealed-store envelope: `Ok(None)` if it has none,
+/// `Err` if it keeps no store or did not answer.
+pub fn store_get() -> Result<Option<alloc::vec::Vec<u8>>, String> {
+    if !matches!(crate::link::send_data(&[cdk_link::store::STORE_GET]), Ok(true)) {
+        return Err("send failed".into());
+    }
+    match wait_answer(5_000, peer::kind::STORE)? {
+        Answer::Blob(b) => Ok(Some(b)),
+        Answer::Done(_) => Ok(None),
+    }
+}
+
+/// Have the gateway store a sealed-store envelope (it answers once the
+/// file is durable).
+pub fn store_put(envelope: &[u8]) -> Result<(), String> {
+    if !crate::link::is_secure() {
+        return Err("no secure link".into());
+    }
+    for m in peer::encode_blob(peer::kind::STORE, envelope).ok_or("the store is too large")? {
+        if !matches!(crate::link::send_data(&m), Ok(true)) {
+            return Err("send failed".into());
+        }
+    }
+    match wait_answer(5_000, 0)? {
+        Answer::Done(_) => Ok(()),
+        Answer::Blob(_) => Err("unexpected answer".into()),
+    }
+}
+
 /// Wait (during attestation) for the gateway's certificate for this boot.
 pub fn await_certificate(ms: u64) {
     match wait_answer(ms, peer::kind::NODE_CERT) {
@@ -438,7 +533,7 @@ fn on_revocations(bytes: &[u8]) {
 }
 
 /// Serials this node has revoked.
-pub fn revoked() -> heapless::Vec<u64, 128> {
+pub fn revoked() -> heapless::Vec<u64, { cdk_link::store::MAX_REVOKED }> {
     REVOKED.lock().clone()
 }
 
@@ -448,8 +543,10 @@ pub fn proxies() -> heapless::Vec<heapless::String<32>, 16> {
 }
 
 /// Revoke this node's delegation `serial`: messages under it are refused
-/// from now on; the gateway records it so later boots refuse them too.
-pub fn revoke(serial: u64) -> Result<alloc::string::String, alloc::string::String> {
+/// from now on. It is committed to the sealed store (when there is one)
+/// and also recorded by the gateway, whose list is merged at every
+/// certification. Returns what persisted.
+pub fn revoke(serial: u64) -> Result<String, String> {
     {
         let mut r = REVOKED.lock();
         if !r.contains(&serial) {
@@ -457,16 +554,21 @@ pub fn revoke(serial: u64) -> Result<alloc::string::String, alloc::string::Strin
         }
     }
     audit::record_fmt(EventKind::CapRevoked, format_args!("serial"), serial);
+    let sealed = match crate::store::commit(None) {
+        Ok(true) => "committed to the sealed store".into(),
+        Ok(false) => alloc::string::String::from("no sealed store on this boot"),
+        Err(e) => alloc::format!("NOT in the sealed store: {e}"),
+    };
     if !crate::link::is_secure() {
-        return Ok("revoked for this boot only (no secure link to record it)".into());
+        return Ok(alloc::format!("{sealed}; gateway: not recorded (no secure link)"));
     }
     if !matches!(crate::link::send_data(&peer::encode_revoke(serial)), Ok(true)) {
-        return Ok("revoked for this boot only (send failed)".into());
+        return Ok(alloc::format!("{sealed}; gateway: not recorded (send failed)"));
     }
     match wait_answer(5_000, 0) {
-        Ok(Answer::Done(note)) => Ok(note),
-        Ok(Answer::Blob(_)) => Ok("revoked (unexpected answer)".into()),
-        Err(e) => Ok(alloc::format!("revoked for this boot only ({e})")),
+        Ok(Answer::Done(note)) => Ok(alloc::format!("{sealed}; gateway: {note}")),
+        Ok(Answer::Blob(_)) => Ok(alloc::format!("{sealed}; gateway: unexpected answer")),
+        Err(e) => Ok(alloc::format!("{sealed}; gateway: not recorded ({e})")),
     }
 }
 
@@ -604,20 +706,39 @@ fn deliver(
     issuer::crypto_stack::run(|| m.verify(&registry, &me, now))
         .map_err(|e| refused_msg(&subject, message_reason(e), e))?;
     message_policy(&m, &REVOKED.lock()).map_err(|(r, e)| refused_msg(&subject, r, e))?;
-    let sender = m.sender.issuer.id();
-    {
-        let mut seen = SEEN.lock();
-        if seen.iter().any(|(i, s)| *i == sender && *s == m.seq) {
-            return Err(refused_msg(&subject, reject::REPLAYED, "already delivered"));
-        }
-        if seen.push((sender, m.seq)).is_err() {
-            return Err(refused_msg(&subject, reject::REPLAYED, "replay list full: no more messages this boot"));
-        }
+    if let Some(why) = crate::store::acceptance_blocked() {
+        crate::println!("peer-sync: {}", why);
+        return Err(refused_msg(&subject, reject::STORE, "the sealed store is unusable"));
     }
     // By exact name only: ids change every boot, intents are free text.
     let id = kernel.find_by_name(&m.grant.object).map_err(|_| {
         refused_msg(&subject, reject::NO_OBJECT, "no single object of that name on this node")
     })?;
+    // Recorded (and committed to the sealed store) before delivery: at
+    // most once. The entry matters until the sender's certificate or the
+    // delegation expires; after that the message is refused anyway.
+    let entry = Seen {
+        id: m.sender.issuer.id(),
+        n: m.seq,
+        not_after: m.sender.not_after.min(m.grant.not_after),
+    };
+    {
+        let mut seen = SEEN.lock();
+        if seen.iter().any(|e| e.id == entry.id && e.n == entry.n) {
+            return Err(refused_msg(&subject, reject::REPLAYED, "already delivered"));
+        }
+        if seen.is_full() {
+            seen.retain(|e| e.not_after >= now);
+        }
+        if seen.push(entry).is_err() {
+            return Err(refused_msg(&subject, reject::REPLAYED, "replay list full: no more messages until some expire"));
+        }
+    }
+    if let Err(e) = crate::store::commit(Some(now)) {
+        SEEN.lock().retain(|x| *x != entry);
+        crate::println!("peer-sync: not recorded in the sealed store: {}", e);
+        return Err(refused_msg(&subject, reject::STORE, "could not be recorded in the sealed store"));
+    }
     let msg = crate::message::Message::new(
         &label,
         &id,
@@ -703,20 +824,44 @@ mod tests {
         }
     }
 
-    /// Replays are refused, and a full list refuses rather than forgets.
+    /// Replays are refused, and a full list refuses rather than forgets
+    /// unexpired entries.
     #[test]
     fn replay_list_fails_closed() {
-        let mut seen: heapless::Vec<([u8; 16], u64), REPLAY_CAPACITY> = heapless::Vec::new();
+        let e = |id: u8, n: u64, not_after: u64| Seen { id: [id; 16], n, not_after };
+        let mut seen: heapless::Vec<Seen, REPLAY_CAPACITY> = heapless::Vec::new();
         assert_eq!(replay_check(&seen, [1; 16], 7), Ok(()));
-        seen.push(([1; 16], 7)).unwrap();
+        seen.push(e(1, 7, 100)).unwrap();
         assert_eq!(replay_check(&seen, [1; 16], 7), Err("already imported"));
         assert_eq!(replay_check(&seen, [2; 16], 7), Ok(()), "another issuer");
         while !seen.is_full() {
             let n = seen.len() as u64;
-            seen.push(([3; 16], n)).unwrap();
+            seen.push(e(3, n, 50)).unwrap();
         }
         assert!(replay_check(&seen, [9; 16], 1).is_err(), "full: refused");
         assert_eq!(replay_check(&seen, [1; 16], 7), Err("already imported"), "never forgotten");
+        // What check_import does with the gateway's clock: only expired
+        // entries make room.
+        seen.retain(|x| x.not_after >= 60);
+        assert_eq!(seen.len(), 1);
+        assert_eq!(replay_check(&seen, [1; 16], 7), Err("already imported"));
+    }
+
+    /// The sealed store's snapshot and restore round-trip and merge.
+    #[test]
+    fn snapshot_and_restore_merge() {
+        let before = snapshot();
+        let r = Records {
+            revoked: alloc::vec![0xAB],
+            delivered: alloc::vec![Seen { id: [7; 16], n: 1, not_after: 9 }],
+            imported: alloc::vec![Seen { id: [8; 16], n: 2, not_after: 9 }],
+        };
+        restore(&r);
+        restore(&r);
+        let after = snapshot();
+        assert_eq!(after.revoked.iter().filter(|s| **s == 0xAB).count(), 1, "no duplicates");
+        assert_eq!(after.delivered.len(), before.delivered.len() + 1);
+        assert_eq!(after.imported.len(), before.imported.len() + 1);
     }
 
     /// The longest node and object names still fit an object kind.

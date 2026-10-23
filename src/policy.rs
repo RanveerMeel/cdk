@@ -234,6 +234,10 @@ pub struct Policy {
     pub approval_timeout_s: u16,
     /// Peer trust (roadmap 3.5).
     pub trusts: Vec<Trust, 16>,
+    /// `require sealed-store` (roadmap 4.5): accept peer messages and
+    /// imports only with the TPM-sealed store open, so a boot without it
+    /// (TPM removed, BIOS boot) cannot be used to replay them.
+    pub require_sealed_store: bool,
 }
 
 /// `trust <node> <object|*> <perms>`: what a peer node may delegate here.
@@ -281,6 +285,7 @@ impl Policy {
             quorums: Vec::new(),
             approval_timeout_s: DEFAULT_APPROVAL_TIMEOUT_S,
             trusts: Vec::new(),
+            require_sealed_store: false,
         }
     }
 
@@ -444,6 +449,11 @@ impl Policy {
                     .ok()
                     .filter(|s| (10..=3600).contains(s))
                     .ok_or(e("approval-timeout must be 10..=3600 seconds"))?;
+            } else if let Some(rest) = line.strip_prefix("require ") {
+                match rest.trim() {
+                    "sealed-store" => p.require_sealed_store = true,
+                    _ => return Err(e("require sealed-store")),
+                }
             } else if let Some(rest) = line.strip_prefix("trust ") {
                 let mut w = rest.split_whitespace();
                 let (Some(node), Some(object), Some(perms), None) =
@@ -1103,6 +1113,9 @@ mod tests {
     fn quorum_and_timeout_rules() {
         let p = policy("quorum credential 2\nquorum policy 3\napproval-timeout 60\nlabel obj-2 customer-data\nquorum customer-data 2\n");
         assert_eq!(p.approval_timeout_s, 60);
+        assert!(!p.require_sealed_store);
+        assert!(policy("require sealed-store\n").require_sealed_store);
+        assert!(Policy::parse("require nothing\n").is_err());
         assert_eq!(p.policy_quorum(), 3);
         assert_eq!(p.max_quorum(), 3);
         let l = p.labels_of("obj-9", "model:paid", FLAG_CREDENTIAL);

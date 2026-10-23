@@ -16,6 +16,12 @@
 //!   ECC endorsement key, and `TPM2_ActivateCredential` (authorized by a
 //!   `PolicySecret(endorsement)` session) to answer the gateway's challenge.
 //!
+//! * sealed storage (`crate::store`): a storage primary key under the
+//!   owner hierarchy, `TPM2_Create` of a sealed data object bound to a PCR
+//!   policy (computed by the TPM in a trial session), `TPM2_Load` +
+//!   `TPM2_PolicyPCR` + `TPM2_Unseal` to recover it, and a monotonic NV
+//!   counter (`TPM2_NV_DefineSpace`, `TPM2_NV_Increment`, `TPM2_NV_Read`).
+//!
 //! Commands are built by hand (big-endian, TPM 2.0 Part 3) with the empty
 //! password session, since CDK sets no TPM authorization values.
 
@@ -52,6 +58,44 @@ const CC_START_AUTH_SESSION: u32 = 0x176;
 const CC_POLICY_SECRET: u32 = 0x151;
 const CC_ACTIVATE_CREDENTIAL: u32 = 0x147;
 const CC_FLUSH_CONTEXT: u32 = 0x165;
+const CC_CREATE: u32 = 0x153;
+const CC_LOAD: u32 = 0x157;
+const CC_UNSEAL: u32 = 0x15E;
+const CC_POLICY_PCR: u32 = 0x17F;
+const CC_POLICY_GET_DIGEST: u32 = 0x189;
+const CC_NV_DEFINE_SPACE: u32 = 0x12A;
+const CC_NV_INCREMENT: u32 = 0x134;
+const SE_TRIAL: u8 = 0x03;
+const RH_OWNER: u32 = 0x4000_0001;
+const ALG_AES: u16 = 0x0006;
+const ALG_CFB: u16 = 0x0043;
+const ALG_ECC: u16 = 0x0023;
+const ALG_KEYEDHASH: u16 = 0x0008;
+const ECC_NIST_P256: u16 = 0x0003;
+/// TPMA_OBJECT bits.
+const OBJ_FIXED_TPM: u32 = 1 << 1;
+const OBJ_FIXED_PARENT: u32 = 1 << 4;
+const OBJ_SENSITIVE_DATA_ORIGIN: u32 = 1 << 5;
+const OBJ_USER_WITH_AUTH: u32 = 1 << 6;
+const OBJ_ADMIN_WITH_POLICY: u32 = 1 << 7;
+const OBJ_NO_DA: u32 = 1 << 10;
+const OBJ_RESTRICTED: u32 = 1 << 16;
+const OBJ_DECRYPT: u32 = 1 << 17;
+/// TPMA_NV bits: written with its own (empty) authorization, a counter
+/// (TPM_NT_COUNTER), read with its own authorization, no dictionary-attack
+/// lockout.
+const NV_AUTHWRITE: u32 = 1 << 2;
+const NV_TYPE_MASK: u32 = 0xF0;
+const NV_TYPE_COUNTER: u32 = 0x10;
+const NV_AUTHREAD: u32 = 1 << 18;
+const NV_NO_DA: u32 = 1 << 25;
+/// TPM_RC_HANDLE for parameter 1 (format 1): the NV index does not exist.
+pub const RC_NV_ABSENT: u32 = 0x18B;
+/// TPM_RC_NV_UNINITIALIZED: a counter never incremented.
+pub const RC_NV_UNINITIALIZED: u32 = 0x14A;
+/// TPM_RC_POLICY_FAIL for session 1 (format 1): the PCRs differ from the
+/// ones the object was sealed to.
+pub const RC_POLICY_FAIL: u32 = 0x99D;
 const RH_NULL: u32 = 0x4000_0007;
 const SE_POLICY: u8 = 0x01;
 const RH_ENDORSEMENT: u32 = 0x4000_000B;
@@ -350,11 +394,11 @@ pub struct Ak {
     pub y: [u8; 32],
 }
 
-/// `TPM2_CreatePrimary` under the endorsement hierarchy with `template`;
+/// `TPM2_CreatePrimary` under `hierarchy` with `template`;
 /// returns the handle and the public area the TPM created.
-fn create_primary(template: &[u8]) -> Result<(u32, Vec<u8>)> {
+fn create_primary(hierarchy: u32, template: &[u8]) -> Result<(u32, Vec<u8>)> {
     let cmd = Cmd::new(ST_SESSIONS, CC_CREATE_PRIMARY)
-        .u32(RH_ENDORSEMENT)
+        .u32(hierarchy)
         .password_session()
         .u16(4)
         .u16(0)
@@ -387,7 +431,7 @@ fn ecc_point(public: &[u8]) -> Result<([u8; 32], [u8; 32])> {
 /// `TPM2_CreatePrimary` of the AK under the endorsement hierarchy. The
 /// public area the TPM returns must be exactly the template with a point.
 pub fn create_ak() -> Result<Ak> {
-    let (handle, public) = create_primary(&cdk_link::tpm::ak_public(None))?;
+    let (handle, public) = create_primary(RH_ENDORSEMENT, &cdk_link::tpm::ak_public(None))?;
     let (x, y) = ecc_point(&public)?;
     if public != cdk_link::tpm::ak_public(Some((&x, &y))) {
         return Err(TpmError::BadResponse);
@@ -404,7 +448,7 @@ pub struct Ek {
 
 /// `TPM2_CreatePrimary` of the EK. Flush it with [`flush`] after use.
 pub fn create_ek() -> Result<Ek> {
-    let (handle, public) = create_primary(&cdk_link::tpm::ek_public(&[0; 32], &[0; 32]))?;
+    let (handle, public) = create_primary(RH_ENDORSEMENT, &cdk_link::tpm::ek_public(&[0; 32], &[0; 32]))?;
     let checked = ecc_point(&public).and_then(|(x, y)| {
         if public == cdk_link::tpm::ek_public(&x, &y) {
             Ok((x, y))
@@ -476,18 +520,7 @@ pub fn nv_read(index: u32, max: usize) -> Result<Vec<u8>> {
 /// TPM holding both `ek` and `ak` can. The EK's policy is
 /// `PolicySecret(TPM_RH_ENDORSEMENT)`, satisfied in a fresh policy session.
 pub fn activate_credential(ak: &Ak, ek: &Ek, id_object: &[u8], secret: &[u8]) -> Result<Vec<u8>> {
-    let r = transmit(
-        &Cmd::new(ST_NO_SESSIONS, CC_START_AUTH_SESSION)
-            .u32(RH_NULL) // tpmKey: unsalted
-            .u32(RH_NULL) // bind: unbound
-            .tpm2b(&[0x5A; 16]) // nonceCaller (no HMAC is computed)
-            .u16(0) // encryptedSalt
-            .u8(SE_POLICY)
-            .u16(ALG_NULL) // symmetric
-            .u16(ALG_SHA256)
-            .finish(),
-    )?;
-    let session = Resp::new(&r).u32()?;
+    let session = start_session(SE_POLICY)?;
     let result = (|| {
         transmit(
             &Cmd::new(ST_SESSIONS, CC_POLICY_SECRET)
@@ -524,6 +557,220 @@ pub fn activate_credential(ak: &Ak, ek: &Ek, id_object: &[u8], secret: &[u8]) ->
         let _ = flush(session);
     }
     result
+}
+
+/// `TPM2_StartAuthSession`: an unsalted, unbound policy (or trial) session.
+fn start_session(kind: u8) -> Result<u32> {
+    let r = transmit(
+        &Cmd::new(ST_NO_SESSIONS, CC_START_AUTH_SESSION)
+            .u32(RH_NULL) // tpmKey: unsalted
+            .u32(RH_NULL) // bind: unbound
+            .tpm2b(&[0x5A; 16]) // nonceCaller (no HMAC is computed)
+            .u16(0) // encryptedSalt
+            .u8(kind)
+            .u16(ALG_NULL) // symmetric
+            .u16(ALG_SHA256)
+            .finish(),
+    )?;
+    Resp::new(&r).u32()
+}
+
+// ---------------------------------------------------------------------------
+// Sealed storage
+// ---------------------------------------------------------------------------
+
+/// The storage primary key under the owner hierarchy (the TCG "SRK"
+/// shape: restricted ECC P-256 decryption key, AES-128-CFB). The same
+/// template gives the same key on every boot of one TPM. Flush it after use.
+pub fn create_storage_key() -> Result<u32> {
+    let mut t = Vec::with_capacity(32);
+    t.extend_from_slice(&ALG_ECC.to_be_bytes());
+    t.extend_from_slice(&ALG_SHA256.to_be_bytes());
+    let attrs = OBJ_FIXED_TPM
+        | OBJ_FIXED_PARENT
+        | OBJ_SENSITIVE_DATA_ORIGIN
+        | OBJ_USER_WITH_AUTH
+        | OBJ_NO_DA
+        | OBJ_RESTRICTED
+        | OBJ_DECRYPT;
+    t.extend_from_slice(&attrs.to_be_bytes());
+    t.extend_from_slice(&0u16.to_be_bytes()); // authPolicy: none
+    for x in [ALG_AES, 128, ALG_CFB, ALG_NULL, ECC_NIST_P256, ALG_NULL] {
+        t.extend_from_slice(&x.to_be_bytes()); // symmetric, scheme, curve, kdf
+    }
+    t.extend_from_slice(&[0, 0, 0, 0]); // unique: empty x, y
+    create_primary(RH_OWNER, &t).map(|(h, _)| h)
+}
+
+/// `TPM2_PolicyPCR` on `session` for the PCRs in `select`, at their
+/// current values.
+fn policy_pcr(session: u32, select: &[u8; 3]) -> Result<()> {
+    transmit(
+        &Cmd::new(ST_NO_SESSIONS, CC_POLICY_PCR)
+            .u32(session)
+            .u16(0) // pcrDigest: the TPM uses the current values
+            .pcr_selection(select)
+            .finish(),
+    )
+    .map(|_| ())
+}
+
+/// The policy digest of "PCRs `select` hold their current values", as the
+/// TPM computes it (trial session).
+pub fn pcr_policy_digest(select: &[u8; 3]) -> Result<[u8; 32]> {
+    let session = start_session(SE_TRIAL)?;
+    let digest = policy_pcr(session, select).and_then(|_| {
+        let r = transmit(
+            &Cmd::new(ST_NO_SESSIONS, CC_POLICY_GET_DIGEST)
+                .u32(session)
+                .finish(),
+        )?;
+        Resp::new(&r).tpm2b()?.try_into().map_err(|_| TpmError::BadResponse)
+    });
+    let _ = flush(session);
+    digest
+}
+
+/// `TPM2_Create` under `parent` of a sealed data object holding `data`,
+/// usable only through `policy` (no password: `userWithAuth` is clear).
+/// Returns its `(TPM2B_PUBLIC, TPM2B_PRIVATE)` contents.
+pub fn seal(parent: u32, data: &[u8], policy: &[u8; 32]) -> Result<(Vec<u8>, Vec<u8>)> {
+    let mut sensitive = Vec::with_capacity(4 + data.len());
+    sensitive.extend_from_slice(&0u16.to_be_bytes()); // userAuth: empty
+    sensitive.extend_from_slice(&(data.len() as u16).to_be_bytes());
+    sensitive.extend_from_slice(data);
+    let mut public = Vec::with_capacity(48);
+    public.extend_from_slice(&ALG_KEYEDHASH.to_be_bytes());
+    public.extend_from_slice(&ALG_SHA256.to_be_bytes());
+    public.extend_from_slice(&(OBJ_FIXED_TPM | OBJ_FIXED_PARENT | OBJ_ADMIN_WITH_POLICY | OBJ_NO_DA).to_be_bytes());
+    public.extend_from_slice(&32u16.to_be_bytes());
+    public.extend_from_slice(policy);
+    public.extend_from_slice(&ALG_NULL.to_be_bytes()); // keyedHash scheme
+    public.extend_from_slice(&0u16.to_be_bytes()); // unique: empty
+    let cmd = Cmd::new(ST_SESSIONS, CC_CREATE)
+        .u32(parent)
+        .password_session()
+        .tpm2b(&sensitive)
+        .tpm2b(&public)
+        .u16(0) // outsideInfo
+        .u32(0) // creationPCR
+        .finish();
+    zeroize::Zeroize::zeroize(sensitive.as_mut_slice());
+    let r = transmit(&cmd);
+    let mut cmd = cmd;
+    zeroize::Zeroize::zeroize(cmd.as_mut_slice());
+    let r = r?;
+    let mut p = Resp::new(&r);
+    p.u32()?; // parameterSize
+    let private = p.tpm2b()?.to_vec();
+    let public = p.tpm2b()?.to_vec();
+    Ok((public, private))
+}
+
+/// `TPM2_Load` the sealed object under `parent`, satisfy its PCR policy in
+/// a fresh policy session, and `TPM2_Unseal` it. Fails with
+/// [`RC_POLICY_FAIL`] when the PCRs differ from the sealed ones.
+pub fn unseal(parent: u32, public: &[u8], private: &[u8], select: &[u8; 3]) -> Result<Vec<u8>> {
+    let r = transmit(
+        &Cmd::new(ST_SESSIONS, CC_LOAD)
+            .u32(parent)
+            .password_session()
+            .tpm2b(private)
+            .tpm2b(public)
+            .finish(),
+    )?;
+    let item = Resp::new(&r).u32()?;
+    let result = start_session(SE_POLICY).and_then(|session| {
+        let out = policy_pcr(session, select).and_then(|_| {
+            let r = transmit(
+                &Cmd::new(ST_SESSIONS, CC_UNSEAL)
+                    .u32(item)
+                    .u32(9)
+                    .u32(session)
+                    .u16(0)
+                    .u8(0) // continueSession clear: the TPM ends the session
+                    .u16(0)
+                    .finish(),
+            )?;
+            let mut p = Resp::new(&r);
+            p.u32()?; // parameterSize
+            Ok(p.tpm2b()?.to_vec())
+        });
+        if out.is_err() {
+            let _ = flush(session);
+        }
+        out
+    });
+    let _ = flush(item);
+    result
+}
+
+/// `TPM2_NV_DefineSpace` of a monotonic 64-bit counter at `index` (owner
+/// hierarchy, empty authorizations), then its first increment.
+pub fn nv_counter_define(index: u32) -> Result<()> {
+    let mut public = Vec::with_capacity(14);
+    public.extend_from_slice(&index.to_be_bytes());
+    public.extend_from_slice(&ALG_SHA256.to_be_bytes());
+    public.extend_from_slice(&(NV_AUTHWRITE | NV_TYPE_COUNTER | NV_AUTHREAD | NV_NO_DA).to_be_bytes());
+    public.extend_from_slice(&0u16.to_be_bytes()); // authPolicy
+    public.extend_from_slice(&8u16.to_be_bytes()); // dataSize
+    transmit(
+        &Cmd::new(ST_SESSIONS, CC_NV_DEFINE_SPACE)
+            .u32(RH_OWNER)
+            .password_session()
+            .u16(0) // auth: empty
+            .tpm2b(&public)
+            .finish(),
+    )?;
+    nv_increment(index)
+}
+
+/// `TPM2_NV_Increment` of the counter at `index`.
+pub fn nv_increment(index: u32) -> Result<()> {
+    transmit(
+        &Cmd::new(ST_SESSIONS, CC_NV_INCREMENT)
+            .u32(index)
+            .u32(index)
+            .password_session()
+            .finish(),
+    )
+    .map(|_| ())
+}
+
+/// The value of the counter at `index`. The index must be a counter (a
+/// TPM never decrements one, whoever defined it); anything else at that
+/// index is refused as [`TpmError::BadResponse`].
+pub fn nv_counter_read(index: u32) -> Result<u64> {
+    let r = transmit(
+        &Cmd::new(ST_NO_SESSIONS, CC_NV_READ_PUBLIC)
+            .u32(index)
+            .finish(),
+    )?;
+    let mut p = Resp::new(&r);
+    let public = p.tpm2b()?;
+    let mut q = Resp(public, 0);
+    if q.u32()? != index {
+        return Err(TpmError::BadResponse);
+    }
+    q.u16()?; // nameAlg
+    let attrs = q.u32()?;
+    q.tpm2b()?; // authPolicy
+    if attrs & NV_TYPE_MASK != NV_TYPE_COUNTER || attrs & NV_AUTHREAD == 0 || q.u16()? != 8 {
+        return Err(TpmError::BadResponse);
+    }
+    let r = transmit(
+        &Cmd::new(ST_SESSIONS, CC_NV_READ)
+            .u32(index)
+            .u32(index)
+            .password_session()
+            .u16(8)
+            .u16(0)
+            .finish(),
+    )?;
+    let mut p = Resp::new(&r);
+    p.u32()?; // parameterSize
+    let v: [u8; 8] = p.tpm2b()?.try_into().map_err(|_| TpmError::BadResponse)?;
+    Ok(u64::from_be_bytes(v))
 }
 
 /// `TPM2_Quote` of PCRs 0..=12 with `nonce` as qualifying data. Returns the

@@ -43,6 +43,7 @@ pub mod process;
 pub mod rng;
 pub mod scheduler;
 pub mod serial;
+pub mod store;
 pub mod syscall;
 pub mod tools;
 pub mod tpm;

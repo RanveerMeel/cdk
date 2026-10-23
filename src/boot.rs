@@ -71,6 +71,11 @@ static STATE: Mutex<State> = Mutex::new(State {
     reason: "",
 });
 
+/// Whether the TPM holds this boot's measurements (and an attestation key).
+pub fn tpm_ready() -> bool {
+    STATE.lock().ak.is_some()
+}
+
 /// Whether the kernel is in lockdown (boot verification failed).
 pub fn lockdown() -> bool {
     LOCKDOWN.load(Ordering::SeqCst)
