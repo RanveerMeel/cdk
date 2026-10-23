@@ -17,7 +17,8 @@ use crate::paging::{MapFlags, PageTableManager};
 use crate::serial;
 use spin::Mutex;
 
-const MAX_LINE: usize = 128;
+/// Long enough for `store-migrate` with two 64-digit PCR values.
+const MAX_LINE: usize = 256;
 /// How many prior commands ↑/↓ can scroll through.
 const HISTORY_CAP: usize = 32;
 
@@ -167,6 +168,7 @@ const COMMANDS: &[&str] = &[
     "peer-sync",
     "store",
     "store-reset",
+    "store-migrate",
     "boot",
     "capbench",
     "audit",
@@ -667,6 +669,7 @@ fn dispatch(
         "peer-sync" => cmd_peer_sync(kernel),
         "store" => cmd_store(),
         "store-reset" => cmd_store_reset(),
+        "store-migrate" => cmd_store_migrate(line.split_once(' ').map_or("", |(_, rest)| rest)),
         "boot" => crate::boot::report(|s| crate::print!("{}", s)),
         "capbench" => cmd_capbench(arg1, arg2, kernel),
         "audit" => cmd_audit(arg1),
@@ -791,6 +794,7 @@ fn cmd_help() {
     crate::println!("  cap-revoke <serial>  Revoke a delegation this node issued (serial from cap-export)");
     crate::println!("  store             The TPM-sealed store of revocations and replay records (roadmap 4.5)");
     crate::println!("  store-reset       Start a new sealed store from this boot's state (reviewed)");
+    crate::println!("  store-migrate [<pcr>=<hex>...]  Before an update: also open the store under those PCR values (reviewed)");
     crate::println!("  boot              Verified-boot verdict, release key, measured registers and log");
     crate::println!("  policy check      Check every agent's handles against the rules");
     crate::println!("  policy reach      Show what each agent can reach, with labels");
@@ -1612,9 +1616,18 @@ fn cmd_peer() {
     }
 }
 
-/// `store`: the sealed store's state and what it holds.
+/// `store`: the sealed store's state, what it holds, and this boot
+/// chain's sealed PCR values (the targets for `store-migrate`).
 fn cmd_store() {
     crate::println!("store: {}", crate::store::status());
+    if let Ok(chain) = crate::store::chain() {
+        crate::println!("store: this boot chain (for store-migrate):");
+        for (i, v) in chain {
+            crate::print!("  {}=", i);
+            print_hex(&v);
+            crate::println!();
+        }
+    }
     let r = crate::peer::snapshot();
     crate::println!(
         "store: this boot holds {} revocation(s), {} delivered message(s), {} import(s)",
@@ -1643,6 +1656,80 @@ fn cmd_store_reset() {
         Ok(c) => crate::println!("store-reset: new sealed store (TPM counter {})", c),
         Err(e) => crate::println!("store-reset: {}", e),
     }
+}
+
+/// `store-migrate [<pcr>=<hex>...]`: before a kernel, loader or firmware
+/// update, re-seal the store so it also opens under the given values of the
+/// sealed PCRs (the others keep this boot's); with no values, re-seal it to
+/// this boot chain only. Reviewed like a policy change.
+fn cmd_store_migrate(args: &str) {
+    let mut targets: alloc::vec::Vec<(u32, [u8; 32])> = alloc::vec::Vec::new();
+    for t in args.split_whitespace() {
+        let parsed = t.split_once('=').and_then(|(i, h)| Some((i.parse::<u32>().ok()?, parse_hex32(h)?)));
+        match parsed {
+            Some((i, _)) if targets.iter().any(|(j, _)| *j == i) => {
+                crate::println!("store-migrate: PCR {} given twice", i);
+                return;
+            }
+            Some(x) => targets.push(x),
+            None => {
+                crate::println!("Usage: store-migrate [<pcr>=<64 hex digits>...]   (pcr: 0 2 4 7 11; see store)");
+                return;
+            }
+        }
+    }
+    let chain = match crate::store::chain() {
+        Ok(c) => c,
+        Err(e) => {
+            crate::println!("store-migrate: {}", e);
+            return;
+        }
+    };
+    let mut text = alloc::string::String::from("=== SEALED STORE MIGRATION ===\n");
+    if targets.is_empty() {
+        text.push_str("  - every other boot chain loses the store (earlier migrations are dropped)\n");
+        text.push_str("  = the store opens under this boot chain only\n");
+    } else {
+        text.push_str("  + the store will ALSO open under the target boot chain:\n");
+        for (i, v) in &chain {
+            let t = targets.iter().find(|(j, _)| j == i).map_or(*v, |(_, t)| *t);
+            let _ = core::fmt::write(
+                &mut text,
+                format_args!("    PCR {:>2} = {}{}\n", i, hex64(&t), if t == *v { "" } else { "   (changed)" }),
+            );
+        }
+        text.push_str("  = and still under the current one (until the next store-migrate)\n");
+    }
+    crate::print!("{}", text);
+    if !crate::policy::confirm("Re-seal the store?", &text) {
+        crate::println!("store-migrate: not approved");
+        return;
+    }
+    match crate::store::migrate(&targets) {
+        Ok(c) => crate::println!("store-migrate: store re-sealed (TPM counter {})", c),
+        Err(e) => crate::println!("store-migrate: {}", e),
+    }
+}
+
+/// 64 hex digits as 32 bytes.
+fn parse_hex32(h: &str) -> Option<[u8; 32]> {
+    if h.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(h.get(2 * i..2 * i + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// 32 bytes as 64 hex digits.
+fn hex64(b: &[u8; 32]) -> heapless::String<64> {
+    let mut s = heapless::String::new();
+    for x in b {
+        let _ = core::fmt::write(&mut s, format_args!("{:02x}", x));
+    }
+    s
 }
 
 /// `peer-sync`: send agents' messages on proxy objects to their owning

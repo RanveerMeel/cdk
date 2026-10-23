@@ -55,7 +55,7 @@ the measurement chain and its limits are in §6), and denial of service by the h
 | FPU/vector register isolation between agents | `src/fpu.rs`, `src/process.rs` (reset, restore, save on switch/block) | `fpu` agent in QEMU: 16 × 256-bit registers checked across preemptions and CPU migrations; negative control with switching disabled; `tools/check_kernel_no_simd.sh` keeps vector code out of the kernel (CI) |
 | Peer messages and revocation lists (roadmap 3.5 stage 2): from an untrusted courier | `link/src/peer.rs` (`PeerMessage`), `src/peer.rs` (`deliver`, `message_policy`), `gateway/src/registry.rs` | `link_messages` (strict decode, verify never panics, revocation and inbox codecs); unit tests: wrong audience, another node replaying a delegation, forged sender signature, tampered payload, foreign registry, expiry, payload bounds, `send` permission, revocation; QEMU, three boots: delivered after the owner rebooted, replayed copy and revoked delegation refused |
 | Peer capabilities and node certificates (roadmap 3.5): from an untrusted courier | `link/src/peer.rs`, `src/peer.rs`, `gateway/src/registry.rs` | `link_messages` (strict decode ⇒ canonical re-encode, verify never panics, blob reassembly bounds); unit tests: other registry, renamed certificate, widened permissions, another object, forged issuer, wrong audience, own node, expiry, outliving the certificate; QEMU with two nodes: replay, wrong audience, untrusted object, tampered file, expired after reboot refused |
-| Sealed store envelope (roadmap 4.5): from the untrusted gateway | `link/src/store.rs` (`Envelope`, `Records`, `freshness`), `src/store.rs`, `src/tpm.rs` (`seal`, `unseal`, NV counter), `gateway/src/store.rs` | `link_messages` (strict decode ⇒ canonical re-encode, opening never panics); unit tests: tampered counter, sealed key, nonce or records, wrong key, counter rules; QEMU with swtpm: rollback to an older envelope, a changed byte, a missing store, a changed kernel (key does not unseal), a BIOS boot on a TPM with a store, a TPM-less boot under `require sealed-store` — all refused and audit-logged; a replayed peer message refused after the receiver rebooted |
+| Sealed store envelope (roadmap 4.5): from the untrusted gateway | `link/src/store.rs` (`Envelope`, `Records`, `freshness`), `src/store.rs`, `src/tpm.rs` (`seal`, `unseal`, NV counter), `gateway/src/store.rs` | `link_messages` (strict decode ⇒ canonical re-encode, opening never panics); unit tests: tampered counter, sealed key, nonce or records, wrong key, counter rules; QEMU with swtpm: rollback to an older envelope, a changed byte, a missing store, a changed kernel (key does not unseal), a BIOS boot on a TPM with a store, a TPM-less boot under `require sealed-store` — all refused and audit-logged; a replayed peer message refused after the receiver rebooted; policy digests checked against swtpm (known answers) and against the TPM before each `store-migrate`; QEMU: a migrated store opens under the updated kernel with its records, the old kernel loses it after a re-seal, a third kernel is refused |
 | Syscalls (every argument) | `src/syscall.rs`, `src/agent.rs`, `src/tools.rs`, `src/paging.rs` | `chaos` ring-3 program in QEMU: 20,000 syscalls with kernel, unmapped, read-only and boundary-straddling pointers, huge lengths, unknown numbers and handles |
 | MCP and model server responses | `gateway/src/mcp.rs`, `gateway/src/models.rs` | Gateway tests (status mapping, wrong-key redaction, redirects); not yet fuzzed |
 
@@ -129,9 +129,11 @@ host test suites also run under AddressSanitizer
   sealed store (4.5) on machines with a TPM and CDK's measuring loader;
   elsewhere they last one boot (`require sealed-store` refuses peers'
   messages and imports then).
-- Sealed store (4.5): a kernel or firmware update makes the store
-  unopenable until `store-reset` (no migration to an authorized new kernel
-  yet); the key crosses the TPM bus unencrypted when unsealed; anyone with
+- Sealed store (4.5): updates need `store-migrate` beforehand (to target
+  PCR values the operator supplies — predicted for the kernel, read from a
+  trial boot of a new loader or firmware); without it the store is
+  unopenable until `store-reset`. A migrated store keeps opening under the
+  previous chain until the next `store-migrate`. The key crosses the TPM bus unencrypted when unsealed; anyone with
   the TPM owner hierarchy (usually no password) can increment or delete the
   counter — a detected, fail-closed denial of service.
 - Under Secure Boot the loader still reads `boot.json` from the boot

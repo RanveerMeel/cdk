@@ -22,7 +22,8 @@
 //!
 //! ```text
 //! Envelope : "CDK-STORE-v1" | counter u64 | public_len u16 | sealed public
-//!            | private_len u16 | sealed private | nonce [12]     (authenticated)
+//!            | private_len u16 | sealed private | n u8 | policy branch [32] × n
+//!            | nonce [12]                                       (authenticated)
 //!            | ct_len u32 | ciphertext (records) | tag [16]
 //! Records  : n u16 | revoked serial u64 × n
 //!            | n u16 | delivered (sender id [16], seq u64, not_after u64) × n
@@ -48,6 +49,8 @@ pub const NONCE_LEN: usize = 12;
 pub const TAG_LEN: usize = 16;
 /// Largest sealed TPM object part the envelope carries.
 pub const MAX_SEALED: usize = 512;
+/// Most `TPM2_PolicyOR` branches (a TPM limit).
+pub const MAX_BRANCHES: usize = 8;
 /// Record limits (each list is pruned of expired entries before it fills).
 pub const MAX_REVOKED: usize = 128;
 pub const MAX_DELIVERED: usize = 256;
@@ -56,6 +59,8 @@ pub const MAX_IMPORTED: usize = 64;
 pub const MAX_ENVELOPE: usize = MAGIC.len()
     + 8
     + 2 * (2 + MAX_SEALED)
+    + 1
+    + 32 * MAX_BRANCHES
     + NONCE_LEN
     + 4
     + 6
@@ -198,6 +203,11 @@ pub struct Envelope {
     pub sealed_public: Vec<u8>,
     /// The sealed key object (`TPM2B_PRIVATE` contents).
     pub sealed_private: Vec<u8>,
+    /// The object's policy: empty for a single `TPM2_PolicyPCR`, or the
+    /// 2..=8 PCR policy digests of a `TPM2_PolicyOR` (a migrated store,
+    /// which opens under any of those boot chains). Needed to unseal;
+    /// changing it only makes unsealing fail.
+    pub branches: Vec<[u8; 32]>,
     pub nonce: [u8; NONCE_LEN],
     /// Encrypted records followed by the tag.
     pub ciphertext: Vec<u8>,
@@ -215,6 +225,10 @@ impl Envelope {
             v.extend_from_slice(&(part.len() as u16).to_le_bytes());
             v.extend_from_slice(part);
         }
+        v.push(self.branches.len() as u8);
+        for b in &self.branches {
+            v.extend_from_slice(b);
+        }
         v.extend_from_slice(&self.nonce);
         v
     }
@@ -227,16 +241,21 @@ impl Envelope {
         counter: u64,
         sealed_public: &[u8],
         sealed_private: &[u8],
+        branches: &[[u8; 32]],
         nonce: [u8; NONCE_LEN],
         records: &Records,
     ) -> Option<Envelope> {
-        if sealed_public.len() > MAX_SEALED || sealed_private.len() > MAX_SEALED {
+        if sealed_public.len() > MAX_SEALED
+            || sealed_private.len() > MAX_SEALED
+            || !valid_branches(branches.len())
+        {
             return None;
         }
         let mut env = Envelope {
             counter,
             sealed_public: sealed_public.to_vec(),
             sealed_private: sealed_private.to_vec(),
+            branches: branches.to_vec(),
             nonce,
             ciphertext: Vec::new(),
         };
@@ -289,6 +308,14 @@ impl Envelope {
             }
             *part = r.take(n)?.to_vec();
         }
+        let count = r.take(1)?[0] as usize;
+        if !valid_branches(count) {
+            return None;
+        }
+        let mut branches = Vec::with_capacity(count);
+        for _ in 0..count {
+            branches.push(r.take(32)?.try_into().ok()?);
+        }
         let nonce = r.take(NONCE_LEN)?.try_into().ok()?;
         let n = r.u32()? as usize;
         if n < TAG_LEN {
@@ -300,10 +327,16 @@ impl Envelope {
             counter,
             sealed_public,
             sealed_private,
+            branches,
             nonce,
             ciphertext,
         })
     }
+}
+
+/// No branches (a single PCR policy) or a `TPM2_PolicyOR` of 2..=8.
+fn valid_branches(n: usize) -> bool {
+    n == 0 || (2..=MAX_BRANCHES).contains(&n)
 }
 
 /// How an envelope's counter relates to the TPM's.
@@ -378,14 +411,45 @@ mod tests {
         assert!(Records::decode(&[0, 0, 0, 0, 0xFF, 0xFF]).is_none());
 
         let key = [9u8; KEY_LEN];
-        let env = Envelope::seal(&key, 42, b"pub", b"priv", [5; NONCE_LEN], &r).unwrap();
+        let env = Envelope::seal(&key, 42, b"pub", b"priv", &[], [5; NONCE_LEN], &r).unwrap();
         let bytes = env.encode();
         let back = Envelope::decode(&bytes).unwrap();
         assert_eq!(back, env);
         assert_eq!(back.encode(), bytes);
-        assert_eq!(back.open(&key), Some(r));
+        assert_eq!(back.open(&key), Some(r.clone()));
         assert!(Envelope::decode(&bytes[..bytes.len() - 1]).is_none());
         assert!(bytes.len() <= MAX_ENVELOPE);
+
+        // A migrated store: two policy branches, authenticated with the rest.
+        let env = Envelope::seal(
+            &key,
+            43,
+            b"pub",
+            b"priv",
+            &[[1; 32], [2; 32]],
+            [6; NONCE_LEN],
+            &r,
+        )
+        .unwrap();
+        let bytes = env.encode();
+        assert_eq!(Envelope::decode(&bytes), Some(env.clone()));
+        let mut e = env.clone();
+        e.branches[1][0] ^= 1;
+        assert!(e.open(&key).is_none(), "branches are authenticated");
+        assert!(
+            Envelope::seal(&key, 1, b"p", b"q", &[[1; 32]], [0; NONCE_LEN], &r).is_none(),
+            "one branch is not an OR"
+        );
+        assert!(Envelope::seal(
+            &key,
+            1,
+            b"p",
+            b"q",
+            &[[1; 32]; MAX_BRANCHES + 1],
+            [0; NONCE_LEN],
+            &r
+        )
+        .is_none());
     }
 
     /// Any change to the envelope — counter, sealed key, nonce, records —
@@ -393,7 +457,8 @@ mod tests {
     #[test]
     fn tampering_is_detected() {
         let key = [9u8; KEY_LEN];
-        let env = Envelope::seal(&key, 42, b"pub", b"priv", [5; NONCE_LEN], &records()).unwrap();
+        let env =
+            Envelope::seal(&key, 42, b"pub", b"priv", &[], [5; NONCE_LEN], &records()).unwrap();
         assert!(env.open(&[8; KEY_LEN]).is_none(), "wrong key");
         let mut e = env.clone();
         e.counter = 43;

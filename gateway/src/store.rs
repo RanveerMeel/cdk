@@ -57,8 +57,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let f = StoreFile(dir.join("sealed-store.bin"));
         assert_eq!(f.read(), Ok(None));
-        let env =
-            Envelope::seal(&[1; 32], 7, b"p", b"q", [2; NONCE_LEN], &Records::default()).unwrap();
+        let env = Envelope::seal(
+            &[1; 32],
+            7,
+            b"p",
+            b"q",
+            &[],
+            [2; NONCE_LEN],
+            &Records::default(),
+        )
+        .unwrap();
         assert_eq!(f.write(&env.encode()), Ok(7));
         assert_eq!(f.read(), Ok(Some(env.encode())));
         assert!(f.write(b"junk").is_err());

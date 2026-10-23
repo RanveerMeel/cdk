@@ -55,13 +55,13 @@ def messages():
     for pc in sorted((ROOT / "target/caps/outbox").glob("*.pcap"))[:1]:
         write("link_messages", "portable-cap", pc.read_bytes())
     write("link_messages", "decision-parts", part(0, b"abcd") + b"\xff" + part(4, b"efgh"))
-    # Sealed store (roadmap 4.5): records, and an envelope (well formed; it
-    # does not authenticate).
+    # Sealed store (roadmap 4.5): records, and a migrated envelope with two
+    # policy branches (well formed; it does not authenticate).
     seen = lambda i, n, t: bytes([i]) * 16 + struct.pack("<QQ", n, t)
     records = struct.pack("<HQ", 1, 0x1234) + struct.pack("<H", 1) + seen(1, 3, 100) + struct.pack("<H", 1) + seen(2, 9, 50)
     sealed = lambda b: struct.pack("<H", len(b)) + b
     envelope = (b"CDK-STORE-v1" + struct.pack("<Q", 5) + sealed(b"\x00\x08" * 20) + sealed(b"\x44" * 60)
-                + b"\x07" * 12 + struct.pack("<I", len(records) + 16) + records + b"\x00" * 16)
+                + bytes([2]) + b"\x0a" * 32 + b"\x0b" * 32 + b"\x07" * 12 + struct.pack("<I", len(records) + 16) + records + b"\x00" * 16)
     write("link_messages", "store-records", records)
     write("link_messages", "store-envelope", envelope)
 

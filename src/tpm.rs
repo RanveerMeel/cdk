@@ -63,6 +63,7 @@ const CC_LOAD: u32 = 0x157;
 const CC_UNSEAL: u32 = 0x15E;
 const CC_POLICY_PCR: u32 = 0x17F;
 const CC_POLICY_GET_DIGEST: u32 = 0x189;
+const CC_POLICY_OR: u32 = 0x171;
 const CC_NV_DEFINE_SPACE: u32 = 0x12A;
 const CC_NV_INCREMENT: u32 = 0x134;
 const SE_TRIAL: u8 = 0x03;
@@ -96,6 +97,9 @@ pub const RC_NV_UNINITIALIZED: u32 = 0x14A;
 /// TPM_RC_POLICY_FAIL for session 1 (format 1): the PCRs differ from the
 /// ones the object was sealed to.
 pub const RC_POLICY_FAIL: u32 = 0x99D;
+/// TPM_RC_VALUE for parameter 1 (format 1): `TPM2_PolicyOR` found the
+/// session's digest in none of the branches.
+pub const RC_OR_NO_BRANCH: u32 = 0x1C4;
 const RH_NULL: u32 = 0x4000_0007;
 const SE_POLICY: u8 = 0x01;
 const RH_ENDORSEMENT: u32 = 0x4000_000B;
@@ -667,10 +671,29 @@ pub fn seal(parent: u32, data: &[u8], policy: &[u8; 32]) -> Result<(Vec<u8>, Vec
     Ok((public, private))
 }
 
-/// `TPM2_Load` the sealed object under `parent`, satisfy its PCR policy in
-/// a fresh policy session, and `TPM2_Unseal` it. Fails with
-/// [`RC_POLICY_FAIL`] when the PCRs differ from the sealed ones.
-pub fn unseal(parent: u32, public: &[u8], private: &[u8], select: &[u8; 3]) -> Result<Vec<u8>> {
+/// `TPM2_PolicyOR` on `session`: its digest must be one of `branches`.
+fn policy_or(session: u32, branches: &[[u8; 32]]) -> Result<()> {
+    let mut cmd = Cmd::new(ST_NO_SESSIONS, CC_POLICY_OR)
+        .u32(session)
+        .u32(branches.len() as u32);
+    for b in branches {
+        cmd = cmd.tpm2b(b);
+    }
+    transmit(&cmd.finish()).map(|_| ())
+}
+
+/// `TPM2_Load` the sealed object under `parent`, satisfy its policy in a
+/// fresh policy session — `TPM2_PolicyPCR`, then `TPM2_PolicyOR` over
+/// `branches` if it has any — and `TPM2_Unseal` it. Fails with
+/// [`RC_POLICY_FAIL`] when the PCRs differ from the sealed ones (or with
+/// another code when they match no branch).
+pub fn unseal(
+    parent: u32,
+    public: &[u8],
+    private: &[u8],
+    select: &[u8; 3],
+    branches: &[[u8; 32]],
+) -> Result<Vec<u8>> {
     let r = transmit(
         &Cmd::new(ST_SESSIONS, CC_LOAD)
             .u32(parent)
@@ -681,7 +704,8 @@ pub fn unseal(parent: u32, public: &[u8], private: &[u8], select: &[u8; 3]) -> R
     )?;
     let item = Resp::new(&r).u32()?;
     let result = start_session(SE_POLICY).and_then(|session| {
-        let out = policy_pcr(session, select).and_then(|_| {
+        let or = |_| if branches.is_empty() { Ok(()) } else { policy_or(session, branches) };
+        let out = policy_pcr(session, select).and_then(or).and_then(|_| {
             let r = transmit(
                 &Cmd::new(ST_SESSIONS, CC_UNSEAL)
                     .u32(item)
