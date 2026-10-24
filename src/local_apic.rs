@@ -26,6 +26,19 @@ pub fn x2apic_enabled() -> bool {
     X2APIC_ENABLED.load(Ordering::Acquire)
 }
 
+/// On an AP: switch this CPU to x2APIC mode if the BSP did. The mode is
+/// per CPU (each has its own `IA32_APIC_BASE`), and the register accessors
+/// follow the BSP's choice, so every AP must match it before touching its
+/// local APIC.
+pub fn enable_x2apic_on_this_cpu() {
+    #[cfg(target_os = "none")]
+    if x2apic_enabled() {
+        let mut apic_base = crate::cpu::rdmsr(crate::cpu::IA32_APIC_BASE);
+        apic_base |= crate::cpu::APIC_BASE_GLOBAL_ENABLE | crate::cpu::APIC_BASE_X2APIC_ENABLE;
+        crate::cpu::wrmsr(crate::cpu::IA32_APIC_BASE, apic_base);
+    }
+}
+
 /// Enable x2APIC when CPUID reports support. Returns true if enabled.
 pub fn try_enable_x2apic() -> bool {
     #[cfg(target_os = "none")]

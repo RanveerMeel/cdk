@@ -532,24 +532,14 @@ pub fn inject_tlb_shootdown_ipi(apic_id: u32) {
     call_tlb_shootdown_ipi_hook(apic_id);
 }
 
+/// This CPU's local APIC id, through the driver (xAPIC MMIO or x2APIC MSR).
 #[inline]
 fn current_local_apic_id() -> u32 {
-    #[cfg(target_os = "none")]
-    unsafe {
-        let reg = (0xFEE0_0000u64 + 0x20) as *const u32;
-        (core::ptr::read_volatile(reg) >> 24) & 0xff
-    }
-    #[cfg(not(target_os = "none"))]
-    {
-        0
-    }
+    crate::percpu::current_apic_id()
 }
 
+/// End of interrupt, through the driver (xAPIC MMIO or x2APIC MSR).
 #[inline]
 unsafe fn local_apic_eoi() {
-    #[cfg(target_os = "none")]
-    {
-        let eoi = (0xFEE0_0000u64 + 0xB0) as *mut u32;
-        core::ptr::write_volatile(eoi, 0);
-    }
+    crate::local_apic::XApicController::new().eoi();
 }

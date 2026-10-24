@@ -104,6 +104,8 @@ fn ap_trampoline_entry_stub(apic_id: u32, startup_seq: u32) {
     let mut private_tss = false;
     #[cfg(target_os = "none")]
     {
+        // Same local APIC mode as the BSP before anything uses it.
+        cdk::local_apic::enable_x2apic_on_this_cpu();
         match cdk::gdt::init_for_ap(apic_id) {
             Ok(()) => {
                 private_tss = true;
