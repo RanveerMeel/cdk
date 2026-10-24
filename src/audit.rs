@@ -166,6 +166,10 @@ pub enum EventKind {
     /// The operator started a new sealed store (`store-reset`). `detail` =
     /// TPM counter value.
     StoreReset = 41,
+    /// The operator re-sealed the store key (`store-migrate`): subject
+    /// `store:two-chains` (this boot chain or the target) or
+    /// `store:this-chain`; `detail` = TPM counter value.
+    StoreMigrated = 42,
 }
 
 impl EventKind {
@@ -212,6 +216,7 @@ impl EventKind {
             EventKind::StoreLoaded => "store-loaded",
             EventKind::StoreFailed => "store-failed",
             EventKind::StoreReset => "store-reset",
+            EventKind::StoreMigrated => "store-migrated",
         }
     }
 }

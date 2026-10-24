@@ -27,6 +27,13 @@
 //!   a new machine, or one whose counter and store were both deleted
 //!   (the TPM owner hierarchy usually has no password), and only the
 //!   operator can tell.
+//! * **Updates** ([`migrate`], console `store-migrate`, reviewed): before
+//!   a kernel, loader or firmware update, the running kernel — still the
+//!   trusted one — re-seals the same key to a `TPM2_PolicyOR` of this boot
+//!   chain and the operator's target values for the sealed PCRs, so the
+//!   updated chain opens the store (and the old one still can, for a
+//!   roll-back) with its records and counter intact. Run without targets,
+//!   it re-seals to this boot chain alone.
 
 extern crate alloc;
 
@@ -65,6 +72,8 @@ struct Ready {
     key: Zeroizing<[u8; KEY_LEN]>,
     public: Vec<u8>,
     private: Vec<u8>,
+    /// `TPM2_PolicyOR` branches of the sealed object (empty: one PCR policy).
+    branches: Vec<[u8; 32]>,
     /// The TPM counter value of the last committed write.
     counter: u64,
 }
@@ -208,12 +217,18 @@ pub fn load() {
 }
 
 /// Recover the store key from its sealed object.
-fn unseal_key(public: &[u8], private: &[u8]) -> Result<Zeroizing<[u8; KEY_LEN]>, (u64, String)> {
+fn unseal_key(
+    public: &[u8],
+    private: &[u8],
+    branches: &[[u8; 32]],
+) -> Result<Zeroizing<[u8; KEY_LEN]>, (u64, String)> {
     let srk = tpm::create_storage_key().map_err(|e| (failure::TPM, format!("TPM storage key ({:?})", e)))?;
-    let out = tpm::unseal(srk, public, private, &SEAL_PCRS);
+    let out = tpm::unseal(srk, public, private, &SEAL_PCRS, branches);
     let _ = tpm::flush(srk);
     let mut data = out.map_err(|e| match e {
-        TpmError::Rc(tpm::RC_POLICY_FAIL) => (
+        // POLICY_FAIL: one PCR policy, other values; VALUE (PolicyOR,
+        // parameter 1): this chain is none of a migrated store's branches.
+        TpmError::Rc(tpm::RC_POLICY_FAIL) | TpmError::Rc(tpm::RC_OR_NO_BRANCH) => (
             failure::OTHER_BOOT_CHAIN,
             "the store is sealed to another boot chain (firmware, loader or kernel changed)".to_string(),
         ),
@@ -232,7 +247,7 @@ fn unseal_key(public: &[u8], private: &[u8]) -> Result<Zeroizing<[u8; KEY_LEN]>,
 /// Unseal, authenticate and check freshness against TPM counter `tpm_counter`.
 fn open(tpm_counter: u64, bytes: &[u8]) -> Result<(Ready, Records), (u64, String)> {
     let env = Envelope::decode(bytes).ok_or((failure::TAMPERED, "not a store envelope".to_string()))?;
-    let key = unseal_key(&env.sealed_public, &env.sealed_private)?;
+    let key = unseal_key(&env.sealed_public, &env.sealed_private, &env.branches)?;
     let records = env
         .open(&key)
         .ok_or((failure::TAMPERED, "the store does not authenticate (changed)".to_string()))?;
@@ -260,6 +275,7 @@ fn open(tpm_counter: u64, bytes: &[u8]) -> Result<(Ready, Records), (u64, String
             key,
             public: env.sealed_public,
             private: env.sealed_private,
+            branches: env.branches,
             counter,
         },
         records,
@@ -291,6 +307,7 @@ fn create(now: Option<u64>) -> Result<u64, (u64, String)> {
         key,
         public,
         private,
+        branches: Vec::new(),
         counter,
     };
     write(&mut ready, now).map_err(|e| (failure::MISSING, e))?;
@@ -315,7 +332,8 @@ fn write(r: &mut Ready, now: Option<u64>) -> Result<(), String> {
     let mut nonce = [0u8; NONCE_LEN];
     rand_core::RngCore::fill_bytes(&mut crate::rng::KernelRng, &mut nonce);
     let next = tpm_counter.checked_add(1).ok_or("TPM counter exhausted")?;
-    let env = Envelope::seal(&r.key, next, &r.public, &r.private, nonce, &records).ok_or("the store is full")?;
+    let env = Envelope::seal(&r.key, next, &r.public, &r.private, &r.branches, nonce, &records)
+        .ok_or("the store is full")?;
     crate::peer::store_put(&env.encode())?;
     tpm::nv_increment(NV_COUNTER).map_err(|e| format!("TPM counter increment ({:?})", e))?;
     r.counter = next;
@@ -369,14 +387,85 @@ pub fn reset() -> Result<u64, String> {
     Ok(c)
 }
 
+/// This boot chain's values of the sealed PCRs, `(pcr, value)` in order.
+pub fn chain() -> Result<Vec<(u32, [u8; 32])>, String> {
+    let pcrs = tpm::pcr_read_quoted().map_err(|e| format!("TPM PCRs unreadable ({:?})", e))?;
+    Ok(cdk_link::tpm::selected_pcrs(&SEAL_PCRS)
+        .into_iter()
+        .map(|i| (i, pcrs[i as usize]))
+        .collect())
+}
+
+/// Re-seal the open store's key (console `store-migrate`, after review).
+/// `targets` overrides sealed PCR values for the boot chain to admit: the
+/// key then opens under this chain *or* that one (`TPM2_PolicyOR`). With no
+/// targets it opens under this chain only (dropping earlier branches). The
+/// records, counter and key are kept; a new envelope is committed.
+pub fn migrate(targets: &[(u32, [u8; 32])]) -> Result<u64, String> {
+    let current = chain()?;
+    let sealed: Vec<u32> = current.iter().map(|(i, _)| *i).collect();
+    if let Some((i, _)) = targets.iter().find(|(i, _)| !sealed.contains(i)) {
+        return Err(format!("PCR {} is not sealed (sealed: 0, 2, 4, 7, 11)", i));
+    }
+    let values = |chain: &[(u32, [u8; 32])]| -> Vec<[u8; 32]> { chain.iter().map(|(_, v)| *v).collect() };
+    let here = cdk_link::tpm::pcr_policy(&SEAL_PCRS, &values(&current));
+    // The software digest must be the TPM's own for this chain, or the
+    // target branch could be wrong too.
+    let tpm_here = tpm::pcr_policy_digest(&SEAL_PCRS).map_err(|e| format!("PCR policy ({:?})", e))?;
+    if here != tpm_here {
+        return Err("the computed PCR policy differs from the TPM's; not migrating".into());
+    }
+    let target: Vec<(u32, [u8; 32])> = current
+        .iter()
+        .map(|(i, v)| (*i, targets.iter().find(|(t, _)| t == i).map_or(*v, |(_, t)| *t)))
+        .collect();
+    let there = cdk_link::tpm::pcr_policy(&SEAL_PCRS, &values(&target));
+    let (branches, policy) = if targets.is_empty() {
+        (Vec::new(), here)
+    } else if there == here {
+        return Err("the target values are this boot chain's: nothing to migrate".into());
+    } else {
+        let b = alloc::vec![here, there];
+        let p = cdk_link::tpm::or_policy(&b);
+        (b, p)
+    };
+    let mut st = STATE.lock();
+    let State::Ready(r) = &mut *st else {
+        return Err("the sealed store is not open (only an open store can be migrated)".into());
+    };
+    let srk = tpm::create_storage_key().map_err(|e| format!("TPM storage key ({:?})", e))?;
+    let sealed = tpm::seal(srk, &r.key[..], &policy);
+    let _ = tpm::flush(srk);
+    let (public, private) = sealed.map_err(|e| format!("sealing the store key ({:?})", e))?;
+    let old = (
+        core::mem::replace(&mut r.public, public),
+        core::mem::replace(&mut r.private, private),
+        core::mem::replace(&mut r.branches, branches),
+    );
+    if let Err(e) = write(r, None) {
+        (r.public, r.private, r.branches) = old;
+        return Err(e);
+    }
+    let c = r.counter;
+    drop(st);
+    audit::record_fmt(
+        EventKind::StoreMigrated,
+        format_args!("store:{}", if targets.is_empty() { "this-chain" } else { "two-chains" }),
+        c,
+    );
+    Ok(c)
+}
+
 /// One line for the console.
 pub fn status() -> String {
     match &*STATE.lock() {
         State::NotLoaded => "not loaded (link-secure loads it)".into(),
         State::Off(why) => format!("off — {}", why),
         State::Ready(r) => format!(
-            "sealed to PCRs 0,2,4,7,11; TPM counter {} (NV {:#010x})",
-            r.counter, NV_COUNTER
+            "sealed to PCRs 0,2,4,7,11{}; TPM counter {} (NV {:#010x})",
+            if r.branches.is_empty() { "" } else { " (this chain or one migrated to)" },
+            r.counter,
+            NV_COUNTER
         ),
         State::Failed(why) => format!("FAILED — {}; acceptance refused until store-reset", why),
     }
@@ -401,7 +490,7 @@ mod tests {
     /// PCRs 0, 2, 4, 7 and 11 — never the kernel's own 8-10.
     #[test]
     fn sealed_to_measurements_made_before_the_kernel() {
-        let pcrs: Vec<u32> = (0..24u32).filter(|i| SEAL_PCRS[*i as usize / 8] & (1 << (i % 8)) != 0).collect();
+        let pcrs = cdk_link::tpm::selected_pcrs(&SEAL_PCRS);
         assert_eq!(pcrs, alloc::vec![0, 2, 4, 7, 11]);
         for own in cdk_link::tpm::CDK_PCRS {
             assert!(!pcrs.contains(&own));

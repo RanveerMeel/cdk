@@ -67,6 +67,49 @@ pub fn expected_loader_pcrs(kernel_file: &[u8], ramdisk: &[u8]) -> [[u8; 32]; 2]
     out
 }
 
+/// TPM_CC_PolicyPCR and TPM_CC_PolicyOR, as policy digests include them.
+const CC_POLICY_PCR: u32 = 0x17F;
+const CC_POLICY_OR: u32 = 0x171;
+
+/// The policy digest of `TPM2_PolicyPCR` for the PCRs in `select` (a
+/// 3-byte SHA-256 selection bitmap) holding `values` (in PCR order), from a
+/// fresh session (TPM 2.0 Part 3, 23.7):
+/// `H(0³² ‖ TPM_CC_PolicyPCR ‖ TPML_PCR_SELECTION ‖ H(values))`.
+pub fn pcr_policy(select: &[u8; 3], values: &[[u8; 32]]) -> [u8; 32] {
+    let mut pcrs = Sha256::new();
+    for v in values {
+        pcrs.update(v);
+    }
+    let mut h = Sha256::new();
+    h.update([0u8; 32]);
+    h.update(CC_POLICY_PCR.to_be_bytes());
+    h.update(1u32.to_be_bytes()); // one selection
+    h.update(TPM_ALG_SHA256.to_be_bytes());
+    h.update([3u8]);
+    h.update(select);
+    h.update(pcrs.finalize());
+    h.finalize().into()
+}
+
+/// The policy digest of `TPM2_PolicyOR` over `branches` (2..=8 policy
+/// digests; Part 3, 23.6): `H(0³² ‖ TPM_CC_PolicyOR ‖ branches…)`.
+pub fn or_policy(branches: &[[u8; 32]]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update([0u8; 32]);
+    h.update(CC_POLICY_OR.to_be_bytes());
+    for b in branches {
+        h.update(b);
+    }
+    h.finalize().into()
+}
+
+/// The PCR indices set in a 3-byte selection bitmap, in order.
+pub fn selected_pcrs(select: &[u8; 3]) -> Vec<u32> {
+    (0..24u32)
+        .filter(|i| select[*i as usize / 8] & (1 << (i % 8)) != 0)
+        .collect()
+}
+
 pub const TPM_GENERATED_VALUE: u32 = 0xff54_4347;
 pub const TPM_ST_ATTEST_QUOTE: u16 = 0x8018;
 pub const TPM_ALG_SHA256: u16 = 0x000B;
@@ -443,6 +486,50 @@ pub fn is_endorsement(msg: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 64 hex digits as bytes.
+    fn hex32(s: &str) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for (i, b) in out.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap();
+        }
+        out
+    }
+
+    /// Policy digests match a TPM's own (swtpm 0.7 via tpm2-tools:
+    /// `tpm2_policypcr -l sha256:0,2,4,7,11` in a trial session, with every
+    /// PCR zero, then after `tpm2_pcrextend 11:sha256=ab…ab`; and
+    /// `tpm2_policyor` of the two).
+    #[test]
+    fn policy_digests_match_a_tpm() {
+        let select = [0x95, 0x08, 0x00];
+        assert_eq!(selected_pcrs(&select), alloc::vec![0, 2, 4, 7, 11]);
+        let zeros = pcr_policy(&select, &[[0; 32]; 5]);
+        assert_eq!(
+            zeros,
+            hex32("439f80a5c14bc5886386526d8527b3936696656aa51ff348db0a7a38f5953a7e")
+        );
+        let mut pcr11 = [0u8; 32];
+        crate::attest::extend(&mut pcr11, &[0xab; 32]);
+        assert_eq!(
+            pcr11,
+            hex32("debb3e7acfff6dd18d501042273629f0b79cb206bb8c24f59f62ddb80849403b")
+        );
+        let ext = pcr_policy(&select, &[[0; 32], [0; 32], [0; 32], [0; 32], pcr11]);
+        assert_eq!(
+            ext,
+            hex32("35f023830f2cac240fb796670098e8552198b8ae551dc29d465f7a58abda593d")
+        );
+        assert_eq!(
+            or_policy(&[zeros, ext]),
+            hex32("e81ed79c0c845fcdb87a027396dd6ac2012d15f0a7a02499e731ad057d456257")
+        );
+        assert_ne!(
+            or_policy(&[ext, zeros]),
+            or_policy(&[zeros, ext]),
+            "branch order matters"
+        );
+    }
 
     #[test]
     fn ek_blob_chunks_reassemble() {

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Sealed store migration: `store-migrate <pcr>=<hex>…` (reviewed) re-seals
+  the store key under a TPM `PolicyOR` of the current boot chain and the
+  target values, so a kernel, loader or firmware update keeps the store
+  (records and counter intact) and a roll-back still opens it;
+  `store-migrate` alone re-seals to the current chain only. `store` prints
+  the sealed PCR values. The envelope now carries the policy branches
+  (stores from the previous commit read as tampered: `store-reset`). Audit
+  `store-migrated`. Console lines can be 256 characters.
+
 - Persistent sealed storage (roadmap 4.5): revocations and the replay
   records of peer messages and imports survive reboots in an envelope the
   gateway keeps (`cdk-gateway --store FILE`; `CDK_STORE` in
