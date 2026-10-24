@@ -36,7 +36,7 @@ next — roadmap 5.2).
 
 | Environment | How CDK runs | Status |
 |---|---|---|
-| **Docker** (development, demos, CI, evaluation) | QEMU inside a container boots CDK; `--device /dev/kvm` makes it fast | Roadmap 5.1 |
+| **Docker** (development, demos, CI, evaluation) | QEMU inside a container boots CDK; `--device /dev/kvm` makes it fast | Works (roadmap 5.1) |
 | **Kubernetes** (production) | A pod whose runtime is a micro-VM (Kata Containers or KubeVirt) boots CDK with a persistent vTPM; the gateway is a sidecar container in the same pod, connected over vsock; CDK images ship as OCI images (containerDisk) | Roadmap 5.2–5.4 |
 | **Cloud VM** | A custom image on a KVM-based cloud; on **confidential VMs** (AMD SEV-SNP, Intel TDX) even the cloud operator cannot read agent memory or keys | Roadmap 5.3, 5.5 |
 | **Bare metal / appliance** (edge, branches, air-gapped) | CDK boots directly with Secure Boot and a discrete TPM; later, with Linux in a driver VM for GPUs (roadmap 4.4) | Works in QEMU today; hardware profile is roadmap 5.8 |
@@ -60,6 +60,10 @@ next — roadmap 5.2).
 
 ## What works today
 
+* **Docker** ([docker/README.md](../docker/README.md)): `cdk:0.2.0` boots the
+  signed release (checked at build) at the `cdk>` prompt; `cdk:dev` runs the
+  whole stack from source in one container. Both use KVM with
+  `--device /dev/kvm`.
 * `./run_qemu.sh` + `tools/run_gateway.sh` on a Linux machine: everything —
   verified and measured boot with a software TPM, the gateway, tools and
   models, signed approvals, distributed capabilities, the sealed store.
