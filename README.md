@@ -371,7 +371,7 @@ The full plan — phases, milestones, and editions — is in [ROADMAP.md](ROADMA
 - [x] Fraud-prevention demo: two agents, signed two-person approvals, a prompt-injection that can't move money, case file — `tools/demo_fraud.sh --auto` ([DEMO.md](DEMO.md))
 - [x] Verified and measured boot: release-signed ramdisk manifest checked by the kernel (lockdown on failure), firmware → measuring loader → kernel chain in TPM PCRs, attested with TPM quotes from an enrolled machine whose TPM proves it is genuine (endorsement certificate chain + credential activation) and UEFI Secure Boot (signed loader, pinned kernel) — roadmap milestone 4.2
 - [x] Persistent sealed storage: revocations and replay records survive reboots in a TPM-sealed, rollback-protected store kept by the untrusted gateway; fail-closed — roadmap milestone 4.5
-- [x] Fuzzing of every parser of untrusted bytes (11 libFuzzer targets in CI), an in-kernel syscall fuzzer (`chaos`), AddressSanitizer on host tests — roadmap milestone 4.3 (independent review pending; see [SECURITY-REVIEW.md](SECURITY-REVIEW.md))
+- [x] Fuzzing of every parser of untrusted bytes (12 libFuzzer targets in CI), an in-kernel syscall fuzzer (`chaos`), AddressSanitizer on host tests — roadmap milestone 4.3 (independent review pending; see [SECURITY-REVIEW.md](SECURITY-REVIEW.md))
 - [x] Signed operator approvals: post-quantum operator signatures, M-of-N quorum, vetoes, time-outs, every vote audit-logged — roadmap milestone 2.8
 - [x] Policy change review: reach diffs, invariant rules, pinned gateway listings that block changed tools until approved, fail-closed boot policy — roadmap milestone 2.9
 - [x] Framebuffer text rendering (8×16 bitmap font, RGB/BGR/U8 pixel formats, auto-scroll)

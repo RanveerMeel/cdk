@@ -15,11 +15,21 @@ for d in gateway user; do
 done
 if [[ "${1:-}" == "--shell" ]]; then exec bash; fi
 rm -f target/cdk-link.sock
+# KVM when the container was given /dev/kvm. This volume's TPM enrollment is
+# made under the first mode used; switching later means enrolling again.
+if [[ -z "${CDK_QEMU_ACCEL:-}" && -r /dev/kvm && -w /dev/kvm ]]; then export CDK_QEMU_ACCEL=kvm; fi
 
 # The gateway: started once CDK is up; if it stops, say so on the console
 # (it is not restarted: fix the cause, see target/gateway.log).
 (
-    for _ in $(seq 1 1800); do [[ -S target/cdk-link.sock ]] && break; sleep 1; done
+    # Console link: QEMU creates the socket. vsock (CDK_LINK=vsock): the
+    # gateway retries until CDK listens, once QEMU is running.
+    for _ in $(seq 1 1800); do
+        if [[ "${CDK_LINK:-console}" == "vsock" ]]; then
+            grep -qx qemu-system-x86 /proc/[0-9]*/comm 2>/dev/null && break
+        else [[ -S target/cdk-link.sock ]] && break; fi
+        sleep 1
+    done
     tools/run_gateway.sh > target/gateway.log 2>&1
     status=$?
     if [[ $status -ne 0 && $status -ne 143 ]]; then

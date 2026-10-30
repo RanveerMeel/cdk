@@ -96,6 +96,13 @@ def policies():
                             b"label obj-2 customer-data\nquorum credential 2\nquorum policy 2\napproval-timeout 120\n")
 
 
+def vsock():
+    """Packet sequences for the vsock endpoint (roadmap 5.2): a session, a reconnect."""
+    hdr = lambda op, port, ln=0: struct.pack("<QQIIIHHIII", 2, 3, port, 0x4344, ln, 1, op, 0, 65536, 0) + b"\x00"
+    write("vsock", "session", hdr(1, 9000) + hdr(5, 9000, 64) + hdr(7, 9000) + hdr(4, 9000))
+    write("vsock", "reconnect", hdr(1, 9000) + hdr(1, 9100) + hdr(5, 9000, 8) + hdr(3, 9100))
+
+
 def spool():
     write("spool_decision", "approve", struct.pack("<I", 3) + b"\x44" * 16 + b"\x01" + b"\x55" * (64 + 3309))
 
@@ -116,6 +123,6 @@ def boot():
 
 
 if __name__ == "__main__":
-    frames(); messages(); ustar(); elves(); policies(); spool(); boot()
+    frames(); messages(); ustar(); elves(); policies(); spool(); boot(); vsock()
     n = sum(1 for _ in OUT.rglob("*") if _.is_file())
     print(f"wrote {n} seed files to {OUT.relative_to(ROOT)}")

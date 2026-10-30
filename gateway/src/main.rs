@@ -31,7 +31,7 @@
 //! cdk-gateway [--identity FILE] [--mcp NAME=COMMAND]... [--model SPEC]... [--allow t1,t2]
 //!             [--spool DIR] [--expect FILE] [--tpm FILE] [--tpm-ca DIR]
 //!             [--registry-key FILE --registry-auth FILE [--node NAME] [--cert-validity S]]
-//!             [--cap-dir DIR] [--store FILE] [SOCKET]
+//!             [--cap-dir DIR] [--store FILE] [SOCKET | vsock:CID[:PORT]]
 //! ```
 //! The public key file (1984 bytes) is packed into CDK's ramdisk as
 //! `gateway.pub`; CDK refuses any other gateway.
@@ -55,6 +55,7 @@ mod models;
 mod registry;
 mod spool;
 mod store;
+mod vsock;
 
 fn send(stream: &mut UnixStream, k: u8, flags: u8, payload: &[u8]) -> std::io::Result<()> {
     let mut buf = [0u8; MAX_FRAME];
@@ -211,11 +212,37 @@ fn refuse_unattested(msg: &[u8]) -> Vec<Vec<u8>> {
     }
 }
 
+/// Connect to CDK: QEMU's virtio-console socket at `path`, or CDK's vsock
+/// port with `vsock:CID[:PORT]` (roadmap 5.2).
 fn connect(path: &str) -> std::io::Result<UnixStream> {
-    let deadline = Instant::now() + Duration::from_secs(60); // CDK may still be booting
+    let vsock = match vsock::parse(path) {
+        Some(Ok(addr)) => Some(addr),
+        Some(Err(e)) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)),
+        None => None,
+    };
+    // CDK may still be booting: the console socket appears when QEMU starts,
+    // but CDK's vsock port only once the kernel is up (slower to wait for).
+    let wait = if vsock.is_some() { 300 } else { 60 };
+    let deadline = Instant::now() + Duration::from_secs(wait);
     loop {
-        match UnixStream::connect(path) {
+        let attempt = match vsock {
+            Some((cid, port)) => vsock::connect(cid, port),
+            None => UnixStream::connect(path),
+        };
+        match attempt {
             Ok(s) => return Ok(s),
+            // Not allowed to open vsock sockets at all (a container's
+            // seccomp/AppArmor profile, no vsock in the kernel): no retry helps.
+            Err(e)
+                if vsock.is_some()
+                    && (e.kind() == std::io::ErrorKind::PermissionDenied
+                        || e.raw_os_error() == Some(libc::EAFNOSUPPORT)) =>
+            {
+                return Err(std::io::Error::new(
+                    e.kind(),
+                    format!("{e} — this process may not use vsock sockets (inside a container, run the gateway on the host)"),
+                ))
+            }
             Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(200)),
             Err(e) => return Err(e),
         }
@@ -525,7 +552,7 @@ fn main() -> std::io::Result<()> {
         reg
     });
     eprintln!(
-        "gateway: connecting to {} (waiting up to 60 s for CDK)",
+        "gateway: connecting to {} (waiting for CDK to come up)",
         a.socket
     );
     let mut stream = match connect(&a.socket) {
