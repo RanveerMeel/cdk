@@ -121,6 +121,22 @@ copies, address-space teardown. See `README.md` for the full list.
 | 4.4 | Research: CDK as a minimal hypervisor with a Linux driver VM (VT-x/EPT, IOMMU passthrough). | ⬜ |
 | 4.5 | **Persistent sealed storage** ✅: what a node must remember across reboots — delegations it revoked, peer messages and capabilities it accepted — is kept by the gateway as an envelope it cannot read, change or roll back: records encrypted (ChaCha20-Poly1305) under a key the TPM seals to the boot chain measured before the kernel ran (PCRs 0, 2, 4, 7 and the loader's kernel measurement, PCR 11), with a monotonic TPM NV counter committed after every durable write. Acceptance is committed before delivery; a missing, rolled-back, tampered or foreign store — or a boot that cannot open it — fails closed until the operator's reviewed `store-reset`, which is also the only way a store is created; `require sealed-store` makes it mandatory. Tested in QEMU with swtpm: revocations survive with the gateway's own list deleted, a replayed message is refused after the receiver rebooted, and rollback, tampering, a missing store, a changed kernel, a BIOS boot and a TPM-less boot under `require sealed-store` are all refused. **Updates:** `store-migrate` (reviewed) re-seals the same key under a `TPM2_PolicyOR` of the current boot chain and the operator's target PCR values (PCR 11 predicted from the new build; loader or firmware values read from a trial boot), so updates keep the store and a roll-back still opens it — no classical `PolicyAuthorize` key. | ✅ |
 
+
+### Phase 5 — Deployment (user feedback first)
+
+How people will run CDK: always as a **VM** (it is a kernel, so it cannot be a container), paired with its gateway as an ordinary Linux container — started by Docker for evaluation, by Kubernetes (Kata Containers or KubeVirt) in production, or as a cloud or confidential VM. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). The order is chosen so each step can be put in front of users: what they ask for decides how far 5.6–5.8 go.
+
+| # | Milestone | Status |
+|---|---|---|
+| 5.1 | **Docker image.** `cdk:<version>` boots the signed release (checked at build) in QEMU with a software TPM — `docker run -it` and you are at the `cdk>` prompt, KVM-accelerated with `--device /dev/kvm`; `cdk:dev` runs the full stack from source (kernel, gateway, tools, signed approvals, sealed store) with the pinned toolchain; keys are made on first run in a volume, never in the image. First result: CDK now runs under KVM (`run_qemu.sh` uses it when `/dev/kvm` is usable), and QEMU 10 exposed an x2APIC bug — the other CPUs were started through xAPIC registers after the switch to x2APIC — now fixed. | ✅ |
+| 5.2 | **vsock link transport.** The kernel–gateway link over virtio-vsock (what Firecracker, Kata, KubeVirt and AWS Nitro provide), alongside the current virtio-console; the gateway listens on `AF_VSOCK`. | ⬜ |
+| 5.3 | **Real virtual hardware.** TPM CRB interface (cloud vTPMs, firmware TPMs), timer calibration instead of a fixed clock assumption, ACPI/APIC robustness; tested under KVM, Firecracker and a cloud VM. x2APIC (every AP in the BSP's mode; ID and EOI through the driver) and KVM are done. | 🚧 |
+| 5.4 | **Kubernetes.** A CDK pod: the kernel in a Kata or KubeVirt micro-VM with a persistent vTPM, the gateway as a sidecar container over vsock; CDK images shipped as OCI images (containerDisk); a Helm chart and a two-node example. | ⬜ |
+| 5.5 | **Confidential VMs.** AMD SEV-SNP and Intel TDX attestation reports checked by the gateway with (or instead of) TPM quotes, so the cloud operator is outside the trust boundary. | ⬜ |
+| 5.6 | **Agent SDK and image builder.** Build agents, policy and keys into a signed, reproducible boot image with its expected measurements in one command (CI-friendly). | ⬜ |
+| 5.7 | **Kubernetes operator** (after feedback from 5.1–5.4): an `AgentNode` resource for attestation, node authorities, updates (`store-migrate`) and audit export. | ⬜ |
+| 5.8 | **Bare-metal appliance** (after feedback): a supported hardware profile with Secure Boot and a discrete TPM; with 4.4, Linux in a driver VM for GPUs. | ⬜ |
+
 ---
 
 ## 5. Editions

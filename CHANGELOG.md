@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Docker (roadmap 5.1): `docker/Dockerfile` builds `cdk:<version>`, which
+  boots the signed release (checksums verified at build) in QEMU with a
+  software TPM, and `cdk:dev`, the full stack from source with the pinned
+  nightly; `--device /dev/kvm` enables KVM. See `docker/README.md`.
+- KVM: `run_qemu.sh` uses it when `/dev/kvm` is usable (`CDK_QEMU_ACCEL`).
+- Fix: with x2APIC available (QEMU 10, KVM, real CPUs) CDK switched its boot
+  CPU to x2APIC but started the other CPUs, read APIC ids and sent EOIs
+  through xAPIC registers, and page-faulted during SMP start. Every AP now
+  enters the BSP's APIC mode and all accesses go through the driver.
+- Deployment plan: roadmap Phase 5 and `docs/DEPLOYMENT.md`.
+
 - Sealed store migration: `store-migrate <pcr>=<hex>…` (reviewed) re-seals
   the store key under a TPM `PolicyOR` of the current boot chain and the
   target values, so a kernel, loader or firmware update keeps the store

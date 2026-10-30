@@ -1,0 +1,6 @@
+# Build output, keys and test state never go into an image.
+target/
+**/target/
+fuzz/corpus/
+fuzz/artifacts/
+.git/

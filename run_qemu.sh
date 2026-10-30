@@ -175,8 +175,17 @@ else
     echo "Boot: BIOS"
 fi
 
+# KVM when this user can open /dev/kvm (e.g. in the cdk:dev container with
+# --device /dev/kvm), else QEMU's emulation. CDK_QEMU_ACCEL=kvm|tcg forces one.
+ACCEL="${CDK_QEMU_ACCEL:-}"
+if [[ -z "$ACCEL" ]]; then
+    if [[ -r /dev/kvm && -w /dev/kvm ]]; then ACCEL=kvm; else ACCEL=tcg; fi
+fi
+echo "QEMU: accelerator $ACCEL"
+
 QEMU_ARGS=(
     "${FIRMWARE_ARGS[@]}"
+    -accel "$ACCEL"
     -cpu max
     -drive format=raw,file="$RUN_IMG",snapshot=on
     -serial stdio

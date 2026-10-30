@@ -129,6 +129,15 @@ CDK is **open core**. This repository — the kernel, the capability model, the 
 
 ## Quick Start
 
+### Try it in Docker
+
+```bash
+docker build -f docker/Dockerfile --target eval -t cdk:0.2.0 .
+docker run -it --rm --device /dev/kvm cdk:0.2.0      # the signed release, at the cdk> prompt
+```
+
+`--target dev` (run with `--init -v cdk-target:/cdk/target`) builds the full stack from source (kernel, gateway, tools, signed approvals, sealed store) in one container. CDK is a kernel, so the container runs QEMU, which boots CDK; `--device /dev/kvm` makes it fast. Details: [docker/README.md](docker/README.md); how CDK is meant to be deployed (Kubernetes, cloud, bare metal): [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+
 ### Try a release
 
 The [v0.2.0 preview](https://github.com/RanveerMeel/cdk/releases/tag/v0.2.0) ships a ready-to-boot evaluation image, built reproducibly (two independent builds are byte-identical) and with an SBOM. Check its signed checksums before running it; the release key ID `0b57f6795dcdf315f2512079b8e16ba8` is stated in the [release notes](docs/releases/v0.2.0.md):
