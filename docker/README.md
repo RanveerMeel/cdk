@@ -37,8 +37,8 @@ docker run -it --rm --init --device /dev/kvm -v cdk-target:/cdk/target cdk:dev
 ```
 
 The container builds the kernel, agents, loader and gateway (the first run
-takes several minutes; the `cdk-target` volume keeps the build, keys and
-TPM for the next), boots CDK with the serial console in your terminal, and
+takes several minutes; the `cdk-target` volume keeps every build — kernel,
+agents and gateway — plus the keys and the TPM for the next), boots CDK with the serial console in your terminal, and
 starts the gateway as soon as CDK is up. Then:
 
 ```
@@ -48,7 +48,8 @@ cdk> tools-sync         # the demo MCP tools appear as objects
 ```
 
 **Ctrl-C** quits (QEMU and the gateway); `--init` lets `docker stop` end
-it cleanly too. A first run takes about four minutes with KVM (mostly
+it cleanly too. If the gateway stops, a notice appears on the console and
+its log is in the volume (`target/gateway.log`). A first run takes about four minutes with KVM (mostly
 compiling), later ones about a minute. `docker run … cdk:dev --shell` opens a shell in the repository instead
 (`./run_qemu.sh`, `tools/run_gateway.sh`, `cargo test-host`, …). Keys —
 release, gateway identity, registry root — are created on first run inside

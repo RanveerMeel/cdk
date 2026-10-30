@@ -58,8 +58,8 @@ RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-too
     && rustup toolchain install ${NIGHTLY} --profile minimal \
         --component rust-src,llvm-tools-preview,rustfmt,clippy \
         --target x86_64-unknown-none,x86_64-unknown-uefi \
-    && mv "$RUSTUP_HOME/toolchains/${NIGHTLY}-x86_64-unknown-linux-gnu" \
-        "$RUSTUP_HOME/toolchains/nightly-x86_64-unknown-linux-gnu" \
+    && host="$(rustc +stable -vV | sed -n 's/^host: //p')" \
+    && mv "$RUSTUP_HOME/toolchains/${NIGHTLY}-$host" "$RUSTUP_HOME/toolchains/nightly-$host" \
     && rustc +nightly -V
 WORKDIR /cdk
 COPY . .

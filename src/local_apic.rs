@@ -680,6 +680,15 @@ mod tests {
         );
     }
 
+    /// With the BSP in xAPIC mode (and always on the host) an AP stays in
+    /// xAPIC mode: nothing is switched, and the accessors keep using MMIO.
+    #[test]
+    fn enable_x2apic_on_this_cpu_follows_a_disabled_bsp() {
+        assert!(!x2apic_enabled());
+        enable_x2apic_on_this_cpu();
+        assert!(!x2apic_enabled());
+    }
+
     #[test]
     fn host_calibrate_returns_periodic_config() {
         let cfg = calibrate_current_core_runtime_timer(TARGET_RUNTIME_TIMER_HZ, || 0);

@@ -53,10 +53,17 @@ next — roadmap 5.2).
 3. **Deploy** — boot the image (Docker, Kubernetes, cloud, bare metal) with
    its gateway. The gateway checks the node's attestation (`--expect`, TPM
    quote, endorsement), certifies it under its node authority, and serves
-   it; the node opens its sealed store.
-4. **Operate** — operators approve actions with their own keys
-   (`cdk-approve`); audit checkpoints are exported; updates are signed with
-   the release key and prepared with `store-migrate`.
+   it; the node opens its sealed store. On a new machine — a TPM that has
+   never held a store — the operator creates it once with `store-reset`
+   after the first `link-secure` (a reviewed decision; until then the node
+   refuses peers' messages and imports).
+4. **Operate** — operators approve actions with their own keys, using
+   `cdk-approve` (`tools/approve.sh init <name>`, `list`, `approve <id>
+   --key …` builds and runs it from the repository; on an operator's machine,
+   `cargo install --path gateway --bin cdk-approve --target "$(rustc -vV |
+   sed -n 's/^host: //p')"` puts it on `PATH`);
+   audit checkpoints are exported; updates are signed with the release key
+   and prepared with `store-migrate`.
 
 ## What works today
 
