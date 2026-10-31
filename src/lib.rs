@@ -51,3 +51,4 @@ pub mod policy;
 pub mod um;
 pub mod vga_buffer;
 pub mod virtio_console;
+pub mod virtio_vsock;

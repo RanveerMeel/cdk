@@ -287,7 +287,15 @@ fn read_line(buf: &mut [u8; MAX_LINE], history: &CmdHistory) -> usize {
     let mut draft_len = 0usize;
 
     loop {
-        let b = serial::read_byte();
+        // While waiting for a key, answer the vsock link (a gateway's
+        // connection request times out if left unanswered).
+        let b = loop {
+            if let Some(b) = serial::try_read_byte() {
+                break b;
+            }
+            crate::virtio_vsock::service();
+            core::hint::spin_loop();
+        };
         match b {
             b'\r' | b'\n' => {
                 serial::write_byte(b'\r');
@@ -1427,17 +1435,31 @@ fn cmd_audit_demo_tamper(seq_str: &str) {
 }
 
 fn cmd_link() {
-    if !crate::virtio_console::is_ready() {
-        crate::println!("link: no virtio-console device (run with the gateway socket)");
+    let Some(transport) = crate::link::transport() else {
+        crate::println!("link: no virtio-console or virtio-vsock device (run with the gateway socket)");
         return;
-    }
-    let s = crate::virtio_console::stats();
+    };
+    let (tx, rx, timeouts) = if crate::virtio_console::is_ready() {
+        let s = crate::virtio_console::stats();
+        (s.tx_bytes, s.rx_bytes, s.tx_timeouts)
+    } else {
+        let s = crate::virtio_vsock::stats();
+        crate::println!(
+            "link: vsock guest CID {}, port {}; gateway {}; {} connection(s) so far",
+            crate::virtio_vsock::guest_cid().unwrap_or(0),
+            crate::virtio_vsock::LINK_PORT,
+            if crate::virtio_vsock::connected() { "connected" } else { "not connected" },
+            s.connections
+        );
+        (s.tx_bytes, s.rx_bytes, s.tx_timeouts)
+    };
     let d = crate::link::decoder_stats();
     crate::println!(
-        "link: virtio-console ready  tx={} B rx={} B tx_timeouts={}  frames={} crc_errors={} skipped={} B",
-        s.tx_bytes,
-        s.rx_bytes,
-        s.tx_timeouts,
+        "link: {} ready  tx={} B rx={} B tx_timeouts={}  frames={} crc_errors={} skipped={} B",
+        transport,
+        tx,
+        rx,
+        timeouts,
         d.frames,
         d.crc_errors,
         d.skipped

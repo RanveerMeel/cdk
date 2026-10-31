@@ -64,6 +64,11 @@ pub fn data_available() -> bool {
 }
 
 /// Blocking read — spins until a byte arrives on COM1.
+/// A received byte, if one is waiting (non-blocking).
+pub fn try_read_byte() -> Option<u8> {
+    unsafe { data_available().then(|| inb(COM1)) }
+}
+
 pub fn read_byte() -> u8 {
     unsafe {
         while !data_available() {

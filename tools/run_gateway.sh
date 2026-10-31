@@ -72,4 +72,8 @@ if [ -n "${CDK_NODE:-}" ]; then
     EXPECT+=(--registry-key "$NODE_KEY" --registry-auth "$NODE_AUTH" --node "$CDK_NODE" \
         --cap-dir "${CDK_CAP_DIR:-$ROOT/target/caps}" ${CDK_CERT_VALIDITY:+--cert-validity "$CDK_CERT_VALIDITY"})
 fi
-exec "$BIN" "${ID[@]}" "${MCP[@]}" "${MODELS[@]}" "${SPOOL[@]}" "${EXPECT[@]}" ${CDK_MCP_ALLOW:+--allow "$CDK_MCP_ALLOW"} "${1:-$ROOT/target/cdk-link.sock}"
+# CDK_LINK=vsock: connect to CDK's vsock port instead of the console socket
+# (roadmap 5.2); CDK_VSOCK_CID is the VM's context id (default 3).
+LINK="$ROOT/target/cdk-link.sock"
+if [[ "${CDK_LINK:-console}" == "vsock" ]]; then LINK="vsock:${CDK_VSOCK_CID:-3}"; fi
+exec "$BIN" "${ID[@]}" "${MCP[@]}" "${MODELS[@]}" "${SPOOL[@]}" "${EXPECT[@]}" ${CDK_MCP_ALLOW:+--allow "$CDK_MCP_ALLOW"} "${1:-$LINK}"

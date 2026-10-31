@@ -1,4 +1,7 @@
-//! Framed link to the host gateway (roadmap 3.1), over [`virtio_console`].
+//! Framed link to the host gateway (roadmap 3.1), over [`virtio_console`]
+//! or, where the hypervisor offers no console but vsock (Firecracker, Kata,
+//! KubeVirt; roadmap 5.2), over [`virtio_vsock`]. The transport is only a
+//! byte stream: framing, handshake and sealing are the same on both.
 //!
 //! Frames use the shared `cdk-link` crate, so the kernel and the host
 //! gateway speak byte-identical framing and handshake.
@@ -11,6 +14,7 @@
 //! (ChaCha20-Poly1305, strictly ordered sequence numbers).
 //!
 //! [`virtio_console`]: crate::virtio_console
+//! [`virtio_vsock`]: crate::virtio_vsock
 
 extern crate alloc;
 
@@ -22,7 +26,36 @@ use rand_core::RngCore;
 use spin::Mutex;
 
 use crate::issuer::{self, HybridSignature, IssuerPublic, SigDomain};
-use crate::virtio_console;
+use crate::{virtio_console, virtio_vsock};
+
+/// The device carrying the link: the console when present, else vsock.
+pub fn transport() -> Option<&'static str> {
+    if virtio_console::is_ready() {
+        Some("virtio-console")
+    } else if virtio_vsock::is_ready() {
+        Some("virtio-vsock")
+    } else {
+        None
+    }
+}
+
+/// Write raw link bytes to the transport.
+fn transport_write(bytes: &[u8]) -> Result<(), &'static str> {
+    if virtio_console::is_ready() {
+        virtio_console::write_all(bytes)
+    } else {
+        virtio_vsock::write_all(bytes)
+    }
+}
+
+/// Hand received link bytes to `sink` (non-blocking).
+fn transport_poll(sink: impl FnMut(&[u8])) -> usize {
+    if virtio_console::is_ready() {
+        virtio_console::poll(sink)
+    } else {
+        virtio_vsock::poll(sink)
+    }
+}
 
 static DECODER: Mutex<Decoder> = Mutex::new(Decoder::new());
 static SESSION: Mutex<Option<Established>> = Mutex::new(None);
@@ -51,7 +84,7 @@ fn send_flags(kind: u8, flags: u8, payload: &[u8]) -> Result<(), &'static str> {
     let mut buf = [0u8; MAX_FRAME];
     let n = cdk_link::encode_with_flags(kind, flags, payload, &mut buf)
         .map_err(|_| "frame too large")?;
-    virtio_console::write_all(&buf[..n])
+    transport_write(&buf[..n])
 }
 
 /// Whether a secure session is established.
@@ -103,7 +136,7 @@ pub fn secure_connect(timeout_ms: u64) -> Result<[u8; 16], SecureError> {
 }
 
 fn secure_connect_inner(timeout_ms: u64) -> Result<[u8; 16], SecureError> {
-    if !virtio_console::is_ready() {
+    if transport().is_none() {
         return Err(SecureError::NoLink);
     }
     let pinned = pinned_gateway().ok_or(SecureError::NoPinnedGateway)?;
@@ -276,7 +309,7 @@ fn wait_handshake(timeout_ms: u64) -> Option<Vec<u8>> {
     let mut done = None;
     while done.is_none() && crate::cpu::rdtsc().wrapping_sub(start) < limit {
         let mut dec = DECODER.lock();
-        virtio_console::poll(|mut bytes| {
+        transport_poll(|mut bytes| {
             while !bytes.is_empty() {
                 let n = dec.push(bytes);
                 bytes = &bytes[n..];
@@ -355,7 +388,7 @@ pub fn recv(mut f: impl FnMut(Incoming<'_>)) -> usize {
 pub fn poll(mut f: impl FnMut(u8, &[u8])) -> usize {
     let mut dec = DECODER.lock();
     let mut frames = 0;
-    virtio_console::poll(|mut bytes| {
+    transport_poll(|mut bytes| {
         while !bytes.is_empty() {
             let n = dec.push(bytes);
             bytes = &bytes[n..];

@@ -56,10 +56,33 @@ release, gateway identity, registry root — are created on first run inside
 the volume, never in the image. The toolchain is the nightly CDK is built
 and released with, so builds match the repository's.
 
+## The link over vsock
+
+`CDK_LINK=vsock` connects kernel and gateway over virtio-vsock (roadmap
+5.2), as on micro-VM hypervisors. QEMU needs the host's vhost-vsock device:
+
+```bash
+docker run -it --rm --init --device /dev/kvm --device /dev/vhost-vsock \
+    -e CDK_LINK=vsock -v cdk-target:/cdk/target cdk:dev
+```
+
+Docker's default security profiles (seccomp and AppArmor) forbid vsock
+sockets inside containers, so the gateway in this container cannot connect;
+run it on the host instead, as it would run beside a real micro-VM — with
+this volume's gateway key (it is pinned in CDK's ramdisk):
+
+```bash
+docker run --rm -v cdk-target:/t --entrypoint cat cdk:dev /t/gateway-identity.key > gw.key && chmod 600 gw.key
+gateway/target/x86_64-unknown-linux-gnu/release/cdk-gateway --identity gw.key \
+    --mcp "demo=python3 gateway/examples/demo_mcp_server.py" vsock:3
+```
+
 ## Notes
 
 * Without `--device /dev/kvm` both images use QEMU's emulation (slow, but
-  needs no privileges). With it, the container can use KVM even if your
+  needs no privileges). The firmware measures the virtual CPU, so a volume's
+  TPM enrollment made under one mode is refused under the other: keep using
+  the same mode, or enroll again. With it, the container can use KVM even if your
   user cannot open `/dev/kvm` directly — the Docker daemon runs as root
   (and membership of the `docker` group is equivalent to root).
 * Docker installed as a snap can only bind-mount files under your home
