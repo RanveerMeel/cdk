@@ -2,11 +2,21 @@
 
 ## Unreleased
 
+- vsock link (roadmap 5.2): when the VM has no virtio-console but
+  virtio-vsock (QEMU `vhost-vsock-pci`, KubeVirt, Firecracker), CDK listens
+  on vsock port 17220 and the gateway connects with `vsock:CID`
+  (`CDK_LINK=vsock`); same frames, handshake and sealing. New fuzz target
+  `vsock`. Console lines answer vsock while waiting for input.
+- Correction: Kubernetes deployment goes through KubeVirt, not Kata
+  Containers (Kata runs a pod's containers in its own Linux guest).
+
 - Docker (roadmap 5.1): `docker/Dockerfile` builds `cdk:<version>`, which
   boots the signed release (checksums verified at build) in QEMU with a
   software TPM, and `cdk:dev`, the full stack from source with the pinned
   nightly; `--device /dev/kvm` enables KVM. See `docker/README.md`.
-- KVM: `run_qemu.sh` uses it when `/dev/kvm` is usable (`CDK_QEMU_ACCEL`).
+- KVM: `CDK_QEMU_ACCEL=kvm ./run_qemu.sh` (emulation stays the default: the
+  firmware measures the virtual CPU, so a TPM enrolled under one mode is
+  refused under the other); `cdk:dev` uses KVM when given `/dev/kvm`.
 - Fix: with x2APIC available (QEMU 10, KVM, real CPUs) CDK switched its boot
   CPU to x2APIC but started the other CPUs, read APIC ids and sent EOIs
   through xAPIC registers, and page-faulted during SMP start. Every AP now

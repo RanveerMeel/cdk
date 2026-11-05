@@ -132,6 +132,14 @@ rm -f "$LINK_SOCK"
 LINK_ARGS=(-device virtio-serial-pci
     -chardev "socket,id=cdklink,path=$LINK_SOCK,server=on,wait=off"
     -device virtconsole,chardev=cdklink)
+# CDK_LINK=vsock: the link over virtio-vsock instead (roadmap 5.2), as in
+# micro-VMs; CDK listens on vsock port 17220 with guest CID CDK_VSOCK_CID
+# (default 3). Needs access to /dev/vhost-vsock (e.g. the cdk:dev container
+# with --device /dev/vhost-vsock); the gateway uses CDK_LINK=vsock too.
+if [[ "${CDK_LINK:-console}" == "vsock" ]]; then
+    LINK_ARGS=(-device "vhost-vsock-pci,guest-cid=${CDK_VSOCK_CID:-3}")
+    echo "Link: virtio-vsock (guest CID ${CDK_VSOCK_CID:-3})"
+fi
 
 # TPM 2.0 (roadmap 4.2): a software TPM (swtpm) when installed, with state in
 # target/tpm/ so the attestation key persists like a real chip's. A new one is
@@ -175,12 +183,11 @@ else
     echo "Boot: BIOS"
 fi
 
-# KVM when this user can open /dev/kvm (e.g. in the cdk:dev container with
-# --device /dev/kvm), else QEMU's emulation. CDK_QEMU_ACCEL=kvm|tcg forces one.
-ACCEL="${CDK_QEMU_ACCEL:-}"
-if [[ -z "$ACCEL" ]]; then
-    if [[ -r /dev/kvm && -w /dev/kvm ]]; then ACCEL=kvm; else ACCEL=tcg; fi
-fi
+# QEMU's emulation by default; CDK_QEMU_ACCEL=kvm for hardware acceleration
+# (much faster). The firmware measures the virtual CPU (PCR 1), and KVM's
+# differs from emulation's, so a TPM enrolled under one is refused under the
+# other: switching means enrolling again (delete the enrollment file).
+ACCEL="${CDK_QEMU_ACCEL:-tcg}"
 echo "QEMU: accelerator $ACCEL"
 
 QEMU_ARGS=(

@@ -619,7 +619,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         cdk::gpu::init(pt_guard.as_mut(), Some(&mut *fa));
     }
 
-    // Host link (virtio-console) for the gateway, if QEMU provides one.
+    // Host link for the gateway: virtio-console if QEMU provides one, else
+    // virtio-vsock (micro-VM hypervisors, roadmap 5.2).
     {
         let mut pt_guard = PAGE_TABLE.lock();
         let mut fa = FRAME_ALLOCATOR.lock();
@@ -636,7 +637,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                         cdk::println!("Link: HELLO not delivered (gateway not connected yet)");
                     }
                 }
-                Err(e) => cdk::println!("Link: none ({})", e),
+                Err(_) => match cdk::virtio_vsock::init(pt, &mut fa) {
+                    Ok(cid) => cdk::println!(
+                        "Link: virtio-vsock ready — guest CID {}, listening on port {} for the gateway",
+                        cid,
+                        cdk::virtio_vsock::LINK_PORT
+                    ),
+                    Err(e) => cdk::println!("Link: none (no virtio-console; {})", e),
+                },
             },
             None => cdk::println!("Link: skipped (no page table)"),
         }

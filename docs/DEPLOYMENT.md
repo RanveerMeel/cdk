@@ -29,15 +29,16 @@ to be put in front of users before the next one gets more complex.
   before serving it, and everything it carries is verified by the kernel.
 
 What changes between environments is only *how the VM is started* and *how
-the two halves are connected* (the link: virtio-console today, virtio-vsock
-next — roadmap 5.2).
+the two halves are connected*: the link is QEMU's virtio-console, or
+virtio-vsock where micro-VM hypervisors offer that instead (CDK listens on
+vsock port 17220; the gateway connects with `vsock:CID`).
 
 ## Environments
 
 | Environment | How CDK runs | Status |
 |---|---|---|
 | **Docker** (development, demos, CI, evaluation) | QEMU inside a container boots CDK; `--device /dev/kvm` makes it fast | Works (roadmap 5.1) |
-| **Kubernetes** (production) | A pod whose runtime is a micro-VM (Kata Containers or KubeVirt) boots CDK with a persistent vTPM; the gateway is a sidecar container in the same pod, connected over vsock; CDK images ship as OCI images (containerDisk) | Roadmap 5.2–5.4 |
+| **Kubernetes** (production) | KubeVirt runs CDK as a VM managed like a pod, with a persistent vTPM and VSOCK; the gateway is a companion container connected over vsock; CDK images ship as OCI images (containerDisk). Kata Containers does not fit: it runs a pod's containers inside its own Linux guest | Link done (5.2); roadmap 5.3–5.4 |
 | **Cloud VM** | A custom image on a KVM-based cloud; on **confidential VMs** (AMD SEV-SNP, Intel TDX) even the cloud operator cannot read agent memory or keys | Roadmap 5.3, 5.5 |
 | **Bare metal / appliance** (edge, branches, air-gapped) | CDK boots directly with Secure Boot and a discrete TPM; later, with Linux in a driver VM for GPUs (roadmap 4.4) | Works in QEMU today; hardware profile is roadmap 5.8 |
 
@@ -77,6 +78,6 @@ next — roadmap 5.2).
 * The [v0.2.0 release](https://github.com/RanveerMeel/cdk/releases/tag/v0.2.0)
   evaluation image boots in QEMU (BIOS or UEFI) without building anything.
 * Not yet: running directly on a cloud hypervisor or physical server. CDK
-  has only been tested on QEMU's virtual hardware; its link needs QEMU's
-  virtio-console, and its TPM driver the TIS interface (cloud vTPMs and
-  firmware TPMs use CRB). Those are roadmap 5.2 and 5.3.
+  has only been tested on QEMU's virtual hardware (under emulation and KVM),
+  and its TPM driver speaks the TIS interface (cloud vTPMs and firmware TPMs
+  use CRB) — roadmap 5.3. The link works over virtio-console and virtio-vsock.

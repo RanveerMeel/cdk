@@ -17,6 +17,8 @@ hmac = "0.12"
 ring = "0.17"
 ureq = { version = "2", default-features = false, features = ["tls"] }
 zeroize = "1"
+# AF_VSOCK for the link to CDK in a micro-VM (roadmap 5.2).
+libc = "0.2"
 # TPM quote signatures (ECDSA P-256), roadmap 4.2.
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 
