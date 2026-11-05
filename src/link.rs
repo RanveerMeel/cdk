@@ -1,6 +1,6 @@
 //! Framed link to the host gateway (roadmap 3.1), over [`virtio_console`]
-//! or, where the hypervisor offers no console but vsock (Firecracker, Kata,
-//! KubeVirt; roadmap 5.2), over [`virtio_vsock`]. The transport is only a
+//! or, where the hypervisor offers no console but vsock (KubeVirt,
+//! Firecracker, AWS Nitro; roadmap 5.2), over [`virtio_vsock`]. The transport is only a
 //! byte stream: framing, handshake and sealing are the same on both.
 //!
 //! Frames use the shared `cdk-link` crate, so the kernel and the host

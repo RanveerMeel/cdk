@@ -1,6 +1,6 @@
 //! The link over vsock (roadmap 5.2): CDK listens on a vsock port inside
 //! its VM, and the gateway connects to it from the host — the transport of
-//! QEMU's `vhost-vsock-pci`, KubeVirt and Kata Containers.
+//! QEMU's `vhost-vsock-pci`, KubeVirt, Firecracker and AWS Nitro.
 //!
 //! The standard library has no vsock socket type. The link only reads,
 //! writes and sets a receive timeout, which are the same system calls for
@@ -35,7 +35,10 @@ pub fn parse(spec: &str) -> Option<Result<(u32, u32), String>> {
 
 /// Connect to `port` in the VM with context id `cid`.
 pub fn connect(cid: u32, port: u32) -> io::Result<UnixStream> {
-    // SAFETY: plain socket calls with a zeroed, fully initialized address.
+    // SAFETY: `fd` is checked non-negative and comes straight from
+    // socket(), so it is valid and owned by no one else; OwnedFd takes it
+    // over and closes it on every error path. `sockaddr_vm` is zeroed, then
+    // its family, CID and port set, before connect() reads it.
     unsafe {
         let fd = libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
         if fd < 0 {

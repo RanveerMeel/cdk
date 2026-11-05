@@ -1,6 +1,6 @@
 //! virtio-vsock as the link to the gateway (roadmap 5.2) — the transport
-//! Firecracker, Kata Containers, KubeVirt and QEMU's `vhost-vsock-pci`
-//! provide, so CDK can run as a micro-VM with its gateway in a sidecar.
+//! QEMU's `vhost-vsock-pci`, KubeVirt, Firecracker and AWS Nitro provide, so
+//! CDK can run as a micro-VM with its gateway beside it.
 //!
 //! CDK *listens* on [`LINK_PORT`]; the gateway connects to it from the host
 //! (CID 2), as it connects to the virtio-console socket. One connection at a
@@ -340,6 +340,8 @@ pub fn write_all(bytes: &[u8]) -> Result<(), &'static str> {
     {
         let mut guard = DEVICE.lock();
         let dev = guard.as_mut().ok_or("link not ready")?;
+        // SAFETY: the DEVICE lock is held, and `dev` exists only after
+        // `hw::probe` set up its rings and buffers.
         unsafe { hw::write_all(dev, bytes) }
     }
     #[cfg(not(target_os = "none"))]
@@ -355,6 +357,7 @@ pub fn service() {
     #[cfg(target_os = "none")]
     if let Some(mut guard) = DEVICE.try_lock() {
         if let Some(dev) = guard.as_mut() {
+            // SAFETY: as in `write_all` (the lock is held by `guard`).
             unsafe { hw::receive(dev) };
         }
     }
@@ -369,6 +372,7 @@ pub fn poll(mut sink: impl FnMut(&[u8])) -> usize {
         let Some(dev) = guard.as_mut() else {
             return 0;
         };
+        // SAFETY: as in `write_all` (the lock is held by `guard`).
         unsafe { hw::poll(dev, &mut sink) }
     }
     #[cfg(not(target_os = "none"))]
@@ -528,6 +532,8 @@ mod hw {
         let notify_base = virtio_pci::cap_mmio(&caps.notify, &bars).map_err(|_| "notify")?;
         let device_cfg = virtio_pci::cap_mmio(&device_cap, &bars).map_err(|_| "device config")?;
 
+        // SAFETY: `ring` only takes the addresses of the driver's static,
+        // page-aligned rings; nothing is read or written here.
         let mut d = unsafe {
             Device {
                 ep: Endpoint::new(0),
@@ -549,6 +555,9 @@ mod hw {
                 pending: alloc::vec::Vec::new(),
             }
         };
+        // SAFETY: the rings are this driver's page-aligned statics (not yet
+        // given to the device), and `common`, `device_cfg` and `notify` are
+        // the device's capability windows, mapped above.
         unsafe {
             for q in [RX_QUEUE, TX_QUEUE, EVT_QUEUE] {
                 core::ptr::write_bytes(ring(q), 0, 4096);
@@ -669,6 +678,8 @@ mod hw {
                         total += payload.len();
                     }
                 }
+                // A reply that cannot be sent (device timeout) is counted in
+                // `tx_timeouts` (console `link`); the peer retries or resets.
                 for r in action.replies.iter() {
                     let _ = transmit(d, r, &[]);
                 }
@@ -694,6 +705,8 @@ mod hw {
         }
         if d.ep.credit_update_due() {
             let h = d.ep.credit_update();
+            // Counted in `tx_timeouts` if it fails; the peer can still ask
+            // with a credit request.
             let _ = transmit(d, &h, &[]);
         }
         held.len()
