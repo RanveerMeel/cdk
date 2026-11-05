@@ -50,23 +50,18 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential curl git python3 openssl \
         swtpm-tools tpm2-tools \
     && rm -rf /var/lib/apt/lists/*
-# The nightly CDK is built and released with, installed as "nightly" (the
-# scripts call `rustup run nightly`).
-ARG NIGHTLY=nightly-2026-08-05
+# The nightly CDK is built and released with, as pinned in
+# rust-toolchain.toml (installed from that file).
 ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
-RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable \
-    && rustup toolchain install ${NIGHTLY} --profile minimal \
-        --component rust-src,llvm-tools-preview,rustfmt,clippy \
-        --target x86_64-unknown-none,x86_64-unknown-uefi \
-    && host="$(rustc +stable -vV | sed -n 's/^host: //p')" \
-    && mv "$RUSTUP_HOME/toolchains/${NIGHTLY}-$host" "$RUSTUP_HOME/toolchains/nightly-$host" \
-    && rustc +nightly -V
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
 WORKDIR /cdk
+COPY rust-toolchain.toml .
+RUN rustup toolchain install --profile minimal && rustc -V
 COPY . .
 # Dependencies only (offline later). Keys are made at first run, in the
 # target/ volume — never baked into the image.
 RUN for d in . link gateway user user/ml tools/create_disk_image boot/uefi-loader; do \
-        (cd "$d" && cargo +nightly fetch --quiet) || exit 1; done
+        (cd "$d" && cargo fetch --quiet) || exit 1; done
 COPY docker/dev.sh /usr/local/bin/cdk-dev
 VOLUME /cdk/target
 ENTRYPOINT ["/usr/local/bin/cdk-dev"]

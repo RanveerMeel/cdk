@@ -2,36 +2,19 @@
 
 ## Unreleased
 
-- vsock link (roadmap 5.2): when the VM has no virtio-console but
-  virtio-vsock (QEMU `vhost-vsock-pci`, KubeVirt, Firecracker), CDK listens
-  on vsock port 17220 and the gateway connects with `vsock:CID`
-  (`CDK_LINK=vsock`); same frames, handshake and sealing. New fuzz target
-  `vsock`. Console lines answer vsock while waiting for input.
-- Correction: Kubernetes deployment goes through KubeVirt, not Kata
-  Containers (Kata runs a pod's containers in its own Linux guest).
+## v0.3.0 — preview (2026-11-05)
 
-- Docker (roadmap 5.1): `docker/Dockerfile` builds `cdk:<version>`, which
-  boots the signed release (checksums verified at build) in QEMU with a
-  software TPM, and `cdk:dev`, the full stack from source with the pinned
-  nightly; `--device /dev/kvm` enables KVM. See `docker/README.md`.
-- KVM: `CDK_QEMU_ACCEL=kvm ./run_qemu.sh` (emulation stays the default: the
-  firmware measures the virtual CPU, so a TPM enrolled under one mode is
-  refused under the other); `cdk:dev` uses KVM when given `/dev/kvm`.
-- Fix: with x2APIC available (QEMU 10, KVM, real CPUs) CDK switched its boot
-  CPU to x2APIC but started the other CPUs, read APIC ids and sent EOIs
-  through xAPIC registers, and page-faulted during SMP start. Every AP now
-  enters the BSP's APIC mode and all accesses go through the driver.
-- Deployment plan: roadmap Phase 5 and `docs/DEPLOYMENT.md`.
+**Upgrading from v0.2.0:** on each TPM machine run `store-reset` once after
+the first `link-secure` (creates the sealed store; until then peer messages
+and imports are refused under the default `require sealed-store`); before
+later kernel, loader or firmware updates, run `store-migrate`. Install the
+pinned toolchain with `rustup toolchain install` in the repository.
 
-- Sealed store migration: `store-migrate <pcr>=<hex>…` (reviewed) re-seals
-  the store key under a TPM `PolicyOR` of the current boot chain and the
-  target values, so a kernel, loader or firmware update keeps the store
-  (records and counter intact) and a roll-back still opens it;
-  `store-migrate` alone re-seals to the current chain only. `store` prints
-  the sealed PCR values. The envelope now carries the policy branches
-  (stores from the previous commit read as tampered: `store-reset`). Audit
-  `store-migrated`. Console lines can be 256 characters.
-
+- **Fix: CDK crashed on x2APIC machines** (QEMU 10, KVM, essentially every
+  modern server and cloud VM). It switched the boot CPU to x2APIC but started
+  the other CPUs, read APIC ids and sent EOIs through xAPIC registers, and
+  page-faulted during SMP start. Every AP now enters the BSP's APIC mode and
+  all accesses go through the driver.
 - Persistent sealed storage (roadmap 4.5): revocations and the replay
   records of peer messages and imports survive reboots in an envelope the
   gateway keeps (`cdk-gateway --store FILE`; `CDK_STORE` in
@@ -43,9 +26,32 @@
   console commands `store`, `store-reset`; new policy rule
   `require sealed-store` (in `policy/default.rules`: TPM-less lab setups
   that use distributed capabilities must remove it); audit `store-loaded`,
-  `store-failed`, `store-reset`; peer refusal reason 11. **Upgrading:** run
-  `store-reset` once per TPM machine, and again after each kernel or
-  firmware update.
+  `store-failed`, `store-reset`; peer refusal reason 11.
+- Sealed store migration: `store-migrate <pcr>=<hex>…` (reviewed) re-seals
+  the store key under a TPM `PolicyOR` of the current boot chain and the
+  target values, so a kernel, loader or firmware update keeps the store
+  (records and counter intact) and a roll-back still opens it;
+  `store-migrate` alone re-seals to the current chain only. `store` prints
+  the sealed PCR values. Audit `store-migrated`. Console lines can be 256
+  characters.
+- vsock link (roadmap 5.2): when the VM has no virtio-console but
+  virtio-vsock (QEMU `vhost-vsock-pci`, KubeVirt, Firecracker), CDK listens
+  on vsock port 17220 and the gateway connects with `vsock:CID`
+  (`CDK_LINK=vsock`); same frames, handshake and sealing. New fuzz target
+  `vsock` (twelve in all).
+- Docker (roadmap 5.1): `docker/Dockerfile` builds `cdk:<version>`, which
+  boots the signed release (checksums verified at build) in QEMU with a
+  software TPM, and `cdk:dev`, the full stack from source; `--device
+  /dev/kvm` enables KVM. See `docker/README.md`.
+- KVM: `CDK_QEMU_ACCEL=kvm ./run_qemu.sh` (emulation stays the default: the
+  firmware measures the virtual CPU, so a TPM enrolled under one mode is
+  refused under the other); `cdk:dev` uses KVM when given `/dev/kvm`.
+- The toolchain is now pinned (`nightly-2026-08-05` in
+  `rust-toolchain.toml`) and every script uses it, as reproducible releases
+  require (v0.2.0's notes said it was pinned; the file named only
+  `nightly`).
+- Deployment plan: roadmap Phase 5 and `docs/DEPLOYMENT.md` (Kubernetes
+  through KubeVirt).
 
 ## v0.2.0 — preview (2026-10-23)
 

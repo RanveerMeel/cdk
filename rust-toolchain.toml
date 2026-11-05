@@ -1,4 +1,7 @@
+# The exact nightly CDK is built and released with: releases are reproducible
+# only with this compiler (tools/release.sh). `rustup toolchain install`
+# in the repository installs it with these components and targets.
 [toolchain]
-channel = "nightly"
+channel = "nightly-2026-08-05"
 components = ["rust-src", "llvm-tools-preview", "rustfmt", "clippy"]
-targets = ["x86_64-unknown-none"]
+targets = ["x86_64-unknown-none", "x86_64-unknown-uefi"]

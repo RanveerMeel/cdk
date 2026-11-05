@@ -46,10 +46,10 @@ echo "Creating bootable image..."
 KERNEL_ELF="target/x86_64-unknown-none/release/cdk"
 DISK_IMG="target/x86_64-unknown-none/release/bootimage-cdk.bin"
 HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
-if ! rustup toolchain list | grep -q '^nightly'; then
-    echo "Error: nightly Rust is required to build the BIOS disk image (bootloader 0.11)."
-    echo "  rustup toolchain install nightly"
-    echo "  rustup component add rust-src llvm-tools-preview --toolchain nightly"
+# The pinned nightly (rust-toolchain.toml) builds everything here.
+if ! rustup show active-toolchain > /dev/null 2>&1; then
+    echo "Error: the toolchain pinned in rust-toolchain.toml is not installed:"
+    echo "  rustup toolchain install    # from the repository root"
     exit 1
 fi
 # Gateway identity (created once) whose public key CDK pins for the link.
@@ -87,7 +87,7 @@ if [[ "$BOOT_MODE" == "uefi" ]]; then
     if [[ "$SECURE_BOOT" == "1" ]]; then
         PIN=(env CDK_KERNEL_SHA256="$(sha256sum "$KERNEL_ELF" | cut -d' ' -f1)")
     fi
-    (cd boot/uefi-loader && "${PIN[@]}" rustup run nightly cargo build --release --quiet --target x86_64-unknown-uefi \
+    (cd boot/uefi-loader && "${PIN[@]}" cargo build --release --quiet --target x86_64-unknown-uefi \
         -Zbuild-std=core -Zbuild-std-features=compiler-builtins-mem)
     UEFI_LOADER=("$CARGO_TARGET_DIR/x86_64-unknown-uefi/release/cdk-uefi-loader.efi")
     if [[ "$SECURE_BOOT" == "1" ]]; then
@@ -96,7 +96,7 @@ if [[ "$BOOT_MODE" == "uefi" ]]; then
         UEFI_LOADER=("$PWD/target/cdk-uefi-loader.signed.efi")
     fi
 fi
-rustup run nightly cargo run --manifest-path tools/create_disk_image/Cargo.toml --release --target "$HOST_TARGET" -- \
+cargo run --manifest-path tools/create_disk_image/Cargo.toml --release --target "$HOST_TARGET" -- \
     "$KERNEL_ELF" "$DISK_IMG" "$RAMDISK" "${UEFI_LOADER[@]}"
 # Expected boot measurements, for the gateway's attestation check (--expect).
 if [[ "$BOOT_MODE" == "uefi" ]]; then
