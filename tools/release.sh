@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build a CDK release reproducibly, sign it, and write its SBOM.
 #
-#   tools/release.sh 0.2.0 [--allow-dirty]
+#   tools/release.sh 0.3.0 [--allow-dirty]
 #
 # 1. Archives the committed source (git archive HEAD).
 # 2. Unpacks it into two different directories and builds each from scratch,
@@ -82,7 +82,7 @@ build_tree "$WORK/b/second/path"
 REPORT="$OUT/REPRODUCIBILITY.txt"
 {
     echo "CDK v$VERSION — reproducibility check"
-    echo "commit $COMMIT, SOURCE_DATE_EPOCH $SOURCE_DATE_EPOCH, $(rustc +nightly -V 2>/dev/null || rustc -V)"
+    echo "commit $COMMIT, SOURCE_DATE_EPOCH $SOURCE_DATE_EPOCH, $(rustc -V)"
     echo "two clean builds from $SRC in different directories, offline:"
     echo
 } > "$REPORT"
