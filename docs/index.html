@@ -314,9 +314,7 @@ audit: OK — 97 records (seq 0..96), 0 evicted, 1 checkpoint(s) valid</code></p
       <section class="section alt">
         <div class="container">
           <h2>Quick start</h2>
-          <pre><code>rustup target add x86_64-unknown-none
-rustup toolchain install nightly
-rustup component add rust-src llvm-tools-preview --toolchain nightly
+          <pre><code>rustup toolchain install        # in the repository: the pinned nightly (rust-toolchain.toml)
 sudo apt install qemu-system-x86
 
 ./run_qemu.sh                    # terminal 1: CDK

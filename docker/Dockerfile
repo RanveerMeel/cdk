@@ -1,8 +1,8 @@
 # CDK in Docker (roadmap 5.1). CDK is a kernel, so the container runs QEMU,
 # which boots CDK; add `--device /dev/kvm` for hardware acceleration.
 #
-#   docker build -f docker/Dockerfile --target eval -t cdk:0.2.0 .
-#   docker run -it --rm cdk:0.2.0                    # the signed v0.2.0 release
+#   docker build -f docker/Dockerfile --target eval -t cdk:0.3.0 .
+#   docker run -it --rm cdk:0.3.0                    # the signed v0.3.0 release
 #
 #   docker build -f docker/Dockerfile --target dev -t cdk:dev .
 #   docker run -it --rm --init -v cdk-target:/cdk/target cdk:dev   # full stack from source
@@ -19,25 +19,43 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------------------
-# eval: the published release image, checked against its signed checksums.
+# verifier: cdk-sign, built from this source, to check a release's signature.
+# (Stable Rust suffices for it; the repository's pinned nightly is not used.)
+# ---------------------------------------------------------------------------
+FROM ${BASE} AS verifier
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.93.0
+COPY link /src/link
+COPY gateway /src/gateway
+RUN cd /src/gateway && cargo build --release --locked --quiet --bin cdk-sign \
+    && cp target/release/cdk-sign /usr/local/bin/
+
+# ---------------------------------------------------------------------------
+# eval: a published release image. The build stops unless SHA256SUMS is
+# signed (Ed25519 + ML-DSA-65) by the CDK release key with the pinned id —
+# the same key for every release — and every file matches it.
 # ---------------------------------------------------------------------------
 FROM runtime AS eval
-ARG VERSION=0.2.0
-# SHA-256 of that release's SHA256SUMS (itself signed with the release key
-# 0b57f6795dcdf315f2512079b8e16ba8; see docs/releases/v0.2.0.md).
-ARG SUMS_SHA256=0a7c19424beea49065d3bed6cbc91569dc95ee9b376f842298bb1357ac8bca3d
+ARG VERSION=0.3.0
+ARG RELEASE_KEY_ID=0b57f6795dcdf315f2512079b8e16ba8
 ARG RELEASE_URL=https://github.com/RanveerMeel/cdk/releases/download/v${VERSION}
 WORKDIR /opt/cdk
+COPY --from=verifier /usr/local/bin/cdk-sign /usr/local/bin/cdk-sign
 ADD ${RELEASE_URL}/SHA256SUMS ${RELEASE_URL}/SHA256SUMS.sig ${RELEASE_URL}/cdk-release.pub \
     ${RELEASE_URL}/cdk-${VERSION}-eval.img ${RELEASE_URL}/cdk-${VERSION}-eval.measurements \
     ${RELEASE_URL}/RELEASE-NOTES.md ./
-RUN echo "${SUMS_SHA256}  SHA256SUMS" | sha256sum -c - \
+RUN cdk-sign verify-file SHA256SUMS --pub cdk-release.pub | tee /tmp/verify \
+    && grep -qx "ok: SHA256SUMS is signed by release key ${RELEASE_KEY_ID}" /tmp/verify \
     && sha256sum -c --ignore-missing SHA256SUMS \
-    && ln -s cdk-${VERSION}-eval.img cdk-eval.img
+    && ln -s cdk-${VERSION}-eval.img cdk-eval.img \
+    && rm /tmp/verify
 COPY docker/boot-eval.sh /usr/local/bin/cdk-boot
-# v0.2.0 starts its other CPUs through the xAPIC registers even when it
-# has switched to x2APIC (fixed after 0.2.0), so this image hides x2APIC.
-ARG CPU=max,-x2apic
+# v0.2.0 starts its other CPUs through the xAPIC registers after switching
+# to x2APIC (fixed in 0.3.0): build it with --build-arg CPU=max,-x2apic.
+ARG CPU=max
 ENV CDK_VERSION=${VERSION} CDK_CPU=${CPU}
 VOLUME /var/lib/cdk
 ENTRYPOINT ["/usr/local/bin/cdk-boot"]

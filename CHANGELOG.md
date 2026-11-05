@@ -7,8 +7,10 @@
 **Upgrading from v0.2.0:** on each TPM machine run `store-reset` once after
 the first `link-secure` (creates the sealed store; until then peer messages
 and imports are refused under the default `require sealed-store`); before
-later kernel, loader or firmware updates, run `store-migrate`. Install the
-pinned toolchain with `rustup toolchain install` in the repository.
+later kernel, loader or firmware updates, run `store-migrate <pcr>=<hex>…`
+with the new boot chain's values (bare `store-migrate` re-seals to the
+current chain only: use it after an update, to drop the old chain). Install
+the pinned toolchain with `rustup toolchain install` in the repository.
 
 - **Fix: CDK crashed on x2APIC machines** (QEMU 10, KVM, essentially every
   modern server and cloud VM). It switched the boot CPU to x2APIC but started
@@ -40,9 +42,10 @@ pinned toolchain with `rustup toolchain install` in the repository.
   (`CDK_LINK=vsock`); same frames, handshake and sealing. New fuzz target
   `vsock` (twelve in all).
 - Docker (roadmap 5.1): `docker/Dockerfile` builds `cdk:<version>`, which
-  boots the signed release (checksums verified at build) in QEMU with a
-  software TPM, and `cdk:dev`, the full stack from source; `--device
-  /dev/kvm` enables KVM. See `docker/README.md`.
+  boots a release in QEMU with a software TPM — the build verifies the
+  release's signature against the pinned release key id, so any release
+  works without per-release checksums — and `cdk:dev`, the full stack from
+  source; `--device /dev/kvm` optionally enables KVM. See `docker/README.md`.
 - KVM: `CDK_QEMU_ACCEL=kvm ./run_qemu.sh` (emulation stays the default: the
   firmware measures the virtual CPU, so a TPM enrolled under one mode is
   refused under the other); `cdk:dev` uses KVM when given `/dev/kvm`.

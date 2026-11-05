@@ -132,11 +132,11 @@ CDK is **open core**. This repository — the kernel, the capability model, the 
 ### Try it in Docker
 
 ```bash
-docker build -f docker/Dockerfile --target eval -t cdk:0.2.0 .
-docker run -it --rm --device /dev/kvm cdk:0.2.0      # the signed release, at the cdk> prompt
+docker build -f docker/Dockerfile --target eval -t cdk:0.3.0 .
+docker run -it --rm cdk:0.3.0      # the signed release, at the cdk> prompt
 ```
 
-`--target dev` (run with `--init -v cdk-target:/cdk/target`) builds the full stack from source (kernel, gateway, tools, signed approvals, sealed store) in one container. CDK is a kernel, so the container runs QEMU, which boots CDK; `--device /dev/kvm` makes it fast. Details: [docker/README.md](docker/README.md); how CDK is meant to be deployed (Kubernetes, cloud, bare metal): [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+`--target dev` (run with `--init -v cdk-target:/cdk/target`) builds the full stack from source (kernel, gateway, tools, signed approvals, sealed store) in one container. CDK is a kernel, so the container runs QEMU, which boots CDK; on Linux hosts with KVM, `--device /dev/kvm` (optional) makes it much faster. Details: [docker/README.md](docker/README.md); how CDK is meant to be deployed (Kubernetes, cloud, bare metal): [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
 ### Try a release
 

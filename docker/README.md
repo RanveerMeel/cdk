@@ -8,19 +8,22 @@ on any machine with Docker. Roadmap 5.1; the deployment model is in
 ## Try the release: `cdk:<version>`
 
 ```bash
-docker build -f docker/Dockerfile --target eval -t cdk:0.2.0 .
-docker run -it --rm cdk:0.2.0
+docker build -f docker/Dockerfile --target eval -t cdk:0.3.0 .
+docker run -it --rm cdk:0.3.0
 ```
 
 The build downloads the release files from GitHub and refuses to finish
-unless they match the release's `SHA256SUMS` (whose own hash is pinned in
-the Dockerfile; that file is signed with the release key
-`0b57f6795dcdf315f2512079b8e16ba8`). At the `cdk>` prompt try `boot`,
+unless `SHA256SUMS` is signed (Ed25519 + ML-DSA-65) by the CDK release key
+with the id pinned in the Dockerfile, `0b57f6795dcdf315f2512079b8e16ba8` —
+checked with `cdk-sign`, built from this source — and every file matches
+it. The key is the same for every release, so another one needs only
+`--build-arg VERSION=…` (for 0.2.0 also `--build-arg CPU=max,-x2apic`, see
+below). At the `cdk>` prompt try `boot`,
 `spawn hello`, `run-all`, `policy`, `audit-verify`; **Ctrl-A X** quits.
 
 | Option | Effect |
 |---|---|
-| `--device /dev/kvm` | Hardware acceleration (KVM), about ten times faster |
+| `--device /dev/kvm` | Optional, Linux hosts with KVM: hardware acceleration, about ten times faster |
 | `-e CDK_BOOT=bios` | BIOS instead of UEFI (no loader measurements) |
 | `-e CDK_SMP=1` | One CPU instead of four |
 | `-v cdk-tpm:/var/lib/cdk` | Keep the software TPM (its attestation key) between runs |
@@ -33,7 +36,7 @@ tools, models, signed approvals or distributed capabilities. For those, use
 
 ```bash
 docker build -f docker/Dockerfile --target dev -t cdk:dev .
-docker run -it --rm --init --device /dev/kvm -v cdk-target:/cdk/target cdk:dev
+docker run -it --rm --init -v cdk-target:/cdk/target cdk:dev     # add --device /dev/kvm on KVM hosts
 ```
 
 The container builds the kernel, agents, loader and gateway (the first run
@@ -88,5 +91,6 @@ gateway/target/x86_64-unknown-linux-gnu/release/cdk-gateway --identity gw.key \
 * Docker installed as a snap can only bind-mount files under your home
   directory.
 * v0.2.0 starts its other CPUs through the xAPIC registers even after
-  switching to x2APIC, which QEMU 10 and KVM offer; the `cdk:0.2.0` image
-  therefore hides x2APIC (`CDK_CPU=max,-x2apic`). Fixed after 0.2.0.
+  switching to x2APIC, which QEMU 10 and KVM offer, and crashes; build a
+  0.2.0 image with `--build-arg VERSION=0.2.0 --build-arg CPU=max,-x2apic`
+  to hide x2APIC from it. Fixed in 0.3.0.
